@@ -1,0 +1,6 @@
+{
+  "name": "Care App Resident Query AI",
+  "description": "Zero-token optimized AI chatbot for Care App resident data queries via MCP tools, deterministic intent routing, and policy guardrails.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

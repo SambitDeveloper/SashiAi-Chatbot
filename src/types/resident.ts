@@ -1,0 +1,173 @@
+/**
+ * Canonical types for the Care App Resident Query AI System
+ */
+
+export type ResidentStatus = 'active' | 'inactive' | 'pending' | 'admitted' | 'discharged';
+
+export type ResidentCareType = 
+  | 'assisted_living'
+  | 'memory_care'
+  | 'independent_living'
+  | 'skilled_nursing'
+  | 'respite_care';
+
+export interface ResidentRecord {
+  id: string;
+  residentId: string; // e.g. "RES-1042"
+  firstName: string;
+  lastName: string;
+  age: number;
+  gender: 'Female' | 'Male' | 'Other';
+  roomNumber: string;
+  wing: 'North Wing' | 'South Wing' | 'East Wing' | 'Garden Terrace';
+  status: ResidentStatus;
+  careType: ResidentCareType;
+  admissionDate: string; // ISO date 'YYYY-MM-DD'
+  createdDate: string;   // ISO date 'YYYY-MM-DD'
+  dischargeDate?: string;
+  primaryCaregiver: string;
+  emergencyContact: {
+    name: string;
+    relationship: string;
+    phone: string;
+  };
+}
+
+export type QueryCategory = 
+  | 'RESIDENT_COUNT'
+  | 'RESIDENTS_BY_STATUS'
+  | 'RESIDENTS_BY_TYPE'
+  | 'RESIDENTS_BY_DATE_RANGE'
+  | 'RESIDENT_LOOKUP'
+  | 'OUT_OF_POLICY'
+  | 'AMBIGUOUS_QUERY';
+
+export type ResidentAttribute = 
+  | 'primaryCaregiver'
+  | 'roomNumber'
+  | 'wing'
+  | 'admissionDate'
+  | 'createdDate'
+  | 'emergencyContact'
+  | 'status'
+  | 'careType'
+  | 'age'
+  | 'gender'
+  | 'fullProfile';
+
+export interface AttributeSpotlight {
+  attribute: ResidentAttribute;
+  label: string;
+  value: string;
+  supportingDetail?: string;
+}
+
+export interface ExtractedParameters {
+  status?: ResidentStatus | 'all';
+  careType?: ResidentCareType | 'all';
+  startDate?: string; // YYYY-MM-DD
+  endDate?: string;   // YYYY-MM-DD
+  dateField?: 'admissionDate' | 'createdDate';
+  dateLabel?: string; // e.g. "October 2026", "Last 30 Days", "Q3 2026"
+  isCountOnly?: boolean;
+  residentName?: string;
+  nameOrId?: string;
+  targetAttribute?: ResidentAttribute;
+  targetAttributes?: ResidentAttribute[];
+  requestedFields?: string[]; // e.g. ['primaryCaregiver', 'roomNumber']
+}
+
+export interface PolicyCheckResult {
+  passed: boolean;
+  violationReason?: string;
+  policyCategory?: 'RESIDENT_INTENT' | 'PROMPT_INJECTION' | 'OUT_OF_SCOPE' | 'SYSTEM_PROBING';
+  suggestedAction?: string;
+}
+
+export interface IntentParseResult {
+  category: QueryCategory;
+  confidence: number; // 0 to 1
+  matchedPattern: string;
+  parameters: ExtractedParameters;
+  isDeterministic: boolean;
+  tokensConsumed: number; // 0 for deterministic
+  missingRequiredParams?: string[];
+  clarificationPrompt?: string;
+  suggestedOptions?: Array<{ label: string; query: string }>;
+}
+
+export interface McpToolCallRequest {
+  jsonrpc: '2.0';
+  id: string;
+  method: string; // e.g. "tools/call"
+  params: {
+    name: string; // e.g. "care_app.get_residents_by_status"
+    arguments: Record<string, unknown>;
+  };
+}
+
+export interface McpToolCallResponse<T = unknown> {
+  jsonrpc: '2.0';
+  id: string;
+  result: {
+    tool: string;
+    data: T;
+    totalMatched: number;
+    filtersApplied: Record<string, unknown>;
+    executionTimeMs: number;
+  };
+  error?: {
+    code: number;
+    message: string;
+  };
+}
+
+export interface StatusBreakdown {
+  status: ResidentStatus;
+  label: string;
+  count: number;
+  percentage: number;
+}
+
+export interface CareTypeBreakdown {
+  careType: ResidentCareType;
+  label: string;
+  count: number;
+  percentage: number;
+}
+
+export interface QueryExecutionResult {
+  queryId: string;
+  timestamp: string;
+  userQuery: string;
+  policy: PolicyCheckResult;
+  intent: IntentParseResult;
+  mcpCall?: McpToolCallRequest;
+  mcpResponse?: McpToolCallResponse;
+  tokensConsumed: number;
+  tokensSaved: number; // Estimated savings vs traditional LLM flow (~450-800 tokens)
+  pipelineLatencyMs: number;
+  response: {
+    headline: string;
+    summaryText: string;
+    count: number;
+    breakdown?: StatusBreakdown[] | CareTypeBreakdown[];
+    residentsSample?: ResidentRecord[];
+    matchedResident?: ResidentRecord;
+    matchedResidents?: ResidentRecord[];
+    attributeSpotlight?: AttributeSpotlight;
+    multiSpotlight?: AttributeSpotlight[];
+    isLlmInterpreted?: boolean;
+    isPolicyViolation?: boolean;
+    needsClarification?: boolean;
+    clarificationOptions?: Array<{ label: string; query: string }>;
+  };
+}
+
+export interface ChatMessage {
+  id: string;
+  sender: 'user' | 'assistant';
+  timestamp: string;
+  content: string;
+  execution?: QueryExecutionResult;
+}
