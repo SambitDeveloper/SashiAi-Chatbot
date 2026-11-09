@@ -6,7 +6,8 @@ interface HeaderProps {
   onOpenDatabase: () => void;
   onOpenArchitecture: () => void;
   onResetChat: () => void;
-  totalTokensSaved: number;
+  totalTokensUsed: number;
+  totalResidents?: number;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -14,7 +15,8 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenDatabase,
   onOpenArchitecture,
   onResetChat,
-  totalTokensSaved
+  totalTokensUsed,
+  totalResidents
 }) => {
   return (
     <header className="flex items-center justify-between gap-8 px-6 py-3.5 bg-slate-900 border-b border-slate-800 text-white shrink-0">
@@ -35,9 +37,9 @@ export const Header: React.FC<HeaderProps> = ({
           className="flex items-center gap-1.5 hover:text-teal-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
         >
           <Sliders className="w-3.5 h-3.5 text-teal-400" />
-          <span>Zero-Token Inspector</span>
+          <span>Query Inspector</span>
           <span className="text-[11px] font-mono text-teal-400 bg-teal-950/60 border border-teal-800/40 px-1.5 py-0.5 rounded">
-            {totalTokensSaved.toLocaleString()} Saved
+            {totalTokensUsed.toLocaleString()} tokens used
           </span>
         </button>
 
@@ -46,7 +48,7 @@ export const Header: React.FC<HeaderProps> = ({
           className="flex items-center gap-1.5 hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
         >
           <Database className="w-3.5 h-3.5 text-slate-400" />
-          <span>MongoDB Census (88 Records)</span>
+          <span>Resident Records{totalResidents !== undefined ? ` (${totalResidents})` : ''}</span>
         </button>
 
         <button

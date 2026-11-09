@@ -1,8 +1,59 @@
+# ---------- Node / frontend ----------
 node_modules/
 build/
 dist/
+dist-server/
 coverage/
-.DS_Store
-*.log
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.eslintcache
+
+# ---------- Python / backend ----------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.ipynb_checkpoints/
+
+# ---------- Secrets / environment ----------
 .env*
 !.env.example
+*.pem
+*.key
+
+# ---------- Editors / OS ----------
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Logs / temp ----------
+*.log
+logs/
+tmp/
+.cache/
+
+# Lockfiles (package-lock.json, uv.lock) are intentionally committed for reproducible installs.

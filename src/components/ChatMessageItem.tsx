@@ -17,7 +17,7 @@ import {
   Calendar, 
   Phone
 } from 'lucide-react';
-import { STATUS_LABELS, CARE_TYPE_LABELS } from '../data/residentDatabase';
+import { STATUS_LABELS, CARE_TYPE_LABELS } from '../data/labels';
 
 interface ChatMessageItemProps {
   message: ChatMessage;
@@ -57,45 +57,58 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
     <div className="flex justify-start mb-6">
       <div className="max-w-3xl w-full bg-slate-900 border border-slate-800 rounded-xl rounded-tl-sm p-5 shadow-sm text-slate-200">
         
-        {/* Pipeline Execution Banner */}
-        {exec && (
+        {/* Execution Banner: how the answer was produced */}
+        {exec && exec.queryId !== 'local' && (
           <div className="flex flex-wrap items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-800 text-xs">
             <div className="flex items-center gap-2 text-slate-400">
               {isPolicyViolation ? (
                 <span className="flex items-center gap-1 text-rose-400 font-medium">
                   <ShieldAlert className="w-3.5 h-3.5" />
-                  Policy Rejection
+                  Not Available
                 </span>
               ) : needsClarification ? (
                 <span className="flex items-center gap-1 text-amber-400 font-medium">
                   <HelpCircle className="w-3.5 h-3.5" />
-                  Clarification Required
+                  {exec.tier === 'unavailable' ? 'Assistant Unavailable' : 'Clarification Needed'}
                 </span>
               ) : (
                 <span className="flex items-center gap-1 text-teal-400 font-medium">
                   <ShieldCheck className="w-3.5 h-3.5" />
-                  Deterministic Match
+                  Verified from Records
                 </span>
               )}
-              <span className="text-slate-600">·</span>
-              <span className="font-mono text-slate-300">{exec.intent.matchedPattern}</span>
               <span className="text-slate-600">·</span>
               <span className="font-mono text-slate-400">{exec.pipelineLatencyMs}ms</span>
             </div>
 
             <div className="flex items-center gap-2">
-              <span className="font-mono text-[11px] text-emerald-400 bg-emerald-950/60 border border-emerald-800/40 px-2 py-0.5 rounded">
-                0 Tokens Consumed (+{exec.tokensSaved} Saved)
+              <span
+                className="font-mono text-[11px] text-emerald-400 bg-emerald-950/60 border border-emerald-800/40 px-2 py-0.5 rounded"
+                title={exec.tier === 'cache' ? 'Same question seen before: served from cache' : 'Tokens used to understand this question'}
+              >
+                {exec.tier === 'cache' ? 'Cached · 0 tokens' : `${exec.tokensConsumed.toLocaleString()} tokens`}
               </span>
               <button
                 onClick={() => onInspectTrace(message)}
                 className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-teal-300 transition-colors cursor-pointer"
-                title="View MCP tool call, parameters, and execution log"
+                title="View the query plan and execution details"
               >
                 <Sliders className="w-3 h-3 text-slate-400" />
-                <span>Inspect Trace</span>
+                <span>Inspect</span>
               </button>
             </div>
+          </div>
+        )}
+
+        {/* How the question was understood */}
+        {exec?.interpretation && exec.interpretation.length > 0 && !isPolicyViolation && !needsClarification && (
+          <div className="flex flex-wrap items-center gap-1.5 mb-3 text-[11px]">
+            <span className="text-slate-500">Interpreted as:</span>
+            {exec.interpretation.map((chip, i) => (
+              <span key={i} className="px-2 py-0.5 rounded bg-slate-800/80 border border-slate-700/60 text-slate-300">
+                {chip}
+              </span>
+            ))}
           </div>
         )}
 
@@ -109,19 +122,13 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
           </p>
         </div>
 
-        {/* Policy Violation Notification Card */}
+        {/* Not-available explanation */}
         {isPolicyViolation && (
           <div className="p-3.5 rounded-lg bg-rose-950/30 border border-rose-900/40 text-xs text-rose-200 mb-4">
-            <p className="font-medium text-rose-300 mb-2">Supported Resident Query Categories:</p>
-            <ul className="space-y-1 list-disc list-inside text-rose-200/90 mb-3">
-              <li>Resident Lookup: "Tell me about Robert MacKenzie category and status" or "Who is Eleanor Vance?"</li>
-              <li>Resident Count: "How many residents are currently registered?"</li>
-              <li>Residents by Status: "How many residents are active, inactive, or pending?"</li>
-              <li>Residents by Type: "How many residents in Assisted Living, Memory Care, etc.?"</li>
-              <li>Residents by Date Range: "Residents admitted this month or in October 2026"</li>
-            </ul>
-            <p className="text-rose-400/80 text-[11px]">
-              Tip: The system protects MongoDB data by rejecting off-scope questions without consuming LLM tokens.
+            <p className="font-medium text-rose-300 mb-2">This assistant can answer questions about:</p>
+            <p className="text-rose-200/90">
+              resident counts and lists, status, care type, wing, room, primary caregiver, gender, age, and admission,
+              registration or discharge dates (combine them freely), plus individual resident details.
             </p>
           </div>
         )}
@@ -133,12 +140,9 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
               <div className="flex items-center gap-2">
                 <span className="flex h-2 w-2 rounded-full bg-teal-400 animate-pulse" />
                 <span className="text-[11px] font-bold uppercase tracking-wider text-teal-300">
-                  Multi-Attribute Spotlight · {exec.response.multiSpotlight.length} Target Fields
+                  {exec.response.multiSpotlight.length} Details
                 </span>
               </div>
-              <span className="text-[10px] font-mono text-teal-400/80 bg-teal-950/80 px-2 py-0.5 rounded border border-teal-800/50">
-                Composite Semantic Extraction
-              </span>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -167,12 +171,9 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
               <div className="flex items-center gap-2">
                 <span className="flex h-2 w-2 rounded-full bg-teal-400 animate-pulse" />
                 <span className="text-[11px] font-bold uppercase tracking-wider text-teal-300">
-                  Target Attribute Spotlight · {exec.response.attributeSpotlight.label}
+                  {exec.response.attributeSpotlight.label}
                 </span>
               </div>
-              <span className="text-[10px] font-mono text-teal-400/80 bg-teal-950/80 px-2 py-0.5 rounded border border-teal-800/50">
-                Direct Semantic Match
-              </span>
             </div>
             <div className="text-xl sm:text-2xl font-bold text-white tracking-tight">
               {exec.response.attributeSpotlight.value}
@@ -258,7 +259,7 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
         {/* Clarification or Suggestion Option Buttons */}
         {exec?.response.clarificationOptions && exec.response.clarificationOptions.length > 0 && (
           <div className="mt-3 pt-3 border-t border-slate-800">
-            <p className="text-xs font-medium text-slate-400 mb-2">Select a verified query:</p>
+            <p className="text-xs font-medium text-slate-400 mb-2">Try one of these:</p>
             <div className="flex flex-wrap gap-2">
               {exec.response.clarificationOptions.map((opt, i) => (
                 <button
@@ -277,7 +278,7 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
         {breakdown && breakdown.length > 0 && (
           <div className="my-4 p-4 rounded-lg bg-slate-950/60 border border-slate-800">
             <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-3">
-              Census Distribution Breakdown
+              Breakdown
             </h4>
             <div className="space-y-2.5">
               {breakdown.map((item, idx) => {

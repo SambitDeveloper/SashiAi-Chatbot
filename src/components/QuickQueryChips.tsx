@@ -32,9 +32,14 @@ export const QuickQueryChips: React.FC<QuickQueryChipsProps> = ({
       query: 'Which room is Arthur Pendleton in?'
     },
     {
-      category: 'Unregistered Check',
+      category: 'Combined Filters',
       icon: Users,
-      query: 'Tell me about Sambit Nayak'
+      query: 'How many active residents does Nurse Sarah Jenkins look after?'
+    },
+    {
+      category: 'Follow-up',
+      icon: Users,
+      query: 'And how many of them are in memory care?'
     },
     {
       category: 'Census Count',

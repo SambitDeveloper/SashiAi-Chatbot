@@ -1,0 +1,34 @@
+[project]
+name = "care-resident-query-api"
+version = "1.0.0"
+description = "Resident query API: Claude translates questions into validated query plans; the database computes every answer."
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "anthropic>=0.75",
+  "rapidfuzz>=3.10",
+  "pymongo>=4.10",
+  "slowapi>=0.1.9",
+  "google-genai>=1.50",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "httpx>=0.27", "ruff>=0.7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+# B008: FastAPI Depends() in defaults is the framework idiom. E501: the formatter owns line length.
+ignore = ["B008", "E501"]

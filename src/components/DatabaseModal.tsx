@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
-import { RESIDENT_DATABASE, STATUS_LABELS, CARE_TYPE_LABELS } from '../data/residentDatabase';
-import { ResidentRecord, ResidentStatus, ResidentCareType } from '../types/resident';
+import React, { useEffect, useState } from 'react';
+import { STATUS_LABELS, CARE_TYPE_LABELS } from '../data/labels';
+import { ResidentRecord } from '../types/resident';
+import { api, ApiError } from '../api/client';
 import { X, Search, Database, Filter } from 'lucide-react';
 
 interface DatabaseModalProps {
@@ -12,10 +13,24 @@ export const DatabaseModal: React.FC<DatabaseModalProps> = ({ isOpen, onClose })
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [typeFilter, setTypeFilter] = useState<string>('all');
+  const [records, setRecords] = useState<ResidentRecord[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setLoading(true);
+    setError(null);
+    api
+      .residents()
+      .then(r => setRecords(r.residents))
+      .catch((err: unknown) => setError(err instanceof ApiError ? err.message : 'Could not load resident records.'))
+      .finally(() => setLoading(false));
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
-  const filtered = RESIDENT_DATABASE.filter(r => {
+  const filtered = records.filter(r => {
     const matchesSearch = 
       r.firstName.toLowerCase().includes(searchTerm.toLowerCase()) ||
       r.lastName.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -39,9 +54,9 @@ export const DatabaseModal: React.FC<DatabaseModalProps> = ({ isOpen, onClose })
               <Database className="w-4 h-4" />
             </div>
             <div>
-              <h2 className="text-base font-semibold text-slate-100">Care App MongoDB Resident Collection</h2>
+              <h2 className="text-base font-semibold text-slate-100">Resident Records</h2>
               <p className="text-xs text-slate-400">
-                Ground-truth database collection: <span className="font-mono text-teal-300">db.care_residents</span> ({RESIDENT_DATABASE.length} total records)
+                {loading ? 'Loading…' : error ? 'Unavailable' : `${records.length} total records`}
               </p>
             </div>
           </div>
@@ -96,13 +111,16 @@ export const DatabaseModal: React.FC<DatabaseModalProps> = ({ isOpen, onClose })
           </div>
 
           <span className="text-xs font-mono text-slate-400">
-            Showing <strong className="text-teal-400">{filtered.length}</strong> of {RESIDENT_DATABASE.length}
+            Showing <strong className="text-teal-400">{filtered.length}</strong> of {records.length}
           </span>
         </div>
 
         {/* Table View */}
         <div className="flex-1 overflow-auto p-4">
-          <table className="w-full text-left text-xs border border-slate-800 rounded-lg">
+          {error && (
+            <div className="p-4 rounded-lg bg-amber-950/30 border border-amber-900/40 text-xs text-amber-200">{error}</div>
+          )}
+          {!error && <table className="w-full text-left text-xs border border-slate-800 rounded-lg">
             <thead className="bg-slate-950 text-slate-400 border-b border-slate-800 sticky top-0">
               <tr>
                 <th className="py-2.5 px-3 font-medium">ID</th>
@@ -144,12 +162,12 @@ export const DatabaseModal: React.FC<DatabaseModalProps> = ({ isOpen, onClose })
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table>}
         </div>
 
         {/* Footer */}
         <div className="p-4 border-t border-slate-800 bg-slate-950/80 flex items-center justify-between text-xs text-slate-400">
-          <span>MongoDB Collection: <code className="font-mono text-teal-400">residents</code> (Care App Cluster 01)</span>
+          <span>Emergency contact details are never included in bulk views.</span>
           <button
             onClick={onClose}
             className="px-4 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md transition-colors cursor-pointer"

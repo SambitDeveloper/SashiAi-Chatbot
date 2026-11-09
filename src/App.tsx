@@ -6,47 +6,54 @@ import { InspectorDrawer } from './components/InspectorDrawer';
 import { DatabaseModal } from './components/DatabaseModal';
 import { ArchitectureModal } from './components/ArchitectureModal';
 import { ChatMessage, QueryExecutionResult } from './types/resident';
-import { processResidentQuery } from './pipeline/queryOrchestrator';
-import { Send, Sparkles, Shield, Database, Users, Tag, Calendar, ArrowRight } from 'lucide-react';
+import { api, ApiError, ApiMeta, newSessionId } from './api/client';
+import { Send, Shield, Users, Tag, Calendar, ArrowRight } from 'lucide-react';
+
+const timeNow = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+const WELCOME_OPTIONS = [
+  { label: 'How many residents are active?', query: 'How many residents are active?' },
+  { label: 'Active residents of Nurse Sarah Jenkins', query: 'How many active residents does Nurse Sarah Jenkins look after?' },
+  { label: 'Residents by care type', query: 'Show residents by care type' },
+  { label: 'Admitted in the last 3 months', query: 'Residents admitted in the last 3 months' },
+  { label: "Who is Eleanor Vance's caregiver?", query: "Who is Eleanor Vance's caregiver?" }
+];
+
+/** A local (non-API) assistant message, e.g. the welcome card or a connection error. */
+function systemMessage(headline: string, summaryText: string, opts: Partial<QueryExecutionResult['response']> = {}): ChatMessage {
+  return {
+    id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    sender: 'assistant',
+    timestamp: timeNow(),
+    content: summaryText,
+    execution: {
+      queryId: 'local',
+      timestamp: timeNow(),
+      userQuery: '',
+      policy: { passed: true, policyCategory: 'RESIDENT_INTENT' },
+      intent: { category: 'HELP', confidence: 1, matchedPattern: 'local', parameters: {}, isDeterministic: true, tokensConsumed: 0 },
+      tokensConsumed: 0,
+      tokensSaved: 0,
+      pipelineLatencyMs: 0,
+      response: { headline, summaryText, count: 0, ...opts }
+    }
+  };
+}
+
+function welcomeMessage(meta: ApiMeta | null): ChatMessage {
+  const census = meta ? `${meta.totalResidents} resident records are available.` : 'Connecting to the resident database…';
+  const llm = meta && !meta.llmEnabled ? ' Note: the language model is not configured on the server, so questions cannot be answered yet.' : '';
+  return systemMessage(
+    'Care App Resident Intelligence',
+    `Ask about residents in plain language: counts, status, care type, wing, room, caregiver, age, and admission or discharge dates. You can combine conditions and ask follow-up questions. ${census}${llm}`,
+    { clarificationOptions: WELCOME_OPTIONS }
+  );
+}
 
 export default function App() {
-  const [messages, setMessages] = useState<ChatMessage[]>(() => [
-    {
-      id: 'msg-welcome',
-      sender: 'assistant',
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      content: 'Welcome to Care App Resident Intelligence. You can ask me questions about resident counts, status breakdowns, care types, or admissions by date range.',
-      execution: {
-        queryId: 'init-000',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        userQuery: 'System Initialized',
-        policy: { passed: true, policyCategory: 'RESIDENT_INTENT' },
-        intent: {
-          category: 'RESIDENT_COUNT',
-          confidence: 1.0,
-          matchedPattern: 'SYSTEM_READY',
-          parameters: { isCountOnly: true },
-          isDeterministic: true,
-          tokensConsumed: 0
-        },
-        tokensConsumed: 0,
-        tokensSaved: 0,
-        pipelineLatencyMs: 0,
-        response: {
-          headline: 'Care App Resident Intelligence Online',
-          summaryText: 'Connected to Care App MongoDB cluster (88 verified resident records) via Model Context Protocol (MCP). All queries run through a zero-token deterministic pipeline with strict policy guardrails.',
-          count: 88,
-          clarificationOptions: [
-            { label: 'Robert MacKenzie status & category', query: 'Tell me about Robert MacKenzi category and staus' },
-            { label: 'How many residents are currently registered?', query: 'How many residents are currently registered?' },
-            { label: 'Show residents by status', query: 'Show residents by status' },
-            { label: 'How many in Memory Care?', query: 'How many residents belong to Memory Care?' },
-            { label: 'Residents admitted this month', query: 'Residents admitted this month' }
-          ]
-        }
-      }
-    }
-  ]);
+  const [meta, setMeta] = useState<ApiMeta | null>(null);
+  const [sessionId, setSessionId] = useState<string>(() => newSessionId());
+  const [messages, setMessages] = useState<ChatMessage[]>(() => [welcomeMessage(null)]);
 
   const [inputValue, setInputValue] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -54,49 +61,57 @@ export default function App() {
   const [isInspectorOpen, setIsInspectorOpen] = useState(false);
   const [isDatabaseOpen, setIsDatabaseOpen] = useState(false);
   const [isArchitectureOpen, setIsArchitectureOpen] = useState(false);
-  const [totalTokensSaved, setTotalTokensSaved] = useState<number>(1450); // initial baseline savings
-  const [totalQueriesRun, setTotalQueriesRun] = useState<number>(1);
+  const [totalTokensUsed, setTotalTokensUsed] = useState<number>(0);
+  const [totalQueriesRun, setTotalQueriesRun] = useState<number>(0);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    api
+      .meta()
+      .then(m => {
+        setMeta(m);
+        setMessages(prev => (prev.length === 1 ? [welcomeMessage(m)] : prev));
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof ApiError ? err.message : 'Cannot reach the server.';
+        setMessages(prev => [...prev, systemMessage('Server unavailable', msg, { needsClarification: true })]);
+      });
+  }, []);
 
   // Auto-scroll to bottom of messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isProcessing]);
 
-  const handleSendMessage = (textToSend?: string) => {
+  const handleSendMessage = async (textToSend?: string) => {
     const query = (textToSend || inputValue).trim();
     if (!query || isProcessing) return;
 
-    const userMessage: ChatMessage = {
-      id: `user-${Date.now()}`,
-      sender: 'user',
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      content: query
-    };
-
+    const userMessage: ChatMessage = { id: `user-${Date.now()}`, sender: 'user', timestamp: timeNow(), content: query };
     setMessages(prev => [...prev, userMessage]);
     setInputValue('');
     setIsProcessing(true);
 
-    // Fast deterministic pipeline execution
-    setTimeout(() => {
-      const executionResult = processResidentQuery(query);
-
+    try {
+      const executionResult = await api.query(query, sessionId);
       const botMessage: ChatMessage = {
         id: `bot-${Date.now()}`,
         sender: 'assistant',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        timestamp: timeNow(),
         content: executionResult.response.summaryText,
         execution: executionResult
       };
-
       setMessages(prev => [...prev, botMessage]);
       setSelectedTrace(executionResult);
-      setTotalTokensSaved(prev => prev + executionResult.tokensSaved);
+      setTotalTokensUsed(prev => prev + (executionResult.tokensConsumed || 0));
       setTotalQueriesRun(prev => prev + 1);
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : 'Something went wrong. Please try again.';
+      setMessages(prev => [...prev, systemMessage('Request failed', msg, { needsClarification: true })]);
+    } finally {
       setIsProcessing(false);
-    }, 120); // Simulates fast local microsecond dispatch with smooth animation
+    }
   };
 
   const handleInspectTrace = (message: ChatMessage) => {
@@ -107,41 +122,9 @@ export default function App() {
   };
 
   const handleResetChat = () => {
-    setMessages([
-      {
-        id: `msg-${Date.now()}`,
-        sender: 'assistant',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        content: 'Session reset. Ready for resident data queries.',
-        execution: {
-          queryId: 'reset-000',
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          userQuery: 'Session Reset',
-          policy: { passed: true, policyCategory: 'RESIDENT_INTENT' },
-          intent: {
-            category: 'RESIDENT_COUNT',
-            confidence: 1.0,
-            matchedPattern: 'SESSION_INITIALIZED',
-            parameters: {},
-            isDeterministic: true,
-            tokensConsumed: 0
-          },
-          tokensConsumed: 0,
-          tokensSaved: 0,
-          pipelineLatencyMs: 0,
-          response: {
-            headline: 'Fresh Session Started',
-            summaryText: 'Ask any question regarding Care App resident count, status distributions, care categories, or date ranges.',
-            count: 88,
-            clarificationOptions: [
-              { label: 'How many residents are active?', query: 'How many residents are active?' },
-              { label: 'Show census breakdown by care type', query: 'Show census breakdown by care type' },
-              { label: 'Residents admitted in October 2026', query: 'Residents admitted in October 2026' }
-            ]
-          }
-        }
-      }
-    ]);
+    setSessionId(newSessionId()); // new conversation: follow-up context is cleared
+    setSelectedTrace(null);
+    setMessages([welcomeMessage(meta)]);
   };
 
   return (
@@ -152,7 +135,8 @@ export default function App() {
         onOpenDatabase={() => setIsDatabaseOpen(true)}
         onOpenArchitecture={() => setIsArchitectureOpen(true)}
         onResetChat={handleResetChat}
-        totalTokensSaved={totalTokensSaved}
+        totalTokensUsed={totalTokensUsed}
+        totalResidents={meta?.totalResidents}
       />
 
       {/* Main Chat Viewport */}
@@ -185,7 +169,7 @@ export default function App() {
                 <span className="text-slate-600">·</span>
                 <span className="flex items-center gap-1">
                   <Calendar className="w-3 h-3 text-teal-400" />
-                  Admission Dates
+                  Wing · Room · Caregiver · Age · Dates
                 </span>
               </div>
             </div>
@@ -220,7 +204,7 @@ export default function App() {
                   <span className="w-1.5 h-1.5 bg-teal-400 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
                   <span className="w-1.5 h-1.5 bg-teal-400 rounded-full animate-bounce"></span>
                 </div>
-                <span>Evaluating Policy Gate & Deterministic Intent Engine (0 tokens)...</span>
+                <span>Understanding your question…</span>
               </div>
             </div>
           )}
@@ -249,7 +233,8 @@ export default function App() {
               type="text"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
-              placeholder="Ask about resident count, status (active/pending), care type, or admission dates..."
+              placeholder="Ask anything about residents, e.g. active residents of Nurse Sarah Jenkins in memory care"
+              maxLength={500}
               disabled={isProcessing}
               className="w-full pl-4 pr-10 py-3 bg-slate-950 border border-slate-700/80 rounded-lg text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500 transition-all disabled:opacity-50"
             />
@@ -275,21 +260,21 @@ export default function App() {
         </form>
 
         <div className="max-w-5xl mx-auto flex items-center justify-between text-[11px] text-slate-500 mt-2">
-          <span>Zero LLM tokens consumed for deterministic queries · Layer 0 policy-guarded</span>
-          <span>MongoDB Care App Backend · JSON-RPC 2.0 MCP</span>
+          <span>Answers are computed from resident records · resident names are masked before reaching the language model</span>
+          <span>{meta?.model ? `Model: ${meta.model}` : ''}</span>
         </div>
       </footer>
 
-      {/* Zero-Token Pipeline Inspector Side Drawer */}
+      {/* Query Inspector Side Drawer */}
       <InspectorDrawer
         isOpen={isInspectorOpen}
         onClose={() => setIsInspectorOpen(false)}
         execution={selectedTrace || (messages[messages.length - 1]?.execution || null)}
-        totalTokensSaved={totalTokensSaved}
+        totalTokensUsed={totalTokensUsed}
         totalQueriesRun={totalQueriesRun}
       />
 
-      {/* MongoDB Database Viewer Modal */}
+      {/* Resident Data Browser Modal */}
       <DatabaseModal
         isOpen={isDatabaseOpen}
         onClose={() => setIsDatabaseOpen(false)}

@@ -39,8 +39,29 @@ export type QueryCategory =
   | 'RESIDENTS_BY_TYPE'
   | 'RESIDENTS_BY_DATE_RANGE'
   | 'RESIDENT_LOOKUP'
+  | 'RESIDENT_LIST'
+  | 'RESIDENT_BREAKDOWN'
+  | 'RESIDENT_AGGREGATE'
+  | 'HELP'
   | 'OUT_OF_POLICY'
   | 'AMBIGUOUS_QUERY';
+
+/** How the plan was produced: by Claude, from the plan cache, or not at all (model unavailable). */
+export type UnderstandingTier = 'llm' | 'cache' | 'unavailable';
+
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+}
+
+export interface GenericBreakdown {
+  key: string;
+  label: string;
+  count: number;
+  percentage: number;
+}
 
 export type ResidentAttribute = 
   | 'primaryCaregiver'
@@ -88,7 +109,7 @@ export interface IntentParseResult {
   category: QueryCategory;
   confidence: number; // 0 to 1
   matchedPattern: string;
-  parameters: ExtractedParameters;
+  parameters: ExtractedParameters | Record<string, unknown>;
   isDeterministic: boolean;
   tokensConsumed: number; // 0 for deterministic
   missingRequiredParams?: string[];
@@ -142,16 +163,21 @@ export interface QueryExecutionResult {
   userQuery: string;
   policy: PolicyCheckResult;
   intent: IntentParseResult;
-  mcpCall?: McpToolCallRequest;
-  mcpResponse?: McpToolCallResponse;
+  mcpCall?: McpToolCallRequest | null;
+  mcpResponse?: McpToolCallResponse | null;
   tokensConsumed: number;
-  tokensSaved: number; // Estimated savings vs traditional LLM flow (~450-800 tokens)
+  tokensSaved: number; // Legacy field; the API always returns 0
   pipelineLatencyMs: number;
+  tier?: UnderstandingTier;
+  /** How the question was understood, e.g. ["Count", "Status: Active", "Caregiver: Nurse Sarah Jenkins, RN"]. */
+  interpretation?: string[];
+  tokenUsage?: TokenUsage;
   response: {
     headline: string;
     summaryText: string;
     count: number;
-    breakdown?: StatusBreakdown[] | CareTypeBreakdown[];
+    breakdown?: Array<StatusBreakdown | CareTypeBreakdown | GenericBreakdown>;
+    aggregateValue?: number | null;
     residentsSample?: ResidentRecord[];
     matchedResident?: ResidentRecord;
     matchedResidents?: ResidentRecord[];
@@ -160,7 +186,7 @@ export interface QueryExecutionResult {
     isLlmInterpreted?: boolean;
     isPolicyViolation?: boolean;
     needsClarification?: boolean;
-    clarificationOptions?: Array<{ label: string; query: string }>;
+    clarificationOptions?: Array<{ label: string; query: string }> | null;
   };
 }
 

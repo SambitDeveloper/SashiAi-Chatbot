@@ -1,6 +1,0 @@
-{
-  "summary":  "Implementation plan for Multi-Attribute Resident Queries and Composite Spotlight in Care App AI. Supports compound questions such as 'Donald Draper belongs to which care level and care taker ?' with simultaneous extraction of careType and primaryCaregiver, generating a composite headline and a multi-attribute spotlight card.",
-  "updatedAt":  "2026-11-09T05:19:29.231433526Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}
