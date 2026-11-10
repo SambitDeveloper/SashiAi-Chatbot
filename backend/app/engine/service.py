@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -15,13 +16,20 @@ from app.data.repository import ResidentRepository
 from app.engine.describe import describe_plan
 from app.engine.executor import execute
 from app.engine.resolver import resolve_plan
-from app.engine.responder import build_response
+from app.engine.responder import HELP_OPTIONS, build_response
 from app.engine.stores import TTLCache
 from app.models.plan import QueryPlan
+from app.nlu.topic_gate import TopicGate
 from app.nlu.translator import TokenUsage, Translator, TranslatorUnavailable
 from app.nlu.vocabulary import EntityIndex
 
 log = logging.getLogger(__name__)
+
+_RESIDENT_ID = re.compile(r"\bRES[-_ ]?\d{3,6}\b", re.IGNORECASE)
+GATE_MESSAGE = (
+    "That doesn't look like a question about residents. I can help with resident counts, status, care type, "
+    "wing, room, caregiver, age and admission or discharge dates."
+)
 
 _CATEGORY = {
     "count": "RESIDENT_COUNT",
@@ -38,7 +46,7 @@ _CATEGORY = {
 @dataclass
 class Stats:
     queries: int = 0
-    by_tier: dict[str, int] = field(default_factory=lambda: {"llm": 0, "cache": 0, "unavailable": 0})
+    by_tier: dict[str, int] = field(default_factory=lambda: {"llm": 0, "cache": 0, "gate": 0, "unavailable": 0})
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
@@ -58,10 +66,19 @@ def _cache_key(today: str, masked_question: str, previous_json: str | None) -> s
 
 
 class QueryService:
-    def __init__(self, repo: ResidentRepository, translator: Translator | None, settings: Settings):
+    def __init__(
+        self,
+        repo: ResidentRepository,
+        translator: Translator | None,
+        settings: Settings,
+        gate: TopicGate | None = None,
+    ):
         self.repo = repo
         self.translator = translator
         self.settings = settings
+        self.gate = gate
+        self._llm_day = ""
+        self._llm_calls_today = 0
         self.cache = TTLCache(settings.cache_max_entries, settings.cache_ttl_seconds)
         self.sessions = TTLCache(settings.session_max_entries, settings.session_ttl_seconds)
         self.stats = Stats()
@@ -113,9 +130,22 @@ class QueryService:
         raw = (self.cache.get(followup_key) if followup_key else None) or self.cache.get(standalone_key)
         uses_previous = False
         if raw is None:
+            # Local topic check (free, on this server) before any paid model call. Questions that mention a
+            # specific resident are about residents by definition, so they skip the check.
+            if self.gate and not mask.placeholders and not _RESIDENT_ID.search(question):
+                verdict = await asyncio.to_thread(self.gate.check, question)
+                if verdict.blocked:
+                    return self._gated(query_id, question, started)
             if self.translator is None:
                 return self._unavailable(
                     query_id, question, started, "The assistant's language model is not configured on this server."
+                )
+            if self._daily_limit_reached(today):
+                log.warning(
+                    "daily language-model call limit reached", extra={"limit": self.settings.llm_daily_call_limit}
+                )
+                return self._unavailable(
+                    query_id, question, started, "The daily question limit has been reached. Please try again tomorrow."
                 )
             try:
                 translation = await self.translator.translate(mask.text, today, self.index.wings, previous_json)
@@ -213,6 +243,31 @@ class QueryService:
             else None,
             "response": {**response, "isLlmInterpreted": tier == "llm"},
         }
+
+    def _daily_limit_reached(self, today: str) -> bool:
+        """Counts model calls per calendar day (per process). Returns True when the configured cap is hit."""
+        if self._llm_day != today:
+            self._llm_day, self._llm_calls_today = today, 0
+        limit = self.settings.llm_daily_call_limit
+        if limit and self._llm_calls_today >= limit:
+            return True
+        self._llm_calls_today += 1
+        return False
+
+    def _gated(self, query_id: str, question: str, started: float) -> dict[str, Any]:
+        self.stats.queries += 1
+        self.stats.by_tier["gate"] += 1
+        plan = QueryPlan(action="unsupported", message=GATE_MESSAGE)
+        response = {
+            "headline": "Not available",
+            "summaryText": GATE_MESSAGE,
+            "count": 0,
+            "isPolicyViolation": True,
+            "clarificationOptions": HELP_OPTIONS[:3],
+        }
+        latency = round((time.perf_counter() - started) * 1000)
+        log.info("query filtered locally", extra={"query_id": query_id, "tier": "gate", "latency_ms": latency})
+        return self._result(query_id, question, plan, 0, 0, response, "gate", TokenUsage(), latency)
 
     def _unavailable(self, query_id: str, question: str, started: float, message: str) -> dict[str, Any]:
         self.stats.queries += 1

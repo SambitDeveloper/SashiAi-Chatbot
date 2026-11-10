@@ -33,6 +33,9 @@ htmlcov/
 .nox/
 .ipynb_checkpoints/
 
+# Downloaded embedding model for the local topic check (re-downloaded on demand)
+.models/
+
 # ---------- Secrets / environment ----------
 .env*
 !.env.example

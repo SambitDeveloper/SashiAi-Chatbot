@@ -3,6 +3,7 @@
 Run locally:   uv run uvicorn app.main:app --reload --port 8000
 """
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +22,7 @@ from app.data.memory_repository import MemoryResidentRepository
 from app.data.repository import ResidentRepository
 from app.engine.service import QueryService
 from app.logging_setup import configure_logging
+from app.nlu.topic_gate import TopicGate
 from app.nlu.translator import ClaudeTranslator, Translator
 
 log = logging.getLogger(__name__)
@@ -76,6 +78,7 @@ def create_app(
     settings: Settings | None = None,
     repo: ResidentRepository | None = None,
     translator: Translator | None = None,
+    gate: TopicGate | None = None,
     use_default_translator: bool = True,
 ) -> FastAPI:
     settings = settings or get_settings()
@@ -88,8 +91,24 @@ def create_app(
         model = (
             translator if translator is not None else (build_translator(settings) if use_default_translator else None)
         )
-        service = QueryService(repository, model, settings)
+        topic_gate = (
+            gate
+            if gate is not None
+            else (
+                TopicGate(
+                    settings.topic_gate_margin,
+                    model_name=settings.topic_gate_model,
+                    cache_dir=settings.topic_gate_cache_dir,
+                )
+                if settings.topic_gate_enabled
+                else None
+            )
+        )
+        service = QueryService(repository, model, settings, gate=topic_gate)
         await service.start()
+        # Load the embedding model in the background: the API is usable at once, and until the model is
+        # ready every question simply goes to the language model.
+        gate_task = asyncio.create_task(topic_gate.start()) if topic_gate and not topic_gate.ready else None
         app.state.settings = settings
         app.state.service = service
         log.info(
@@ -99,9 +118,12 @@ def create_app(
                 "llm": model is not None,
                 "provider": getattr(model, "provider", None),
                 "model": getattr(model, "model_name", None),
+                "topic_check": topic_gate is not None,
             },
         )
         yield
+        if gate_task and not gate_task.done():
+            gate_task.cancel()
         await service.stop()
         if hasattr(model, "close"):
             await model.close()

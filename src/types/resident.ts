@@ -47,7 +47,7 @@ export type QueryCategory =
   | 'AMBIGUOUS_QUERY';
 
 /** How the plan was produced: by Claude, from the plan cache, or not at all (model unavailable). */
-export type UnderstandingTier = 'llm' | 'cache' | 'unavailable';
+export type UnderstandingTier = 'llm' | 'cache' | 'gate' | 'unavailable';
 
 export interface TokenUsage {
   input_tokens: number;

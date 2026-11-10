@@ -41,7 +41,9 @@ class PinnedDateSettings(Settings):
 
 @pytest.fixture
 def settings() -> Settings:
-    return PinnedDateSettings(_env_file=None, environment="test", anthropic_api_key=None, rate_limit_per_minute=1000)
+    return PinnedDateSettings(
+        _env_file=None, environment="test", anthropic_api_key=None, rate_limit_per_minute=1000, topic_gate_enabled=False
+    )
 
 
 @pytest.fixture

@@ -73,11 +73,21 @@ async def meta(service: QueryService = Depends(get_service), settings: Settings 
 @protected.get("/stats")
 async def stats(service: QueryService = Depends(get_service)) -> dict:
     s = service.stats
-    return {**s.__dict__, "cacheEntries": len(service.cache), "cacheHits": service.cache.hits}
+    gate = service.gate
+    return {
+        **s.__dict__,
+        "cacheEntries": len(service.cache),
+        "cacheHits": service.cache.hits,
+        "topicCheck": {
+            "enabled": gate is not None,
+            "ready": bool(gate and gate.ready),
+            "blocked": gate.blocked_count if gate else 0,
+        },
+    }
 
 
 @protected.post("/query")
-@limiter.limit(lambda: f"{_rate_limit()}/minute")
+@limiter.limit(lambda: _rate_limit())
 async def query(request: Request, body: QueryRequest, service: QueryService = Depends(get_service)) -> dict:
     return await service.handle(body.query, body.session_id)
 
@@ -92,7 +102,8 @@ async def residents(
     return {"residents": [list_view(r) for r in rows]}
 
 
-def _rate_limit() -> int:
+def _rate_limit() -> str:
     from app.config import get_settings
 
-    return get_settings().rate_limit_per_minute
+    s = get_settings()
+    return f"{s.rate_limit_per_minute}/minute;{s.rate_limit_per_day}/day"

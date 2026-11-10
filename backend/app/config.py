@@ -47,6 +47,18 @@ class Settings(BaseSettings):
     anthropic_max_retries: int = Field(default=2, ge=0, le=5)
     anthropic_refusal_fallbacks: bool = True
 
+    # Local topic check (free embedding model on this server): stops clearly off-topic questions
+    # before they reach the language model. Margin 0.02 was tuned on held-out questions (0 resident
+    # questions blocked); raise it to block less, lower it to block more.
+    topic_gate_enabled: bool = True
+    topic_gate_model: str = "BAAI/bge-small-en-v1.5"
+    topic_gate_cache_dir: str | None = ".models"
+    topic_gate_margin: float = Field(default=0.02, ge=0.0, le=0.5)
+
+    # Cost guard: maximum language-model calls per day for this server (0 = unlimited).
+    # Cached and locally filtered questions do not count.
+    llm_daily_call_limit: int = Field(default=0, ge=0)
+
     # Plan cache and conversation memory (per process; use Redis for multiple replicas)
     cache_max_entries: int = Field(default=5000, ge=0)
     cache_ttl_seconds: int = Field(default=86400, ge=60)
@@ -55,6 +67,7 @@ class Settings(BaseSettings):
 
     # HTTP
     rate_limit_per_minute: int = Field(default=60, ge=1)
+    rate_limit_per_day: int = Field(default=2000, ge=1)  # per IP, on POST /api/query
     api_token: str | None = Field(default=None, min_length=16)
     cors_origins: str | None = None
     enable_data_browser: bool = False

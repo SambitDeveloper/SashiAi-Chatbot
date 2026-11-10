@@ -13,6 +13,7 @@ dependencies = [
   "pymongo>=4.10",
   "slowapi>=0.1.9",
   "google-genai>=1.50",
+  "fastembed>=0.4",
 ]
 
 [dependency-groups]

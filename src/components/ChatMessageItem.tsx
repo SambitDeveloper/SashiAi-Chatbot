@@ -86,7 +86,11 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
                 className="font-mono text-[11px] text-emerald-400 bg-emerald-950/60 border border-emerald-800/40 px-2 py-0.5 rounded"
                 title={exec.tier === 'cache' ? 'Same question seen before: served from cache' : 'Tokens used to understand this question'}
               >
-                {exec.tier === 'cache' ? 'Cached · 0 tokens' : `${exec.tokensConsumed.toLocaleString()} tokens`}
+                {exec.tier === 'cache'
+                  ? 'Cached · 0 tokens'
+                  : exec.tier === 'gate'
+                    ? 'Filtered locally · 0 tokens'
+                    : `${exec.tokensConsumed.toLocaleString()} tokens`}
               </span>
               <button
                 onClick={() => onInspectTrace(message)}

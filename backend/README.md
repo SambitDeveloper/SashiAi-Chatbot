@@ -5,7 +5,8 @@ validates the plan, runs it against the resident database and builds the answer 
 The model never sees resident records and never produces a number.
 
 ```
-question → mask resident names → plan cache? → Gemini / Claude (structured output: plan only)
+question → mask resident names → plan cache? → local topic check (off-topic → "not available", 0 tokens)
+         → Gemini / Claude (structured output: plan only)
          → resolve names/wings/rooms against the database → validate → query database → answer + "Interpreted as" chips
 ```
 
@@ -31,7 +32,7 @@ Check with `curl localhost:8000/api/meta`, which shows the active `provider` and
 ## Tests and lint
 
 ```bash
-uv run pytest          # 93 tests; the model is replaced by fakes/mocks, so no API calls or cost
+uv run pytest          # 105 tests; the model is replaced by fakes/mocks, so no API calls or cost
 uv run ruff check app tests
 ```
 
@@ -54,9 +55,13 @@ uv run ruff check app tests
 | `DATA_SOURCE` | `memory` | `memory` (built-in seed data) or `mongodb` |
 | `MONGODB_URI` / `MONGODB_DB` / `MONGODB_COLLECTION` | – / `care_app` / `residents` | MongoDB connection |
 | `VOCAB_REFRESH_SECONDS` | `300` | How often names/wings/rooms are reloaded from the database |
+| `TOPIC_GATE_ENABLED` | `true` | Local topic check: a free embedding model on this server stops clearly off-topic questions before the language model |
+| `TOPIC_GATE_MODEL` / `TOPIC_GATE_CACHE_DIR` | `BAAI/bge-small-en-v1.5` / `.models` | Embedding model (~65 MB, downloaded once) and where it is stored |
+| `TOPIC_GATE_MARGIN` | `0.02` | How clearly off-topic a question must be to block it; higher blocks less. Tuned so no resident test question is blocked. Reference examples: `app/nlu/topic_examples.py` |
+| `LLM_DAILY_CALL_LIMIT` | `0` | Cost cap: maximum language-model calls per day per server (0 = unlimited). Cached and filtered questions don't count |
 | `CACHE_MAX_ENTRIES` / `CACHE_TTL_SECONDS` | `5000` / `86400` | Plan cache (repeat questions cost 0 tokens) |
 | `SESSION_TTL_SECONDS` | `1800` | How long follow-up context is kept per conversation |
-| `RATE_LIMIT_PER_MINUTE` | `60` | Per-IP limit on `POST /api/query` |
+| `RATE_LIMIT_PER_MINUTE` / `RATE_LIMIT_PER_DAY` | `60` / `2000` | Per-IP limits on `POST /api/query` |
 | `API_TOKEN` | – | If set, `/api/*` (except health/ready) requires `Authorization: Bearer <token>` |
 | `CORS_ORIGINS` | – | Comma-separated allowed origins when the UI is served from another domain |
 | `ENABLE_DATA_BROWSER` | `false` | Exposes `GET /api/residents` for the in-app record browser |
