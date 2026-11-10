@@ -58,13 +58,18 @@ class GeminiTranslator:
             await aclose()
 
     async def translate(
-        self, masked_question: str, today: str, wings: list[str], previous_plan_json: str | None
+        self,
+        masked_question: str,
+        today: str,
+        wings: list[str],
+        previous_plan_json: str | None,
+        hint: str | None = None,
     ) -> Translation:
         model = self._settings.gemini_model
         try:
             response = await self._client.aio.models.generate_content(
                 model=model,
-                contents=build_user_message(masked_question, today, wings, previous_plan_json),
+                contents=build_user_message(masked_question, today, wings, previous_plan_json, hint),
                 config=self._config,
             )
         except errors.ClientError as exc:  # 4xx

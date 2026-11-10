@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 from app.models.plan import QueryPlan
+from app.nlu.prompt import conditions_to_filters
 from app.nlu.vocabulary import EntityIndex, MaskResult, Resolution
 
 
@@ -36,7 +37,12 @@ def _clarify(message: str, options: list[dict] | None = None) -> QueryPlan:
 
 def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str) -> ResolveOutcome:
     plan = _clean(copy.deepcopy(raw)) if isinstance(raw, dict) else {}
+    # The model returns an order-free list of conditions; convert it to filters (older cached plans use filters).
+    if isinstance(plan.get("conditions"), list):
+        converted = conditions_to_filters(plan.pop("conditions"))
+        plan["filters"] = {**converted, **plan.get("filters", {})}
     plan.setdefault("filters", {})
+    plan["filters"] = {k: v for k, v in plan["filters"].items() if v not in ({}, [], None)}
     unknown: list[str] = []
 
     resolvers = {

@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.models.plan import Filters, QueryPlan
-from app.nlu.prompt import OUTPUT_SCHEMA, SYSTEM_PROMPT
+from app.nlu.prompt import OUTPUT_SCHEMA, SYSTEM_PROMPT, conditions_to_filters, filters_to_conditions
 
 
 def test_valid_combined_plan():
@@ -58,9 +58,39 @@ def test_output_schema_objects_forbid_extra_properties():
 
 
 def test_output_schema_mirrors_pydantic_model():
-    # options are server-generated; uses_previous is a cache hint consumed by the service, not part of the plan
-    assert set(OUTPUT_SCHEMA["properties"]) - {"uses_previous"} == set(QueryPlan.model_fields) - {"options"}
-    assert set(OUTPUT_SCHEMA["properties"]["filters"]["properties"]) == set(Filters.model_fields)
+    # options are server-generated; uses_previous is a cache hint; the model writes filters as a list of conditions
+    model_side = set(OUTPUT_SCHEMA["properties"]) - {"uses_previous", "conditions"} | {"filters"}
+    assert model_side == set(QueryPlan.model_fields) - {"options"}
+    condition_fields = OUTPUT_SCHEMA["properties"]["conditions"]["items"]["properties"]["field"]["enum"]
+    assert set(condition_fields) == set(Filters.model_fields)
+
+
+def test_conditions_convert_to_filters_in_any_order():
+    conds = [
+        {"field": "primary_caregiver", "include": ["Elena Rostova"]},
+        {"field": "admission_date", "start": "2026-10-01", "end": "2026-10-31"},
+        {"field": "status", "include": ["active"]},
+        {"field": "status", "include": ["pending"]},
+        {"field": "age", "min": 80},
+    ]
+    f = conditions_to_filters(conds)
+    assert f == {
+        "primary_caregiver": {"include": ["Elena Rostova"]},
+        "admission_date": {"start": "2026-10-01", "end": "2026-10-31"},
+        "status": {"include": ["active", "pending"]},
+        "age": {"min": 80},
+    }
+    assert conditions_to_filters(filters_to_conditions(f)) == f
+
+
+def test_malformed_conditions_fail_validation():
+    for bad in (
+        [{"field": "diagnosis", "include": ["x"]}],
+        [{"field": "status", "start": "2026-01-01"}],
+        [{"include": ["a"]}],
+    ):
+        with pytest.raises(ValidationError):
+            QueryPlan.model_validate({"action": "count", "filters": conditions_to_filters(bad)})
 
 
 def test_system_prompt_is_static_for_prompt_caching():

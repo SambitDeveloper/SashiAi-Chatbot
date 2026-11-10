@@ -18,11 +18,15 @@ class FakeTranslator:
         self.fail = fail
         self.calls: list[dict] = []
 
-    async def translate(self, masked_question, today, wings, previous_plan_json):
-        self.calls.append({"question": masked_question, "today": today, "wings": wings, "previous": previous_plan_json})
+    async def translate(self, masked_question, today, wings, previous_plan_json, hint=None):
+        self.calls.append(
+            {"question": masked_question, "today": today, "wings": wings, "previous": previous_plan_json, "hint": hint}
+        )
         if self.fail:
             raise TranslatorUnavailable("connection")
         plan = self.plans.get(masked_question.lower())
+        if isinstance(plan, list):  # successive answers for the same question (e.g. a retry)
+            plan = plan.pop(0) if len(plan) > 1 else plan[0]
         if plan is None:
             raise AssertionError(f"no fake plan for masked question: {masked_question!r}")
         return Translation(

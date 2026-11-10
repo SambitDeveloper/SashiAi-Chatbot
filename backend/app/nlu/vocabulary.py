@@ -169,6 +169,56 @@ class EntityIndex:
                 ids.append(r.resident_id)
         return ids if best >= FULL_NAME_THRESHOLD else []
 
+    # ------------------------------------------------------------------ mentions (completeness check)
+    def mentioned_caregivers(self, text: str) -> dict[str, list[str]]:
+        """Caregivers named in the question, as {text written: [exact database values]}.
+
+        Full names (typo tolerant, titles ignored) or an exact surname. A first name alone is too ambiguous.
+        Used to check that the plan did not drop a caregiver condition.
+        """
+        tokens = [(m.group(0), _norm(m.group(0))) for m in _TOKEN_RE.finditer(text)]
+        found: dict[str, list[str]] = {}
+        used: set[int] = set()
+        for size in (4, 3, 2):
+            for i in range(len(tokens) - size + 1):
+                idx = range(i, i + size)
+                if any(j in used for j in idx):
+                    continue
+                words = [tokens[j][1] for j in idx if tokens[j][1] not in _TITLE_WORDS]
+                if len(words) < 2:
+                    continue
+                concat = "".join(words)
+                hits = [
+                    c.value
+                    for c in self._caregivers
+                    if len(c.tokens) > 1
+                    and self._window_is_name(words, c.tokens)
+                    and fuzz.ratio(concat, c.person) >= FULL_NAME_THRESHOLD
+                ]
+                if hits:
+                    found[" ".join(tokens[j][0] for j in idx)] = hits
+                    used.update(idx)
+        for j, (raw, n) in enumerate(tokens):
+            if j in used or len(n) < 4:
+                continue
+            hits = [c.value for c in self._caregivers if len(c.tokens) > 1 and n == c.tokens[-1]]
+            if hits:
+                found[raw] = hits
+        return found
+
+    def mentioned_wings(self, text: str) -> dict[str, list[str]]:
+        """Wings named in full in the question (typo tolerant), as {wing: [wing]}."""
+        tokens = [_norm(m.group(0)) for m in _TOKEN_RE.finditer(text)]
+        found: dict[str, list[str]] = {}
+        for wing in self.wings:
+            parts = _name_parts(wing)
+            target = " ".join(parts)
+            for i in range(len(tokens) - len(parts) + 1):
+                if fuzz.ratio(" ".join(tokens[i : i + len(parts)]), target) >= 90:
+                    found[wing] = [wing]
+                    break
+        return found
+
     # ------------------------------------------------------------------ resolution
     def resolve_resident(self, ref: str, placeholders: dict[str, list[str]]) -> Resolution:
         ref = ref.strip()

@@ -1,4 +1,6 @@
-"""End-to-end pipeline tests with a fake translator in place of Claude."""
+"""End-to-end pipeline tests with a fake translator in place of the language model."""
+
+import json
 
 from tests.conftest import TODAY, FakeTranslator
 
@@ -195,3 +197,145 @@ async def test_token_usage_reported(make_service):
     result = await service.handle(q)
     assert result["tokenUsage"]["cache_read_input_tokens"] == 600
     assert service.stats.output_tokens == 40
+
+
+# ---------------------------------------------------------------- completeness check (dropped conditions)
+ELENA_Q = (
+    "How many active residents are available who joined october month and undergoes Care Aide Elena Rostova care taker?"
+)
+ACTIVE_OCTOBER = {
+    "action": "count",
+    "filters": {"status": {"include": ["active"]}, "admission_date": {"start": "2026-10-01", "end": "2026-10-31"}},
+}
+ACTIVE_OCTOBER_ELENA = {
+    "action": "count",
+    "filters": {
+        "status": {"include": ["active"]},
+        "admission_date": {"start": "2026-10-01", "end": "2026-10-31"},
+        "primary_caregiver": {"include": ["Elena Rostova"]},
+    },
+}
+
+
+async def test_dropped_caregiver_is_caught_and_retried(make_service):
+    # Gemini's real first answer for this question left out the caregiver (answer 12 instead of 2).
+    fake = FakeTranslator({ELENA_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER_ELENA]})
+    service = await make_service(fake)
+    result = await service.handle(ELENA_Q)
+    assert result["response"]["count"] == 2  # Emily Dickinson, Cecilia Payne-Gaposchkin
+    assert "Caregiver: Care Aide Elena Rostova" in result["interpretation"]
+    assert len(fake.calls) == 2 and "Elena Rostova" in fake.calls[1]["hint"]
+    assert result["tokensConsumed"] == 2 * 760  # both calls are counted
+    # the corrected plan is what gets cached
+    again = await service.handle(ELENA_Q)
+    assert again["tier"] == "cache" and again["response"]["count"] == 2
+
+
+async def test_still_incomplete_after_retry_asks_the_user(make_service):
+    fake = FakeTranslator({ELENA_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER]})
+    service = await make_service(fake)
+    result = await service.handle(ELENA_Q)
+    assert result["response"]["needsClarification"] and "Elena Rostova" in result["response"]["summaryText"]
+    assert result["mcpCall"] is None  # nothing was executed
+    await service.handle(ELENA_Q)
+    assert len(fake.calls) == 4, "an incomplete plan must never be cached"
+
+
+async def test_dropped_wing_is_caught(make_service):
+    q = "How many active residents are in the North Wing?"
+    fake = FakeTranslator(
+        {
+            q: [
+                {"action": "count", "filters": {"status": {"include": ["active"]}}},
+                {
+                    "action": "count",
+                    "filters": {"status": {"include": ["active"]}, "wing": {"include": ["North Wing"]}},
+                },
+            ]
+        }
+    )
+    service = await make_service(fake)
+    result = await service.handle(q)
+    assert len(fake.calls) == 2 and "Wing: North Wing" in result["interpretation"]
+
+
+async def test_no_retry_when_plan_is_complete(make_service):
+    cases = {
+        "Tell me the count of active residents whose care taker is Nurse Sarah Jenkins?": JENKINS_ACTIVE,
+        "How many residents per caregiver?": {"action": "breakdown", "group_by": ["primary_caregiver"]},
+        "Which residents does Maya Patel look after?": {
+            "action": "list",
+            "filters": {"primary_caregiver": {"include": ["Maya Patel"]}},
+        },
+        "Who is the caretaker of resident_1?": {
+            "action": "lookup",
+            "lookup": {"residents": ["resident_1"], "attributes": ["primary_caregiver"]},
+        },
+    }
+    fake = FakeTranslator(cases)
+    service = await make_service(fake)
+    for q in [*list(cases)[:3], "Who is the caretaker of Eleanor Vance?"]:
+        await service.handle(q)
+    assert len(fake.calls) == 4 and all(c["hint"] is None for c in fake.calls)
+    assert service.stats.completeness_retries == 0
+
+
+async def test_model_conditions_format_end_to_end(make_service):
+    fake = FakeTranslator(
+        {
+            ELENA_Q: {
+                "action": "count",
+                "conditions": [
+                    {"field": "status", "include": ["active"]},
+                    {"field": "admission_date", "start": "2026-10-01", "end": "2026-10-31"},
+                    {"field": "primary_caregiver", "include": ["Elena Rostova"]},
+                ],
+            }
+        }
+    )
+    service = await make_service(fake)
+    result = await service.handle(ELENA_Q)
+    assert result["response"]["count"] == 2 and len(fake.calls) == 1
+
+
+async def test_empty_invented_condition_is_ignored(make_service):
+    q = "how many residents in memory care came in this year"
+    fake = FakeTranslator(
+        {
+            q: {
+                "action": "count",
+                "conditions": [
+                    {"field": "care_type", "include": ["memory_care"]},
+                    {"field": "admission_date", "start": "2026-01-01", "end": "2026-11-09"},
+                    {"field": "discharge_date"},
+                ],
+            }
+        }
+    )
+    service = await make_service(fake)
+    result = await service.handle(q)
+    assert not result["response"].get("needsClarification")
+    assert not any(c.startswith("Discharged") for c in result["interpretation"])
+
+
+async def test_previous_plan_is_shown_as_conditions(make_service):
+    q1, q2 = "How many active residents are there?", "And in memory care?"
+    fake = FakeTranslator(
+        {
+            q1: {"action": "count", "conditions": [{"field": "status", "include": ["active"]}]},
+            q2: {
+                "action": "count",
+                "conditions": [
+                    {"field": "status", "include": ["active"]},
+                    {"field": "care_type", "include": ["memory_care"]},
+                ],
+                "uses_previous": True,
+            },
+        }
+    )
+    service = await make_service(fake)
+    await service.handle(q1, session_id="c1")
+    result = await service.handle(q2, session_id="c1")
+    previous = json.loads(fake.calls[1]["previous"])
+    assert "filters" not in previous and {"field": "status", "include": ["active"]} in previous["conditions"]
+    assert result["response"]["count"] == 15

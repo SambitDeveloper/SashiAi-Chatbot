@@ -47,7 +47,12 @@ class TranslatorUnavailable(Exception):
 
 class Translator(Protocol):
     async def translate(
-        self, masked_question: str, today: str, wings: list[str], previous_plan_json: str | None
+        self,
+        masked_question: str,
+        today: str,
+        wings: list[str],
+        previous_plan_json: str | None,
+        hint: str | None = None,
     ) -> Translation: ...
 
 
@@ -67,7 +72,12 @@ class ClaudeTranslator:
         await self._client.close()
 
     async def translate(
-        self, masked_question: str, today: str, wings: list[str], previous_plan_json: str | None
+        self,
+        masked_question: str,
+        today: str,
+        wings: list[str],
+        previous_plan_json: str | None,
+        hint: str | None = None,
     ) -> Translation:
         s = self._settings
         extra: dict = {}
@@ -79,7 +89,10 @@ class ClaudeTranslator:
                 max_tokens=s.anthropic_max_tokens,
                 system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
                 messages=[
-                    {"role": "user", "content": build_user_message(masked_question, today, wings, previous_plan_json)}
+                    {
+                        "role": "user",
+                        "content": build_user_message(masked_question, today, wings, previous_plan_json, hint),
+                    }
                 ],
                 output_config={
                     "effort": s.anthropic_effort,

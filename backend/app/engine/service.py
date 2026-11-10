@@ -19,6 +19,7 @@ from app.engine.resolver import resolve_plan
 from app.engine.responder import HELP_OPTIONS, build_response
 from app.engine.stores import TTLCache
 from app.models.plan import QueryPlan
+from app.nlu.prompt import filters_to_conditions
 from app.nlu.topic_gate import TopicGate
 from app.nlu.translator import TokenUsage, Translator, TranslatorUnavailable
 from app.nlu.vocabulary import EntityIndex
@@ -52,12 +53,22 @@ class Stats:
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     llm_errors: int = 0
+    completeness_retries: int = 0
 
     def add(self, u: TokenUsage) -> None:
         self.input_tokens += u.input_tokens
         self.output_tokens += u.output_tokens
         self.cache_read_input_tokens += u.cache_read_input_tokens
         self.cache_creation_input_tokens += u.cache_creation_input_tokens
+
+
+def _sum_usage(a: TokenUsage, b: TokenUsage) -> TokenUsage:
+    return TokenUsage(
+        input_tokens=a.input_tokens + b.input_tokens,
+        output_tokens=a.output_tokens + b.output_tokens,
+        cache_read_input_tokens=a.cache_read_input_tokens + b.cache_read_input_tokens,
+        cache_creation_input_tokens=a.cache_creation_input_tokens + b.cache_creation_input_tokens,
+    )
 
 
 def _cache_key(today: str, masked_question: str, previous_json: str | None) -> str:
@@ -118,6 +129,9 @@ class QueryService:
         mask = self.index.mask(question)
 
         previous = self.sessions.get(session_id) if session_id else None
+        if previous and "filters" in previous:  # show the model its own (conditions) format
+            conditions = filters_to_conditions(previous.pop("filters"))
+            previous = {**previous, "conditions": conditions}
         previous_json = json.dumps(previous, sort_keys=True, separators=(",", ":")) if previous else None
 
         # Two cache keys: standalone questions are cached WITHOUT the conversation, so a repeat hits the cache
@@ -164,9 +178,42 @@ class QueryService:
 
         outcome = resolve_plan(raw, self.index, mask, question)
         plan = outcome.plan
+        cacheable = tier == "llm" and not outcome.problem
+
+        # Completeness check (data-driven): if the question names a caregiver or wing from the database that the
+        # plan does not use, the model dropped a condition. Ask once more with a pointer; if it is still missing,
+        # ask the user rather than answer with a wrong number. Incomplete plans are never cached.
+        missing = self._missing_conditions(plan, question) if tier == "llm" and not outcome.problem else []
+        if missing:
+            self.stats.completeness_retries += 1
+            log.warning("plan dropped a condition; retrying", extra={"missing": len(missing)})
+            hint = (
+                f"The question names {', '.join(missing)}. Every condition in the question must be in the plan "
+                "(as filters for counts and lists)."
+            )
+            try:
+                retry = await self.translator.translate(mask.text, today, self.index.wings, previous_json, hint)
+                self.stats.add(retry.usage)
+                usage = _sum_usage(usage, retry.usage)
+                raw = retry.plan
+                uses_previous = bool(raw.pop("uses_previous", False)) if isinstance(raw, dict) else False
+                outcome = resolve_plan(raw, self.index, mask, question)
+                plan = outcome.plan
+                missing = [] if outcome.problem else self._missing_conditions(plan, question)
+                cacheable = not outcome.problem and not missing
+            except TranslatorUnavailable:
+                self.stats.llm_errors += 1
+            if missing:
+                cacheable = False
+                plan = QueryPlan(
+                    action="clarify",
+                    message=f"I couldn't apply every condition in your question ({', '.join(missing)}). "
+                    "Please rephrase it, for example: 'active residents of Elena Rostova admitted in October'.",
+                )
+
         if outcome.problem:
             log.info("plan resolution: %s", outcome.problem)
-        elif tier == "llm":  # cache only plans that resolved cleanly
+        elif cacheable:  # cache only complete plans that resolved cleanly
             self.cache.set(followup_key if (uses_previous and followup_key) else standalone_key, raw)
 
         data = await execute(plan, self.repo)
@@ -243,6 +290,32 @@ class QueryService:
             else None,
             "response": {**response, "isLlmInterpreted": tier == "llm"},
         }
+
+    def _missing_conditions(self, plan: QueryPlan, question: str) -> list[str]:
+        """Caregivers or wings named in the question (matched against database values) that the plan ignores."""
+        if not plan.is_data_query:
+            return []
+        f = plan.filters
+        attrs = set(plan.lookup.attributes) if plan.lookup else set()
+        groups = set(plan.group_by or [])
+        missing: list[str] = []
+
+        used = (
+            set((f.primary_caregiver.include or []) + (f.primary_caregiver.exclude or []))
+            if f.primary_caregiver
+            else set()
+        )
+        if "primary_caregiver" not in groups and "primary_caregiver" not in attrs:
+            for text, values in self.index.mentioned_caregivers(question).items():
+                if not used & set(values):
+                    missing.append(f'caregiver "{text}"')
+
+        used = set((f.wing.include or []) + (f.wing.exclude or [])) if f.wing else set()
+        if "wing" not in groups and not attrs & {"wing", "room_number"}:
+            for text, values in self.index.mentioned_wings(question).items():
+                if not used & set(values):
+                    missing.append(f'wing "{text}"')
+        return missing
 
     def _daily_limit_reached(self, today: str) -> bool:
         """Counts model calls per calendar day (per process). Returns True when the configured cap is hit."""
