@@ -59,4 +59,12 @@ logs/
 tmp/
 .cache/
 
-# Lockfiles (package-lock.json, uv.lock) are intentionally committed for reproducible installs.
+# Lockfiles (package-lock.json, backend/uv.lock) and .nvmrc are intentionally committed for reproducible installs
+# (the Dockerfile runs `uv sync --frozen` against backend/uv.lock).
+
+# ---------- Local LLM weights and benchmark output ----------
+# Model weights are fetched per host by backend/scripts/fetch_model.sh (multi-GB) and never committed.
+*.gguf
+*.gguf.part
+# Benchmark/load-test reports contain questions, plans and model output; keep them out of git.
+backend/bench-results/

@@ -6,6 +6,9 @@ backend/.models
 **/.pytest_cache
 **/.ruff_cache
 .git
-.env*
-!.env.example
-*.log
+**/.env*
+!**/.env.example
+**/*.log
+**/*.gguf
+**/*.gguf.part
+backend/bench-results

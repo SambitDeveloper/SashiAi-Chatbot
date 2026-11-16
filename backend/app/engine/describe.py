@@ -3,10 +3,12 @@
 from collections.abc import Callable
 from datetime import date
 
+from app.data.repository import MISSING_GROUP
 from app.models.plan import DateRange, Filters, QueryPlan
 
 STATUS_LABELS = {
     "active": "Active",
+    "away": "Away",
     "inactive": "Inactive",
     "pending": "Pending Intake",
     "admitted": "Recently Admitted",
@@ -22,18 +24,19 @@ CARE_TYPE_LABELS = {
 GROUP_LABELS = {
     "status": "Status",
     "care_type": "Care Type",
-    "wing": "Wing",
+    "facility": "Facility",
     "gender": "Gender",
     "primary_caregiver": "Caregiver",
 }
 ATTRIBUTE_LABELS = {
     "primary_caregiver": "Primary Caregiver",
     "room_number": "Room",
-    "wing": "Wing",
+    "facility": "Facility",
     "admission_date": "Admission Date",
     "created_date": "Registration Date",
     "discharge_date": "Discharge Date",
     "emergency_contact": "Emergency Contact",
+    "resident_id": "Resident ID",
     "status": "Status",
     "care_type": "Care Type",
     "age": "Age",
@@ -42,7 +45,7 @@ ATTRIBUTE_LABELS = {
 _SET_FIELDS = [
     ("status", "Status"),
     ("care_type", "Care Type"),
-    ("wing", "Wing"),
+    ("facility", "Facility"),
     ("gender", "Gender"),
     ("primary_caregiver", "Caregiver"),
     ("room_number", "Room"),
@@ -50,6 +53,8 @@ _SET_FIELDS = [
 
 
 def label_value(field_name: str, value: str) -> str:
+    if value == MISSING_GROUP:  # the one group of residents whose field is not recorded
+        return MISSING_GROUP
     if field_name == "status":
         return STATUS_LABELS.get(value, value)
     if field_name == "care_type":
@@ -74,24 +79,32 @@ def describe_filters(f: Filters) -> list[str]:
         sf = getattr(f, field_name)
         if sf is None:
             continue
-        if sf.include:
-            chips.append(f"{label}: {' or '.join(label_value(field_name, v) for v in sf.include)}")
+        if sf.include or sf.missing is True:
+            shown = [label_value(field_name, v) for v in sf.include or []]
+            if sf.missing is True:
+                shown.append("not recorded")
+            chips.append(f"{label}: {' or '.join(shown)}")
+        if sf.missing is False:
+            chips.append(f"{label}: recorded")
         if sf.exclude:
             chips.append(f"{label}: not {' / '.join(label_value(field_name, v) for v in sf.exclude)}")
     if f.age:
         lo, hi = f.age.min, f.age.max
-        if lo is not None and hi is not None:
-            chips.append(f"Age: {lo}" if lo == hi else f"Age: {lo}–{hi}")
-        elif lo is not None:
-            chips.append(f"Age: {lo}+")
+        if not f.age.has_range:
+            chips.append("Age: not recorded" if f.age.missing else "Age: recorded")
         else:
-            chips.append(f"Age: {hi} or younger")
-    if f.admission_date:
-        chips.append(f"Admitted: {_range_text(f.admission_date)}")
-    if f.created_date:
-        chips.append(f"Registered: {_range_text(f.created_date)}")
-    if f.discharge_date:
-        chips.append(f"Discharged: {_range_text(f.discharge_date)}")
+            text = f"Age: {lo}" if lo == hi else f"Age: {lo}–{hi}" if lo is not None and hi is not None else (
+                f"Age: {lo}+" if lo is not None else f"Age: {hi} or younger"
+            )
+            chips.append(text + (" or not recorded" if f.age.missing else ""))
+    for field_name, label in (("admission_date", "Admitted"), ("created_date", "Registered"), ("discharge_date", "Discharged")):
+        r = getattr(f, field_name)
+        if r is None:
+            continue
+        if not r.has_range:
+            chips.append(f"{label}: {'date not recorded' if r.missing else 'date recorded'}")
+        else:
+            chips.append(f"{label}: {_range_text(r)}" + (" or date not recorded" if r.missing else ""))
     return chips
 
 
@@ -102,6 +115,8 @@ def describe_plan(plan: QueryPlan, name_of: Callable[[str], str]) -> list[str]:
             chips.append("Count")
         case "list":
             chips.append("List")
+            if plan.output_fields:
+                chips.append("Show: " + ", ".join(ATTRIBUTE_LABELS.get(a, a) for a in plan.output_fields))
         case "breakdown":
             chips.append("Breakdown by " + " × ".join(GROUP_LABELS[g] for g in plan.group_by))
         case "aggregate":
@@ -111,7 +126,7 @@ def describe_plan(plan: QueryPlan, name_of: Callable[[str], str]) -> list[str]:
             )
         case "lookup":
             chips.extend(f"Resident: {name_of(i)} ({i})" for i in plan.lookup.residents)
-            chips.extend(f"Asked: {ATTRIBUTE_LABELS.get(a, a)}" for a in plan.lookup.attributes)
+            chips.extend(f"Asked: {ATTRIBUTE_LABELS.get(a, a)}" for a in plan.output_fields)
     chips.extend(describe_filters(plan.filters))
     if plan.sort:
         s = plan.sort

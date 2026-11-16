@@ -2,7 +2,7 @@
  * Canonical types for the Care App Resident Query AI System
  */
 
-export type ResidentStatus = 'active' | 'inactive' | 'pending' | 'admitted' | 'discharged';
+export type ResidentStatus = 'active' | 'away' | 'inactive' | 'pending' | 'admitted' | 'discharged';
 
 export type ResidentCareType = 
   | 'assisted_living'
@@ -46,14 +46,13 @@ export type QueryCategory =
   | 'OUT_OF_POLICY'
   | 'AMBIGUOUS_QUERY';
 
-/** How the plan was produced: by Claude, from the plan cache, or not at all (model unavailable). */
-export type UnderstandingTier = 'llm' | 'cache' | 'gate' | 'unavailable';
+/** How the plan was produced: by the local Qwen model ('llm'), the deterministic planner ('direct'), the plan cache, or not at all. */
+export type UnderstandingTier = 'llm' | 'cache' | 'gate' | 'direct' | 'unavailable';
 
+/** Local model token counts (informational: the model runs on our server, there is no per-token cost). */
 export interface TokenUsage {
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_input_tokens: number;
-  cache_creation_input_tokens: number;
+  prompt_tokens: number;
+  completion_tokens: number;
 }
 
 export interface GenericBreakdown {
@@ -172,6 +171,11 @@ export interface QueryExecutionResult {
   /** How the question was understood, e.g. ["Count", "Status: Active", "Caregiver: Nurse Sarah Jenkins, RN"]. */
   interpretation?: string[];
   tokenUsage?: TokenUsage;
+  /** Local model inferences for this question (0 for deterministic answers). */
+  modelCalls?: number;
+  model?: string | null;
+  /** Always 0: no external language model is called. */
+  externalLlmCalls?: number;
   response: {
     headline: string;
     summaryText: string;
@@ -187,6 +191,8 @@ export interface QueryExecutionResult {
     isPolicyViolation?: boolean;
     needsClarification?: boolean;
     clarificationOptions?: Array<{ label: string; query: string }> | null;
+    /** Explicit projection: the columns the question asked to see (identity is always shown). Absent → default columns. */
+    columns?: ResultColumn[];
   };
 }
 
@@ -196,4 +202,11 @@ export interface ChatMessage {
   timestamp: string;
   content: string;
   execution?: QueryExecutionResult;
+}
+
+/** One requested output column: the record key, its label and the plan attribute it comes from. */
+export interface ResultColumn {
+  key: string;
+  label: string;
+  attribute: string;
 }

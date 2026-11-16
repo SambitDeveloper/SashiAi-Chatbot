@@ -1,0 +1,180 @@
+# Resident schema mapping — how the Care App's `residents` collection becomes the fields this assistant uses.
+# Configuration, not code: when the database changes (field renamed, new collection to join), edit this file.
+#
+# Every query runs inside MongoDB as:   match  →  joins  →  derived fields  →  whitelist  →  the question's filters
+# Only the whitelisted fields ever leave the database; everything else in a resident document (medications,
+# insurance, phone, email, address, PCC details, ...) is dropped by MongoDB itself.
+
+# 0. Fields the collection must have; startup stops with a clear message when one is missing.
+required_source_fields: [firstName, lastName, status, careType]
+
+# 1. Which documents count as residents at all
+match:
+  deletedAt: null                     # soft-deleted residents are never included
+
+# 2. Joins to other collections (MongoDB $lookup). Only the projected fields are read from them.
+joins:
+  - from: staffs                      # assigned staff → their names
+    localField: assignedStaff         # array of staff ids
+    foreignField: cName
+    as: _staff
+    fields: {name: 1}
+  - from: facilities                  # facility code → facility name
+    localField: facilityId
+    foreignField: facilityId
+    as: _facility
+    fields: {facilityName: 1}
+
+# 3. App field → MongoDB expression (any aggregation expression). The app's query engine only sees these names.
+fields:
+  # residentId is the BUSINESS id shown to staff; see `identities` below for why it currently equals the record id.
+  residentId: {$toString: "$_id"}
+  id: {$toString: "$_id"}
+  # Every mapping below is TYPE-SAFE: a value of an unexpected type (a list where text belongs, a number, a date stored
+  # as text or text stored as a date) becomes "not recorded" (or is converted when the meaning is clear) instead of
+  # raising a MongoDB error. One malformed resident must never make every query fail.
+  firstName: {$convert: {input: "$firstName", to: string, onError: "", onNull: ""}}
+  lastName: {$convert: {input: "$lastName", to: string, onError: "", onNull: ""}}
+  # status values in the database: Active / Discharged / Away → active / discharged / away
+  status: {$cond: [{$eq: [{$type: "$status"}, "string"]}, {$toLower: "$status"}, "unknown"]}
+  careType: {$cond: [{$eq: [{$type: "$careType"}, "string"]}, "$careType", "unknown"]}
+  gender:
+    $let:
+      vars:
+        g: {$cond: [{$eq: [{$type: "$gender"}, "string"]}, {$toLower: "$gender"}, ""]}
+      in:
+        $switch:
+          branches:
+            - case: {$in: ["$$g", ["f", "female"]]}
+              then: Female
+            - case: {$in: ["$$g", ["m", "male"]]}
+              then: Male
+          default: Other
+  # age: stored for few residents, so it is calculated from birthDate (YYYY-MM-DD text, or a stored date) when missing.
+  # Implausible values (typos such as year 1683 or a future date) become "unknown" instead of skewing answers.
+  age:
+    $let:
+      vars:
+        bd:
+          $switch:
+            branches:
+              - case: {$eq: [{$type: "$birthDate"}, "date"]}
+                then: {$dateToString: {format: "%Y-%m-%d", date: "$birthDate"}}
+              - case: {$eq: [{$type: "$birthDate"}, "string"]}
+                then: "$birthDate"
+            default: ""
+      in:
+        $let:
+          vars:
+            a:
+              $ifNull:
+                - {$convert: {input: "$age", to: "int", onError: null, onNull: null}}
+                - $cond:
+                    - {$regexMatch: {input: "$$bd", regex: "^\\d{4}-\\d{2}-\\d{2}$"}}
+                    - $subtract:
+                        - {$subtract: [{$year: "$$NOW"}, {$toInt: {$substrCP: ["$$bd", 0, 4]}}]}
+                        - $cond:
+                            - {$lt: [{$dateToString: {format: "%m-%d", date: "$$NOW"}}, {$substrCP: ["$$bd", 5, 5]}]}
+                            - 1
+                            - 0
+                    - null
+          in: {$cond: [{$and: [{$gte: ["$$a", 0]}, {$lte: ["$$a", 120]}]}, "$$a", null]}
+  roomNumber: {$convert: {input: "$unitNo", to: string, onError: "", onNull: ""}}
+  # "wing" in the assistant = the facility (name when the facility record exists, otherwise its code, always as text)
+  wing:
+    $convert:
+      input: {$ifNull: [{$first: "$_facility.facilityName"}, {$ifNull: ["$facilityId", "Unknown"]}]}
+      to: string
+      onError: Unknown
+      onNull: Unknown
+  # all assigned staff names; a caregiver filter matches if ANY assigned staff member matches. Staff records without a
+  # usable name (null, "", not text) are left out, so they neither hide the real caregivers nor form a fake one.
+  primaryCaregiver:
+    $filter:
+      input: {$ifNull: ["$_staff.name", []]}
+      cond: {$and: [{$eq: [{$type: "$$this"}, "string"]}, {$ne: ["$$this", ""]}]}
+  admissionDate:
+    $switch:
+      branches:
+        - case: {$eq: [{$type: "$admissionDate"}, "date"]}
+          then: {$dateToString: {format: "%Y-%m-%d", date: "$admissionDate"}}
+        # $cond (not $and): only the chosen branch is evaluated, so $regexMatch never sees a non-text value
+        - case: {$cond: [{$eq: [{$type: "$admissionDate"}, "string"]}, {$regexMatch: {input: "$admissionDate", regex: "^\\d{4}-\\d{2}-\\d{2}$"}}, false]}
+          then: "$admissionDate"
+      default: null
+  createdDate:
+    $switch:
+      branches:
+        - case: {$eq: [{$type: "$createdAt"}, "date"]}
+          then: {$dateToString: {format: "%Y-%m-%d", date: "$createdAt"}}
+        # $cond (not $and): only the chosen branch is evaluated, so $regexMatch never sees a non-text value
+        - case: {$cond: [{$eq: [{$type: "$createdAt"}, "string"]}, {$regexMatch: {input: "$createdAt", regex: "^\\d{4}-\\d{2}-\\d{2}"}}, false]}
+          then: {$substrCP: ["$createdAt", 0, 10]}
+      default: null
+  dischargeDate:
+    $cond:
+      - {$eq: [{$type: "$dischargeDate"}, "date"]}
+      - {$dateToString: {format: "%Y-%m-%d", date: "$dischargeDate"}}
+      - null
+  emergencyContact:
+    name: {$convert: {input: "$emergencyContact", to: string, onError: "", onNull: ""}}
+    relationship: {$literal: ""}
+    phone: {$literal: ""}
+
+# 4. Fields that are lists in the database (a resident has several staff). Grouping by them counts each value.
+list_fields: [primaryCaregiver]
+
+# 5. Values the mapping above uses to mean "not recorded" for a field, besides null, an absent field, "" and an empty
+#    list (which always count as missing). Used by `missing: true/false` filters, identically in MongoDB and in the
+#    in-memory test repository. Example: a resident without facilityId is mapped to wing "Unknown".
+#    Gender is deliberately absent: the mapping turns a missing gender into "Other", which is a real gender value,
+#    so "no gender recorded" cannot be told apart from it.
+missing_values:
+  status: [unknown]
+  careType: [unknown]
+  wing: [Unknown]
+
+# 6. Projection: what a question may ask to SEE (plan attribute → view field above). A list result always carries the
+#    identity fields plus the requested ones; nothing else leaves the database for that question.
+#    single_record_only fields are never returned for several residents at once (privacy).
+output_fields:
+  room_number: roomNumber
+  facility: wing
+  primary_caregiver: primaryCaregiver
+  status: status
+  care_type: careType
+  gender: gender
+  age: age
+  admission_date: admissionDate
+  created_date: createdDate
+  discharge_date: dischargeDate
+  resident_id: residentId
+  emergency_contact: emergencyContact
+identity_fields: [residentId, id, firstName, lastName]
+single_record_only: [emergencyContact]
+
+# 7. Identities, kept distinct (they must not be used interchangeably):
+#    record   — MongoDB `_id`: the stable identity of a stored record (references, duplicate detection).
+#    business — `residentId`: what staff see. The collection has no business id for every resident (pcc_patientId exists
+#               for some), so the view currently derives it from _id; code must still treat the two as different keys.
+identities:
+  record: _id
+  business: residentId
+
+# 8. Fields that can be compared with ANOTHER record ("admitted on the same day as X"). Stage 1 uses only the kinds (to
+#    understand questions and reject plans that answer something else); execution comes with Stage 2.
+#    kind: date | number | value | relation (one related record, compared by identity) | relation_set (several).
+#    Comparisons per kind: date: equal, not_equal, less, greater, same_day, same_month, same_year · number: equal,
+#    not_equal, less, greater · value / relation: equal, not_equal · relation_set: overlaps (at least one in common),
+#    disjoint (none in common), same_set (exactly the same set), not_equal (not exactly the same set).
+comparable:
+  admission_date: {kind: date}
+  discharge_date: {kind: date}
+  created_date: {kind: date}
+  age: {kind: number}
+  status: {kind: value}
+  care_type: {kind: value}
+  gender: {kind: value}
+  room_number: {kind: value}
+  facility: {kind: relation, entity: facility, identity_field: facilityId}        # facility identity, never its name
+  primary_caregiver: {kind: relation_set, entity: staff, identity_field: assignedStaff}   # staff record ids (staffs.cName)

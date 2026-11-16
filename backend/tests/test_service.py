@@ -78,8 +78,11 @@ async def test_follow_up_uses_previous_plan(make_service):
     assert result["response"]["count"] == 9
 
     # A follow-up answer is tied to its conversation: the same words in a fresh chat must not reuse it.
-    await service.handle(q2, session_id="other-chat")
-    assert len(fake.calls) == 3 and fake.calls[2]["previous"] is None
+    # With no previous plan, "of them" has no referent: the model's active + Jenkins conditions are not in the
+    # question, so grounding rejects them (one retry, then a clarifying question instead of a wrong number).
+    fresh = await service.handle(q2, session_id="other-chat")
+    assert fake.calls[2]["previous"] is None and fresh["tier"] == "llm"
+    assert fresh["response"].get("needsClarification") and fresh["mcpCall"] is None
 
 
 async def test_repeated_question_in_same_chat_uses_cache(make_service):
@@ -189,14 +192,16 @@ async def test_no_model_configured(make_service):
     assert "not configured" in result["response"]["summaryText"]
 
 
-async def test_token_usage_reported(make_service):
+async def test_local_model_usage_reported(make_service):
+    # Billing fields (cache read/creation tokens) were removed with the external providers; local usage remains.
     q = "How many residents are active?"
     service = await make_service(
         FakeTranslator({q: {"action": "count", "filters": {"status": {"include": ["active"]}}}})
     )
     result = await service.handle(q)
-    assert result["tokenUsage"]["cache_read_input_tokens"] == 600
-    assert service.stats.output_tokens == 40
+    assert result["tokenUsage"] == {"prompt_tokens": 700, "completion_tokens": 40}
+    assert result["modelCalls"] == 1 and result["externalLlmCalls"] == 0
+    assert service.stats.completion_tokens == 40 and service.stats.external_llm_calls == 0
 
 
 # ---------------------------------------------------------------- completeness check (dropped conditions)
@@ -218,14 +223,14 @@ ACTIVE_OCTOBER_ELENA = {
 
 
 async def test_dropped_caregiver_is_caught_and_retried(make_service):
-    # Gemini's real first answer for this question left out the caregiver (answer 12 instead of 2).
+    # A real model answer for this question once left out the caregiver (answer 12 instead of 2).
     fake = FakeTranslator({ELENA_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER_ELENA]})
     service = await make_service(fake)
     result = await service.handle(ELENA_Q)
     assert result["response"]["count"] == 2  # Emily Dickinson, Cecilia Payne-Gaposchkin
     assert "Caregiver: Care Aide Elena Rostova" in result["interpretation"]
     assert len(fake.calls) == 2 and "Elena Rostova" in fake.calls[1]["hint"]
-    assert result["tokensConsumed"] == 2 * 760  # both calls are counted
+    assert result["tokensConsumed"] == 2 * 740 and result["modelCalls"] == 2  # both calls are counted
     # the corrected plan is what gets cached
     again = await service.handle(ELENA_Q)
     assert again["tier"] == "cache" and again["response"]["count"] == 2
@@ -237,8 +242,10 @@ async def test_still_incomplete_after_retry_asks_the_user(make_service):
     result = await service.handle(ELENA_Q)
     assert result["response"]["needsClarification"] and "Elena Rostova" in result["response"]["summaryText"]
     assert result["mcpCall"] is None  # nothing was executed
-    await service.handle(ELENA_Q)
-    assert len(fake.calls) == 4, "an incomplete plan must never be cached"
+    again = await service.handle(ELENA_Q)
+    # an incomplete plan is never cached as an answer; the known failure itself is, so asking again costs no model calls
+    assert again["response"]["needsClarification"] and again["mcpCall"] is None
+    assert len(fake.calls) == 2 and again["modelCalls"] == 0
 
 
 async def test_dropped_wing_is_caught(make_service):
@@ -256,7 +263,7 @@ async def test_dropped_wing_is_caught(make_service):
     )
     service = await make_service(fake)
     result = await service.handle(q)
-    assert len(fake.calls) == 2 and "Wing: North Wing" in result["interpretation"]
+    assert len(fake.calls) == 2 and "Facility: North Wing" in result["interpretation"]
 
 
 async def test_no_retry_when_plan_is_complete(make_service):
@@ -339,3 +346,45 @@ async def test_previous_plan_is_shown_as_conditions(make_service):
     previous = json.loads(fake.calls[1]["previous"])
     assert "filters" not in previous and {"field": "status", "include": ["active"]} in previous["conditions"]
     assert result["response"]["count"] == 15
+
+
+async def test_model_plans_are_reported_and_logged_without_names(make_service, caplog):
+    """Every plan the local model generated is in the response (as generated) and in the log (names redacted)."""
+    import logging
+
+    fake = FakeTranslator(
+        {ELENA_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER_ELENA]}  # first attempt drops the caregiver, the retry fixes it
+    )
+    service = await make_service(fake)
+    with caplog.at_level(logging.INFO, logger="app.engine.service"):
+        result = await service.handle(ELENA_Q)
+    plans = result["modelPlans"]
+    assert [p["attempt"] for p in plans] == [1, 2]
+    assert plans[0]["plan"] == ACTIVE_OCTOBER and "primary_caregiver" not in json.dumps(plans[0])
+    assert any("Elena Rostova" in f for f in plans[1]["feedback"])  # what the retry was told to fix
+    assert result["fallbackReason"] == "planner_not_ready"  # this test service has no semantic router
+    logged = [r for r in caplog.records if r.getMessage() == "local model plan generated"]
+    assert [r.attempt for r in logged] == [1, 2]
+
+
+def test_logged_model_plan_never_contains_resident_names():
+    from app.engine.service import _redact_for_log
+
+    raw = {"action": "lookup", "lookup": {"residents": ["Kessler Alphonse", "resident_1"]}, "message": "Is it Kessler?"}
+    red = _redact_for_log(raw)
+    assert red["lookup"]["residents"] == ["<resident name>", "resident_1"]
+    assert "Kessler" not in json.dumps(red) and raw["lookup"]["residents"][0] == "Kessler Alphonse"  # original intact
+
+
+async def test_model_text_never_shows_placeholders(make_service):
+    """The model sees resident_1; the user must never see it. Since Stage 1 the model's own wording is not shown at all
+    (it can be wrong or leak placeholders): a fixed backend message replaces it."""
+    q = "Does Eleanor Vance enjoy gardening?"
+    fake = FakeTranslator(
+        {"Does resident_1 enjoy gardening?": {"action": "unsupported", "message": "Resident_1's hobbies are not stored."}}
+    )
+    service = await make_service(fake)
+    result = await service.handle(q)
+    assert "resident_1" not in result["response"]["summaryText"].lower()
+    assert "hobbies are not stored" not in result["response"]["summaryText"]  # model wording is never shown
+    assert result["response"]["needsClarification"] and result["mcpCall"] is None

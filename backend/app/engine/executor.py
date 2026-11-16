@@ -2,8 +2,9 @@
 
 from dataclasses import dataclass, field
 
-from app.data.repository import GroupRow, Resident, ResidentRepository, list_view, matches
-from app.models.plan import Filters, QueryPlan, SetFilter
+from app.data.repository import GroupAggregateRow, GroupRow, Resident, ResidentRepository, list_view, matches
+from app.data.schema_config import output_fields
+from app.models.plan import QueryPlan
 
 SAMPLE_SIZE = 25
 
@@ -14,10 +15,18 @@ class ExecutionData:
     matched: int = 0
     rows: list[Resident] = field(default_factory=list)
     groups: list[GroupRow] | None = None
-    group_values: list[tuple[GroupRow, float | None]] | None = None
+    group_values: list[GroupAggregateRow] | None = None  # grouped aggregate: count + value per group
     aggregate_value: float | None = None
     looked_up: list[Resident] | None = None
     checks: list[bool] | None = None  # lookup + filters → does each resident satisfy the filters?
+
+
+def projected_view_fields(plan: QueryPlan) -> list[str] | None:
+    """The view fields a list should return (schema `output_fields`), or None for the default result shape."""
+    if plan.action != "list" or not plan.output_fields:
+        return None
+    mapping = output_fields()
+    return [mapping[a] for a in plan.output_fields if a in mapping]
 
 
 async def execute(plan: QueryPlan, repo: ResidentRepository) -> ExecutionData:
@@ -40,27 +49,24 @@ async def execute(plan: QueryPlan, repo: ResidentRepository) -> ExecutionData:
     if plan.action == "aggregate":
         matched = await repo.count(f)
         if plan.group_by:
-            groups = await repo.group_count(f, plan.group_by)
-            values = []
-            for g in groups:
-                gf = f.model_copy(deep=True)
-                for field_name, key in zip(plan.group_by, g.key, strict=True):
-                    setattr(gf, field_name, SetFilter[str](include=[key]))
-                values.append(
-                    (
-                        g,
-                        await repo.aggregate(
-                            Filters.model_validate(gf.model_dump(exclude_none=True)), plan.aggregate.op, "age"
-                        ),
-                    )
-                )
-            return ExecutionData(total=total, matched=matched, group_values=values)
+            # One grouped query: every group's count and aggregate together. A group key is never turned back into
+            # a filter, so a "not recorded" or unexpected value (status "unknown", no facility) cannot fail
+            # validation or silently match nothing (see repository.MISSING_GROUP).
+            rows = await repo.group_aggregate(f, plan.group_by, plan.aggregate.op, plan.aggregate.field)
+            return ExecutionData(total=total, matched=matched, group_values=rows)
         value = await repo.aggregate(f, plan.aggregate.op, plan.aggregate.field)
         return ExecutionData(total=total, matched=matched, aggregate_value=value)
 
-    if plan.action in ("count", "list"):
+    if plan.action == "count":
+        # A count returns only the number: no resident documents, caregivers, contacts or samples are fetched.
+        return ExecutionData(total=total, matched=await repo.count(f))
+
+    if plan.action == "list":
         matched = await repo.count(f)
-        rows = [list_view(r) for r in await repo.find(f, sort=plan.sort, limit=plan.limit or SAMPLE_SIZE)]
+        projection = projected_view_fields(plan)
+        found = await repo.find(f, sort=plan.sort, limit=plan.limit or SAMPLE_SIZE, fields=projection)
+        # a projection returns only identity + the requested fields; the default shape keeps list_view's privacy rule
+        rows = found if projection is not None else [list_view(r) for r in found]
         return ExecutionData(total=total, matched=matched, rows=rows)
 
     return ExecutionData(total=total)

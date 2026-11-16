@@ -164,7 +164,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                   <span className="text-xs font-semibold text-slate-200">Understanding</span>
                 </div>
                 <span className="text-[11px] font-mono text-teal-400">
-                  {execution.tier === 'cache' ? 'Plan cache' : execution.tier === 'gate' ? 'Local topic check' : execution.tier === 'llm' ? 'Language model' : 'Unavailable'}
+                  {execution.tier === 'cache' ? 'Plan cache' : execution.tier === 'gate' ? 'Local topic check' : execution.tier === 'direct' ? 'Semantic router → MongoDB MCP' : execution.tier === 'llm' ? 'Local Qwen model (llama.cpp)' : 'Unavailable'}
                 </span>
               </div>
               <div className="text-xs space-y-1">

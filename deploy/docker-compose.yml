@@ -1,0 +1,61 @@
+# Resident Query API + local Qwen3-4B-Instruct-2507 inference (llama.cpp, non-thinking, Q8_0 KV cache), single AWS host, CPU only.
+#
+#   1. once per host:  backend/scripts/fetch_model.sh /opt/sashi/models      (pinned + SHA-256 verified; MODEL=qwen3-4b-2507 default)
+#   2. docker compose -f deploy/docker-compose.yml up -d --build
+#
+# The llm service publishes NO host port and sits on an internal-only network: it is reachable only by the app
+# container (http://llm:8081) and cannot reach the internet itself. Only the app's port 8000 is published.
+
+services:
+  llm:
+    build:
+      context: .
+      dockerfile: llm.Dockerfile
+    command:
+      - --model=/models/${LLM_MODEL_FILE:-Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf}
+      - --host=0.0.0.0              # inside the internal network only (no `ports:` below)
+      - --port=8081
+      - --ctx-size=${LLM_CTX_SIZE:-4096}   # shared by the parallel slots (2 × 2048 tokens)
+      - --parallel=${LLM_PARALLEL:-2}      # keep equal to the app's LLM_MAX_CONCURRENCY
+      - --threads=${LLM_THREADS:-4}
+      - --threads-batch=${LLM_THREADS:-4}
+      - --cache-type-k=${LLM_CACHE_TYPE:-q8_0}   # Q8_0 KV: 238 MiB instead of 448 MiB (f16), same measured accuracy
+      - --cache-type-v=${LLM_CACHE_TYPE:-q8_0}
+      - --n-predict=256
+      - --timeout=30
+      - --reasoning=off             # no thinking tokens (Qwen3); no effect on Qwen2.5
+      - --no-webui
+      - --no-slots                  # the slots endpoint can expose prompt text
+      - --metrics                   # Prometheus metrics (internal network only)
+      - --offline                   # never attempt network access
+    volumes:
+      - ${MODEL_DIR:-/opt/sashi/models}:/models:ro
+    networks: [internal]
+    restart: unless-stopped
+    stop_grace_period: 20s          # finish in-flight generations on shutdown
+    mem_limit: 1536m                # measured peak RSS 1171 MB under concurrent load (see backend/README.md)
+    cpus: ${LLM_CPUS:-4}
+
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file: ../backend/.env
+    environment:
+      LLM_SERVER_URL: http://llm:8081
+      LLM_MAX_CONCURRENCY: ${LLM_PARALLEL:-2}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-qwen3-4b-instruct-2507-q4_k_m}
+      LLM_CHAT_TEMPLATE_KWARGS: ${LLM_CHAT_TEMPLATE_KWARGS:-{"enable_thinking": false}}
+    ports:
+      - "8000:8000"
+    depends_on:
+      llm:
+        condition: service_started  # simple questions are answered without the model; no hard dependency
+    networks: [internal, public]
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+networks:
+  internal:
+    internal: true                  # no route to the outside world
+  public: {}

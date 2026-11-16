@@ -28,6 +28,4 @@ def configure_logging(level: str) -> None:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level.upper())
-    # The SDK's own debug logs can include request bodies; keep them quiet unless explicitly enabled.
-    logging.getLogger("anthropic").setLevel(max(logging.WARNING, root.level))
     logging.getLogger("httpx").setLevel(logging.WARNING)

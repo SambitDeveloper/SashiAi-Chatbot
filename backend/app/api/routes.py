@@ -56,7 +56,9 @@ async def ready(service: QueryService = Depends(get_service)) -> dict:
         raise HTTPException(status_code=503, detail="data source unavailable") from exc
     if not service.ready:
         raise HTTPException(status_code=503, detail="index not ready")
-    return {"status": "ready", "llmConfigured": service.translator is not None}
+    # The local model is optional for readiness: simple questions are answered without it.
+    model_ready = await service.translator.health() if service.translator is not None else False
+    return {"status": "ready", "llmConfigured": service.translator is not None, "llmReady": model_ready}
 
 
 @protected.get("/meta")
@@ -66,6 +68,7 @@ async def meta(service: QueryService = Depends(get_service), settings: Settings 
         "llmEnabled": service.translator is not None,
         "provider": getattr(service.translator, "provider", None),
         "model": getattr(service.translator, "model_name", None),
+        "externalLlm": False,
         "dataBrowserEnabled": settings.enable_data_browser,
     }
 

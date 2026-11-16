@@ -90,6 +90,7 @@ export const DatabaseModal: React.FC<DatabaseModalProps> = ({ isOpen, onClose })
             >
               <option value="all">All Statuses</option>
               <option value="active">Active</option>
+              <option value="away">Away</option>
               <option value="pending">Pending Intake</option>
               <option value="admitted">Recently Admitted</option>
               <option value="inactive">Inactive</option>

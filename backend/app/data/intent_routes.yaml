@@ -1,0 +1,344 @@
+# Semantic router configuration (Aurelio semantic-router). Edit this file — no code changes — to:
+#   • add example questions to a route (better matching),
+#   • add a route (a new kind of question) with its direct-answer metadata,
+#   • tune when a question may be answered directly with a MongoDB MCP tool instead of the language model.
+#
+# Routes describe kinds of question only. Field VALUES (statuses, care types, wings, caregivers, residents)
+# are never listed here: they are read from the database and recognised in the question automatically.
+# The encoder runs on this server (BAAI/bge-small-en-v1.5): no API calls, no tokens.
+
+router_type: indexed
+encoder:
+  type: fastembed
+  name: BAAI/bge-small-en-v1.5
+top_k: 5
+aggregation: mean
+
+# ---------------------------------------------------------------------------------------------------------
+# Direct answers (MongoDB MCP tool, 0 tokens). A question is answered directly only when ALL of these hold:
+#   1. the chosen route has metadata.action, its score >= min_confidence and it leads the next candidate by >= min_margin
+#      (route_cues below choose the candidates from the question's words; the router picks among them)
+#   2. the question contains no digits and none of the blocker words (dates, negation, comparisons, follow-ups)
+#   3. every word is explained: a database value, a word from the route's examples, or a filler word
+#   4. every database value found belongs to a field the route allows (metadata.fields)
+# Anything else goes to the language model (Gemini), exactly as before.
+direct:
+  min_confidence: 0.80
+  # A cue word ("how many", "show", "per", a named resident) already fixes the kind of question; combined with the
+  # requirement that every token be explained, a lower confidence bar is safe for cue-selected routes.
+  min_cue_confidence: 0.70
+  min_margin: 0.03
+  # The kind of question comes from its words, not from embeddings (they score "how many residents are away" and
+  # "list the residents who are away" almost the same). Groups are checked top to bottom; the FIRST group with one
+  # of its words in the question limits the routes, and the router picks among those. A question naming a resident
+  # always uses the routes that accept a resident. No cue word → the router's top route, as before.
+  route_cues:
+    - routes: [average_age]
+      words: [average, mean, avg]
+    - routes: [oldest]
+      words: [oldest, eldest]
+    - routes: [youngest]
+      words: [youngest]
+    - routes: [breakdown_status, breakdown_care_type, breakdown_wing, breakdown_caregiver, breakdown_gender]
+      words: [each, per, breakdown, distribution, split, grouped, wise, segregate, segregated]
+    - routes: [count]
+      words: [how many, number of, count, total, census, tally, headcount, strength]
+    - routes: [list]
+      words: [list, show, which, who, display, names, give, find, get, fetch]
+  # Words that name a field, never one specific value, even when a facility or staff name contains them
+  # (e.g. a facility called "FACILITY_12"): "how many residents in each facility" must not look for that facility.
+  field_words: [care, type, types, level, levels, category, categories, status, statuses, gender, genders, age,
+    wing, wings, facility, facilities, building, buildings, unit, units, center, centre, home, community,
+    staff, nurse, nurses, caregiver, caregivers, caretaker, caretakers, aide, aides, doctor, doctors, dr, physician]
+  # Date expressions are parsed locally (app/nlu/grammar.py). A date range is attached to the field whose anchor
+  # word appears in the question; with no anchor word the date is ambiguous and the question goes to the model.
+  date_fields:
+    admission_date: [admission date, admission dates, admitted, admission, admissions, joined, enrolled, enrolment,
+      enrollment, intake, admit]
+    discharge_date: [discharge date, discharge dates, discharged, discharge, discharges, released, release]
+    created_date: [registration date, created date, registered, registration, created, added, onboarded]
+  # Numeric comparisons are parsed locally. An anchor word (or none, using the default) chooses the field.
+  number_fields:
+    age: [age, aged, year, years, "yr", "yrs", "old"]
+  default_number_field: age
+  # Negation turns the value that follows it into an exclusion ("not in memory care" → exclude memory_care).
+  negation_words: [not, "non", never, without, except, excluding, exclude, "other than", "apart from", besides]
+  # "No value recorded" questions → `missing: true` on a field ("no caregiver assigned", "room not recorded",
+  # "without an admission date", "empty room number"); "with a caregiver assigned" → `missing: false`.
+  # Fields: plan field → words naming it (longest phrase wins). Gender is absent on purpose: the schema mapping turns
+  # a missing gender into "Other" (see resident_schema.yaml `missing_values`).
+  missing_values:
+    absent_before: ["no", without, missing, empty, blank, unknown, unrecorded, unassigned]   # "<word> [a/an/any] <field>"
+    absent_after: [missing, empty, blank, unknown, unassigned, unrecorded, "not assigned", "not recorded", "not set",
+      "not known", "not available", "not entered", "not given", "not specified", "not on file", "not filled"]
+    absent_have: ["not have", "n't have", "not has", "n't has"]   # "don't have a <field>"
+    present_before: ["with a", "with an", "has a", "has an", "have a", "have an"]   # needs a word from present_after
+    present_after: [assigned, recorded, set, known, entered, specified, "on file", "on record", "filled in"]
+    fields:
+      primary_caregiver: [primary caregiver, caregiver, caregivers, caretaker, caretakers, carer, assigned staff, staff member, staff]
+      room_number: [room number, room, unit number, unit, bed]
+      facility: [facility, wing, building]
+      admission_date: [admission date, date of admission, admission]
+      discharge_date: [discharge date, date of discharge]
+      created_date: [registration date, created date, date registered]
+      age: [date of birth, birth date, birthdate, dob, age]
+      status: [status]
+      care_type: [care type, care level, level of care]
+  # Reference resolution (app/nlu/references.py). Closed grammatical classes, not phrase exceptions: a pronoun
+  # refers within the question when an entity antecedent precedes it ("list active residents and show their rooms"),
+  # otherwise to the previous question ("how many of them are female?").
+  references:
+    pronouns: [they, them, their, theirs, he, him, his, she, her, hers, it, its, those, these]
+    demonstratives: [these, those]   # + an entity noun ("these residents") points back to the previous answer
+    continuation_openers: [what about, how about, and, also, plus]   # a question opening with these continues the last
+    entity_nouns: [resident, residents, people, person, persons, patients, patient, individuals, folks, ones]
+  # Projection (what to SHOW) vs condition (what to FILTER BY), decided by the phrase's role in the sentence:
+  # an attribute phrase (`lookup_attributes` words) is shown when it follows a display verb or a possessive
+  # ("show their room numbers", "with their caregivers"), or continues such a list ("room and caregiver"); the same
+  # phrase directly bound to a value ("room 101", "caregiver Sarah Jenkins", "age over 80") is a condition.
+  projection:
+    display_verbs: [show, showing, display, include, including, with, plus, "along with", give, return, add, see]
+    possessives: [their, his, her, its]
+    determiners: [the, a, an, each, every, all, any]
+    joiners: [and, or, ",", "&"]
+    value_links: [is, are, was, "=", ":", named, called, of]   # "caregiver is Sarah Jenkins" stays a condition
+    # what every row already shows (the resident's name): no extra column, but part of a list of shown attributes
+    identity_words: [name, names, full name, full names]
+  # Lookups answer only what was asked: these words pick the resident attributes to show ("what is the room number of
+  # resident_1" → room_number). No match → the full profile ("tell me about resident_1"). Single words of 5+ letters
+  # also match with a small typo ("staus" → status).
+  lookup_attributes:
+    room_number: [room, room number, unit, unit number, bed]
+    primary_caregiver: [primary caregiver, primary caregivers, caregiver, caregivers, caretaker, caretakers, carer, nurse, aide, assigned staff, looks after, look after, cares for]
+    admission_date: [admitted, admission, admission date, joined, moved in]
+    discharge_date: [discharged, discharge, discharge date]
+    created_date: [registered, registration, created]
+    emergency_contact: [emergency contact, emergency, next of kin]
+    status: [status]
+    care_type: [care type, care level, level of care, category, care category, type of care]
+    age: [age, how old]
+    gender: [gender, sex]
+    facility: [facility, facilities, wing, building]
+    resident_id: [resident id, id, record id, resident number, record number]
+  # Remaining blockers: things the deterministic grammar still cannot resolve safely.
+  # Question STRUCTURE (app/nlu/structure.py): which named resident the answer is ABOUT (subject) and which one other
+  # residents are COMPARED WITH (reference), the comparison asked for, and whether the reference itself belongs in
+  # the answer. Closed grammatical classes only; field words come from `lookup_attributes`/`date_fields` and field
+  # kinds from resident_schema.yaml `comparable`. A resident is a reference only as the OPERAND of a comparison
+  # construction, so "same", "before", "with" ... on their own decide nothing.
+  structure:
+    clause_boundaries: [",", ".", "?", "!", ";", who, which, whose, that, where, whom]
+    # the word(s) directly before the operand → the construction; `needs` = a word class that must occur in the clause
+    frames:
+      - {words: [as], family: equality, needs: equality_words}           # "the same day as X"
+      - {words: [like], family: equality}                                # "the same care level like X"
+      - {words: [than], family: ordering, needs: ordering_words}         # "older than X", "admitted earlier than X"
+      - {words: [before, "prior to"], family: ordering, direction: less} # "admitted before X"
+      - {words: [after], family: ordering, direction: greater}           # "admitted after her"
+      - {words: [with, of], family: association, needs: overlap_words}  # "in common with X", "overlaps with … of X"
+      - {words: [from], family: difference, needs: difference_words}     # "different from X"
+    equality_words: [same, identical, matching, equal]
+    exact_words: [exactly, exact, identical, entire, whole, complete, all of]   # set equality instead of overlap
+    overlap_words: [share, shares, shared, sharing, "in common", common, overlap, overlaps, overlapping]
+    no_overlap_words: ["no", none, "not share", "don't share", "do not share", "does not share", "doesn't share", disjoint, "nothing in common"]
+    difference_words: [different, differ, differs, unlike]
+    ordering_words:
+      greater: [older, later, after, more, greater, higher, longer]
+      less: [younger, earlier, before, fewer, less, lower, sooner]
+    ordering_implies_field: {older: age, younger: age}    # "older than X" compares age without naming it
+    granularity: {same_day: [day, date], same_month: [month], same_year: [year]}   # finest named unit wins
+    cross_record_words: [duplicate, duplicates, duplicated]   # comparing residents among themselves, nobody named
+    # The reference is EXCLUDED from the answer only when the answer set is explicitly the others:
+    exclusion:
+      modifiers: [other]                                   # + an entity noun: "all other residents"
+      else_after: [anyone, anybody, everyone, everybody, someone, who, whoever]   # "who else"
+      prepositions: [except, besides, "apart from", "aside from", excluding, "other than", "but not"]   # + the reference
+      rest: ["the rest of", "remaining"]                   # "the rest of the residents"
+    messages:
+      reference: >-
+        Comparing residents with another resident (for example, admitted on the same day as a named resident, or
+        sharing a caregiver with them) isn't supported yet. You can ask with the values themselves instead, e.g.
+        'residents admitted on <date>' or 'residents in <facility> in <care level>'.
+      cross_record: >-
+        Comparing residents with one another (for example, residents who share the same room) isn't supported yet.
+        I can list residents by room, facility or caregiver instead, e.g. 'list residents in room <room number>'.
+  blocker_words: [
+    # ranking / positional selection beyond oldest/youngest (needs limit + ordering we do not infer)
+    top, most, latest, earliest,
+    # comparisons with another record / continuation words the planner does not resolve (pronouns are resolved by
+    # the `references` section below, not blocked)
+    same, also,
+    # future / scheduled events we do not model
+    due, upcoming, next, scheduled, will
+  ]
+  filler_words: [
+    a, an, the, is, are, was, were, be, of, in, "on", at, to, for, by, with, and, or, me, my, we, our, us, you, i,
+    please, kindly, can, could, would, tell, show, give, list, display, find, get, see, what, which, who, whom,
+    how, many, much, whose, having, under, within, among, number, count, total, all, any, every, each, there, here, currently, right, now, residents,
+    resident, people, patients, folks, do, does, did, have, has, about, details, info, information, s,
+    available, overall, altogether, entire, whole, complete, full, as, it, that, this, its, so, far, presently,
+    currently, at, moment, exist, exists, existing, registered, record, records, system, database, data, let, know,
+    during, within, recently, recent, ago, period, were, who, where, still, listed, belong, belongs,
+    belonging
+  ]
+
+routes:
+  - name: count
+    description: How many residents match some conditions
+    metadata: {action: count, fields: [status, care_type, gender, facility, primary_caregiver, age, admission_date, discharge_date, created_date, room_number]}
+    utterances:
+      - how many residents are active
+      - number of residents in memory care
+      - count the residents in the north wing
+      - how many people are on the waitlist
+      - how many female residents are there
+      - what is the census
+      - how many residents are there
+      - how many active residents does the caregiver look after
+      - total number of residents
+      - how many residents are in skilled nursing
+      - how many residents are in the facility
+      - what is the total number of residents
+      - how many residents do we have
+      - how many residents are away
+      - how many residents are discharged
+      # dated / aged counts (the date and age phrases themselves are stripped before routing)
+      - how many residents were admitted recently
+      - how many residents joined in a period
+      - how many residents were discharged this period
+      - how many residents registered recently
+      - how many residents are above a certain age
+      - how many residents fall in an age range
+
+  - name: list
+    description: Which residents match some conditions
+    metadata: {action: list, fields: [status, care_type, gender, facility, primary_caregiver, age, admission_date, discharge_date, created_date, room_number]}
+    utterances:
+      - list the active residents
+      - show me the residents in the north wing
+      - which residents are pending
+      - which residents are away
+      - who is in memory care
+      - give me the names of residents in assisted living
+      - show residents looked after by the caregiver
+      - display the discharged residents
+      - show the residents in the facility
+      # dated / aged / negated lists (the date and age phrases themselves are stripped before routing)
+      - residents admitted recently
+      - residents admitted in a period
+      - residents joined in a period
+      - residents discharged this period
+      - residents registered recently
+      - residents within an age range
+      - residents older than a certain age
+      - residents who are not in a care type
+      - show residents assigned to a caregiver
+      - residents of a gender in a care type
+      - active residents in a care type
+
+  - name: breakdown_status
+    description: Counts grouped by status
+    metadata: {action: breakdown, group_by: [status], fields: [care_type, gender, facility, primary_caregiver, age, admission_date, discharge_date, created_date, room_number]}
+    utterances:
+      - residents by status
+      - status breakdown of residents
+      - how many residents in each status
+      - split residents by status
+
+  - name: breakdown_care_type
+    description: Counts grouped by care type
+    metadata: {action: breakdown, group_by: [care_type], fields: [status, gender, facility, primary_caregiver, age, admission_date, discharge_date, created_date, room_number]}
+    utterances:
+      - residents by care type
+      - breakdown of residents by care level
+      - how many residents in each care category
+      - care type distribution
+
+  - name: breakdown_wing
+    description: Counts grouped by facility
+    metadata: {action: breakdown, group_by: [facility], fields: [status, care_type, gender, primary_caregiver, age, admission_date, discharge_date, created_date, room_number]}
+    utterances:
+      - residents per wing
+      - how many residents in each wing
+      - distribution of residents across wings
+      - wing breakdown
+      - how many residents in each facility
+      - residents per facility
+      - facility wise resident count
+
+  - name: breakdown_caregiver
+    description: Counts grouped by caregiver
+    metadata: {action: breakdown, group_by: [primary_caregiver], fields: [status, care_type, gender, facility, age, admission_date, discharge_date, created_date]}
+    utterances:
+      - residents per caregiver
+      - how many residents does each nurse look after
+      - caregiver workload breakdown
+      - number of residents for each caretaker
+      - how many residents per staff member
+
+  - name: breakdown_gender
+    description: Counts grouped by gender
+    metadata: {action: breakdown, group_by: [gender], fields: [status, care_type, facility, primary_caregiver, age, admission_date, discharge_date, created_date, room_number]}
+    utterances:
+      - residents by gender
+      - split residents by gender
+      - gender breakdown of residents
+
+  - name: average_age
+    description: Average age
+    metadata: {action: aggregate, op: avg, fields: [status, care_type, gender, facility, primary_caregiver, age, admission_date, discharge_date, created_date, room_number]}
+    utterances:
+      - what is the average age of residents
+      - average age of memory care residents
+      - mean age of the active residents
+
+  - name: oldest
+    description: The oldest resident
+    metadata: {action: list, sort: {field: age, direction: desc}, limit: 1, fields: [status, care_type, gender, wing, primary_caregiver, age, admission_date, discharge_date, created_date, room_number]}
+    utterances:
+      - who is the oldest resident
+      - the oldest resident in memory care
+
+  - name: youngest
+    description: The youngest resident
+    metadata: {action: list, sort: {field: age, direction: asc}, limit: 1, fields: [status, care_type, gender, wing, primary_caregiver, age, admission_date, discharge_date, created_date, room_number]}
+    utterances:
+      - who is the youngest resident
+      - the youngest resident in independent living
+
+  - name: lookup
+    description: Facts about one specific resident (answered with the full profile), or a yes/no check on them
+    metadata: {action: lookup, fields: [resident, status, care_type, facility, gender, primary_caregiver, age, room_number]}
+    utterances:
+      - tell me about the resident
+      - tell me about resident_1
+      - resident_1 category and status
+      - what is resident_1's room
+      - who is resident_1's caregiver
+      - who is the primary caretaker of resident_1
+      - is resident_1 in memory care
+      - when was resident_1 admitted
+      - emergency contact for resident_1
+      - resident_1 profile
+      - what is the care type of resident_1
+      - what is the room number of resident_1
+      - which facility is resident_1 in
+      - what is the status of resident_1
+      - how old is resident_1
+      - what is the age and gender of resident_1
+      - discharge date of resident_1
+      - is resident_1 active
+      - is resident_1 still active
+      - is resident_1 discharged
+      - is resident_1 assigned to the caregiver
+
+  - name: help
+    description: Greetings and questions about the assistant
+    metadata: {action: help, fields: []}
+    utterances:
+      - hi
+      - hello
+      - thanks
+      - thank you
+      - what can you do
+      - how do I use this

@@ -1,9 +1,9 @@
 """Data-driven entity handling (no question-parsing rules).
 
 Everything here is driven by values loaded from the database:
-  • mask():    replaces resident names in the question with placeholders before it is sent to Claude,
+  • mask():    replaces resident names in the question with placeholders before it reaches the model,
                so resident names never leave the server and similar questions share one cache entry.
-  • resolve_*: maps what Claude wrote ("Jenkins", "garden wing", "resident_1") to exact database values,
+  • resolve_*: maps what the model wrote ("Jenkins", "garden wing", "resident_1") to exact database values,
                reporting unknown or ambiguous references instead of guessing.
 """
 
@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from rapidfuzz import fuzz
 
 from app.data.repository import Vocabulary
+from app.data.schema_config import is_missing
+from app.models.plan import CARE_TYPES, STATUSES
 
 # Staff titles/credentials are stripped when comparing caregiver names (data normalisation).
 _TITLE_WORDS = {
@@ -45,6 +47,19 @@ def _norm(token: str) -> str:
 
 def _name_parts(name: str) -> list[str]:
     return [p for p in (_norm(x) for x in re.split(r"[\s-]+", name)) if p]
+
+
+def _wing_tokens(text: str) -> list[str]:
+    """Wing/facility name tokens with numbers kept: "(train) FACILITY_12" → ["train", "facility", "12"].
+
+    `_name_parts` drops digits (right for people's names), which made every "FACILITY_n" look identical.
+    """
+    return re.findall(r"[a-z]+|\d+", text.lower().replace("’", "'"))
+
+
+def _same_numbers(a: list[str], b: list[str]) -> bool:
+    """Position by position, any token that is a number must be identical."""
+    return all(x == y for x, y in zip(a, b, strict=True) if x.isdigit() or y.isdigit())
 
 
 @dataclass
@@ -83,18 +98,31 @@ class EntityIndex:
         for r in vocab.residents:
             first, last = _name_parts(r["firstName"]), _name_parts(r["lastName"])
             keys = ["".join(first + last)] + (["".join(first + [p]) for p in last] if len(last) > 1 else [])
+            # surname-first is common in staff questions ("Jain Aarya", "Vance, Eleanor"): the same person
+            keys.append("".join(last + first))
             display = f"{r['firstName']} {r['lastName']}"
             self.display_by_id[r["residentId"].upper()] = display
             self._residents.append(_IndexedResident(r["residentId"].upper(), display, first, last, keys))
+        self._by_id = {r.resident_id: r for r in self._residents}
 
         self._caregivers: list[_IndexedCaregiver] = []
-        for value in vocab.caregivers:
+        for value in (c for c in vocab.caregivers if not is_missing(c, "primaryCaregiver")):
             tokens = [t for t in _name_parts(value.split(",")[0]) if t not in _TITLE_WORDS]
             self._caregivers.append(_IndexedCaregiver(value, "".join(tokens), tokens))
         self._caregiver_first_names = {c.tokens[0] for c in self._caregivers if c.tokens}
+        # caregivers recorded under one word only ("Vik"): that word is their whole recorded name
+        self._single_word_caregivers: dict[str, list[str]] = {}
+        for c in self._caregivers:
+            if len(c.tokens) == 1:
+                self._single_word_caregivers.setdefault(c.tokens[0], []).append(c.value)
 
-        self.wings = list(vocab.wings)
-        self._rooms = {re.sub(r"[^a-z0-9]", "", r.lower()): r for r in vocab.rooms}
+        # placeholders such as wing "Unknown" (resident_schema.yaml missing_values) are not names: "unknown status"
+        # must never be read as the facility "Unknown"
+        self.wings = [w for w in vocab.wings if not is_missing(w, "wing")]
+        # statuses / care types that exist in the database; all known ones when the database did not say
+        self.statuses = [s for s in STATUSES if not vocab.statuses or s in vocab.statuses]
+        self.care_types = [c for c in CARE_TYPES if not vocab.care_types or c in vocab.care_types]
+        self._rooms = {re.sub(r"[^a-z0-9]", "", r.lower()): r for r in vocab.rooms if not is_missing(r, "roomNumber")}
 
     # ------------------------------------------------------------------ masking
     def mask(self, question: str) -> MaskResult:
@@ -137,6 +165,16 @@ class EntityIndex:
             if ids:
                 spans.append((start, end, ids))
 
+        # A single-letter initial right after a recognised name ("Jone Aarya J", "Aarya J.") is part of that name
+        # when it is the first letter of one of that resident's names; otherwise it is left alone.
+        with_initials = []
+        for st, en, ids in spans:
+            m = re.match(r"\s+([A-Za-z])\.?(?![A-Za-z'’])", question[en:])
+            if m and len(ids) == 1 and m.group(1).lower() in self._initials(ids[0]):
+                en += m.end()
+            with_initials.append((st, en, ids))
+        spans = with_initials
+
         # Keep a trailing possessive outside the placeholder: "Vance's room" → "resident_1's room".
         spans = [
             (st, en - 2 if question[en - 2 : en].lower() in ("'s", "\u2019s") else en, ids) for st, en, ids in spans
@@ -152,10 +190,22 @@ class EntityIndex:
         result.text = text
         return result
 
+    def _initials(self, resident_id: str) -> set[str]:
+        r = self._by_id.get(resident_id.upper())
+        return {p[0] for p in (r.first + r.last) if p} if r else set()
+
     @staticmethod
     def _window_is_name(words: list[str], name_parts: list[str]) -> bool:
+        """Every word of the window belongs to the name. Short words (≤ 3 letters) must BE a name part: a substring
+        match would let function words join the name ("as" is inside "aakash", "on" inside "jones")."""
         joined = "".join(name_parts)
-        return all(fuzz.partial_ratio(w, joined) >= 80 for w in words)
+
+        def short_ok(i: int, w: str) -> bool:  # a name part, or written apart from its neighbour ("van gogh" = VanGogh)
+            nxt = words[i + 1] if i + 1 < len(words) else ""
+            prev = words[i - 1] if i > 0 else ""
+            return w in name_parts or any((nxt and (w + nxt) in p) or (prev and (prev + w) in p) for p in name_parts)
+
+        return all(short_ok(i, w) if len(w) <= 3 else fuzz.partial_ratio(w, joined) >= 80 for i, w in enumerate(words))
 
     def _best_full_match(self, concat: str, words: list[str] | None = None) -> list[str]:
         best, ids = 0.0, []
@@ -169,7 +219,29 @@ class EntityIndex:
                 ids.append(r.resident_id)
         return ids if best >= FULL_NAME_THRESHOLD else []
 
+    def caregiver_values(self) -> list[str]:
+        return [c.value for c in self._caregivers]
+
     # ------------------------------------------------------------------ mentions (completeness check)
+    def _outside_fixed_values(self, text: str, found: dict[str, list[str]]) -> dict[str, list[str]]:
+        """Drop name matches that are only part of a status, care type or gender in the question.
+
+        Staff and facility names are free text ("Director Nursing"); "skilled nursing" in a question is the care type,
+        never that staff member.
+        """
+        low = text.lower()
+        spans = []
+        for phrase in [*self.statuses, *(c.replace("_", " ") for c in self.care_types), "female", "male"]:
+            spans += [m.span() for m in re.finditer(r"(?<![a-z])" + re.escape(phrase) + r"(?![a-z])", low)]
+        if not spans:
+            return found
+
+        def inside(raw: str) -> bool:
+            hits = [m.span() for m in re.finditer(r"(?<![a-z])" + re.escape(raw.lower()) + r"(?![a-z])", low)]
+            return bool(hits) and all(any(a <= s and e <= b for a, b in spans) for s, e in hits)
+
+        return {raw: values for raw, values in found.items() if not inside(raw)}
+
     def mentioned_caregivers(self, text: str) -> dict[str, list[str]]:
         """Caregivers named in the question, as {text written: [exact database values]}.
 
@@ -199,25 +271,55 @@ class EntityIndex:
                     found[" ".join(tokens[j][0] for j in idx)] = hits
                     used.update(idx)
         for j, (raw, n) in enumerate(tokens):
-            if j in used or len(n) < 4:
+            if j in used:
                 continue
-            hits = [c.value for c in self._caregivers if len(c.tokens) > 1 and n == c.tokens[-1]]
+            hits = [c.value for c in self._caregivers if len(c.tokens) > 1 and n == c.tokens[-1]] if len(n) >= 4 else []
+            # A caregiver recorded under a single word is named in full by that word. It must be written as a name
+            # (capitalised, not the sentence's first word) so ordinary words never match a one-word staff record.
+            if not hits and j > 0 and raw[:1].isupper() and len(n) >= 3:
+                hits = list(self._single_word_caregivers.get(n, []))
             if hits:
                 found[raw] = hits
-        return found
+        # the text written, without trailing punctuation ("Nursing." at the end of the sentence is "Nursing")
+        found = {raw.rstrip(".,;:!?'’-"): values for raw, values in found.items()}
+        return self._outside_fixed_values(text, found)
 
     def mentioned_wings(self, text: str) -> dict[str, list[str]]:
-        """Wings named in full in the question (typo tolerant), as {wing: [wing]}."""
-        tokens = [_norm(m.group(0)) for m in _TOKEN_RE.finditer(text)]
+        """Wings named in the question (typo tolerant), as {text written: [wing]}.
+
+        Numbers in a name must match exactly ("(train) FACILITY_42" is not FACILITY_4 or FACILITY_420); only the
+        letters are compared with typo tolerance. A bracketed qualifier in a recorded name ("(train) FACILITY_12") is
+        optional: "FACILITY_12" names that wing too.
+        """
+        low = text.lower().replace("’", "'")
+        tokens = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[a-z]+|\d+", low)]
+        words = [t[0] for t in tokens]
         found: dict[str, list[str]] = {}
         for wing in self.wings:
-            parts = _name_parts(wing)
-            target = " ".join(parts)
-            for i in range(len(tokens) - len(parts) + 1):
-                if fuzz.ratio(" ".join(tokens[i : i + len(parts)]), target) >= 90:
-                    found[wing] = [wing]
+            forms = [_wing_tokens(wing)]
+            core = _wing_tokens(re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", wing))
+            if core and core != forms[0]:
+                forms.append(core)
+            for parts in forms:
+                if not parts:
+                    continue
+                target = " ".join(parts)
+                hit = next(
+                    (
+                        i
+                        for i in range(len(words) - len(parts) + 1)
+                        if _same_numbers(words[i : i + len(parts)], parts)
+                        and fuzz.ratio(" ".join(words[i : i + len(parts)]), target) >= 90
+                    ),
+                    None,
+                )
+                if hit is not None:
+                    start, end = tokens[hit][1], tokens[hit + len(parts) - 1][2]
+                    start -= 1 if start > 0 and text[start - 1] in "([" else 0  # "(train) …" as written
+                    written = text[start:end]
+                    found.setdefault(written, []).append(wing)
                     break
-        return found
+        return self._outside_fixed_values(text, found)
 
     # ------------------------------------------------------------------ resolution
     def resolve_resident(self, ref: str, placeholders: dict[str, list[str]]) -> Resolution:
@@ -225,6 +327,8 @@ class EntityIndex:
         if _PLACEHOLDER_RE.match(ref.lower()):
             ids = placeholders.get(ref.lower(), [])
             return Resolution(ids, ambiguous=len(ids) > 1)
+        if ref.upper() in self.display_by_id:  # a database id (e.g. a MongoDB ObjectId), as direct answers pass them
+            return Resolution([ref.upper()])
         m = _RESIDENT_ID_RE.search(ref)
         if m:
             rid = f"RES-{m.group(1)}"
@@ -264,12 +368,18 @@ class EntityIndex:
 
     def resolve_wing(self, text: str) -> Resolution:
         # Compare only the distinctive part: "West Wing" must not match "East Wing" via the shared word "wing".
-        q = " ".join(p for p in _name_parts(text) if p != "wing")
+        # Numbers must match exactly: "FACILITY_12" is never FACILITY_1 or FACILITY_120 (letters stay typo tolerant).
+        q_tokens = [p for p in _wing_tokens(text) if p != "wing"]
+        q = " ".join(q_tokens)
         if not q:
             return Resolution([])
+        q_numbers = [t for t in q_tokens if t.isdigit()]
         scored = []
         for w in self.wings:
-            wn = " ".join(p for p in _name_parts(w) if p != "wing")
+            w_tokens = [p for p in _wing_tokens(w) if p != "wing"]
+            if [t for t in w_tokens if t.isdigit()] != q_numbers and q_numbers:
+                continue
+            wn = " ".join(w_tokens)
             score = max(fuzz.ratio(q, wn), fuzz.token_set_ratio(q, wn) if len(q) >= 4 else 0)
             scored.append((score, w))
         scored.sort(reverse=True)

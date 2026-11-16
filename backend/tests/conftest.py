@@ -5,22 +5,36 @@ import pytest
 from app.config import Settings
 from app.data.memory_repository import MemoryResidentRepository
 from app.engine.service import QueryService
-from app.nlu.translator import TokenUsage, Translation, TranslatorUnavailable
+from app.nlu.translator import ModelUsage, Translation, TranslationRequest, TranslatorUnavailable
 
 TODAY = "2026-11-09"
 
 
 class FakeTranslator:
-    """Stands in for Claude: returns a fixed plan per masked question and records every call."""
+    """Stands in for the local Qwen model: returns a fixed plan per masked question and records every call."""
+
+    provider = "fake"
+    model_name = "fake-local-model"
 
     def __init__(self, plans: dict[str, dict] | None = None, fail: bool = False):
         self.plans = {k.lower(): v for k, v in (plans or {}).items()}
         self.fail = fail
         self.calls: list[dict] = []
 
-    async def translate(self, masked_question, today, wings, previous_plan_json, hint=None):
+    async def health(self) -> bool:
+        return not self.fail
+
+    async def translate(self, request: TranslationRequest):
+        masked_question = request.masked_question
         self.calls.append(
-            {"question": masked_question, "today": today, "wings": wings, "previous": previous_plan_json, "hint": hint}
+            {
+                "question": masked_question,
+                "today": request.today,
+                "wings": request.context.wings,
+                "previous": request.previous_plan_json,
+                "hint": request.hint,
+                "dates": request.date_hints,
+            }
         )
         if self.fail:
             raise TranslatorUnavailable("connection")
@@ -31,7 +45,7 @@ class FakeTranslator:
             raise AssertionError(f"no fake plan for masked question: {masked_question!r}")
         return Translation(
             plan=copy.deepcopy(plan),
-            usage=TokenUsage(input_tokens=120, output_tokens=40, cache_read_input_tokens=600),
+            usage=ModelUsage(calls=1, prompt_tokens=700, completion_tokens=40, inference_ms=5),
             model="fake",
         )
 
@@ -46,7 +60,11 @@ class PinnedDateSettings(Settings):
 @pytest.fixture
 def settings() -> Settings:
     return PinnedDateSettings(
-        _env_file=None, environment="test", anthropic_api_key=None, rate_limit_per_minute=1000, topic_gate_enabled=False
+        _env_file=None,
+        environment="test",
+        rate_limit_per_minute=1000,
+        topic_gate_enabled=False,
+        semantic_router_enabled=False,
     )
 
 

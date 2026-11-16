@@ -56,7 +56,7 @@ async def test_breakdown_by_wing(repo):
         "South Wing": 18,
         "East Wing": 16,
     }
-    assert build_response(plan, data)["headline"] == "88 residents by Wing"
+    assert build_response(plan, data)["headline"] == "88 residents by Facility"
 
 
 async def test_average_and_extremes(repo):

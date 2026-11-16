@@ -13,13 +13,16 @@ const FLOW = `Staff question
       ▼
 ① Mask resident names (server)        "status of Eleanor Vance" → "status of resident_1"
       │
-      ├── Plan cache hit? ──────────► reuse plan (0 tokens)
+      ├── Plan cache hit? ──────────► reuse plan (no model call)
+      ├── Off-topic? (local check) ──► "not available"
+      ├── Deterministic planner ─────► simple questions: plan from database values (no model call)
       │
       ▼
-② Model translates → JSON query plan   { action, filters, group_by, sort, lookup }
-      │   (structured output: can only return the plan schema; never sees resident records)
+② Local Qwen2.5-0.5B (llama.cpp)       only when the deterministic planner cannot resolve it
+      │   grammar-constrained JSON plan; runs on our server, no external API
       ▼
 ③ Resolve & validate (server)          names/wings/rooms checked against the database;
+      │                                every requested condition kept, none invented;
       │                                unknown or ambiguous → ask the user, never guess
       ▼
 ④ Database query                       MongoDB / seed data computes every number
@@ -35,7 +38,7 @@ export const ArchitectureModal: React.FC<ArchitectureModalProps> = ({ isOpen, on
     { id: 'overview', label: 'Overview', icon: Layers },
     { id: 'flow', label: 'Request Flow', icon: Cpu },
     { id: 'safety', label: 'Accuracy & Privacy', icon: ShieldCheck },
-    { id: 'cost', label: 'Token Usage', icon: Coins },
+    { id: 'cost', label: 'Cost', icon: Coins },
     { id: 'testing', label: 'Testing', icon: CheckCircle }
   ];
 
@@ -80,8 +83,9 @@ export const ArchitectureModal: React.FC<ArchitectureModalProps> = ({ isOpen, on
             <>
               <h3 className="text-sm font-semibold text-slate-100">Overview</h3>
               <p>
-                Staff ask questions in their own words. A language model (Google Gemini by default, or Anthropic Claude) has one narrow job: translate the question into a
-                structured <strong className="text-slate-100">query plan</strong>. The Python backend validates that plan, runs it against
+                Staff ask questions in their own words. Simple questions are planned deterministically from database values, with no
+                model at all. Only when that is not possible, a small model running on our own server (Qwen2.5-0.5B via llama.cpp) translates
+                the question into a structured <strong className="text-slate-100">query plan</strong>. No external AI service is called. The Python backend validates that plan, runs it against
                 the resident database, and writes the answer from the results. The model never sees resident records and never produces
                 a number.
               </p>
@@ -110,7 +114,7 @@ export const ArchitectureModal: React.FC<ArchitectureModalProps> = ({ isOpen, on
                 <li><strong className="text-slate-100">Schema-constrained output:</strong> the model can only return a query plan; it cannot request data outside the schema.</li>
                 <li><strong className="text-slate-100">Validation:</strong> every plan is checked (enums, dates, ranges) before it runs. Invalid plans are never executed.</li>
                 <li><strong className="text-slate-100">No guessing:</strong> unknown names, wings or rooms produce "I couldn't find…"; ambiguous names produce a choice.</li>
-                <li><strong className="text-slate-100">Name masking:</strong> resident names are replaced with placeholders before the question leaves the server.</li>
+                <li><strong className="text-slate-100">Name masking:</strong> resident names are replaced with placeholders before the question reaches the model (which runs on this server).</li>
                 <li><strong className="text-slate-100">Minimal exposure:</strong> list views never include emergency contacts; questions are not written to logs.</li>
                 <li><strong className="text-slate-100">Out of scope:</strong> diagnoses, medications, billing and similar topics are reported as not available.</li>
               </ul>
@@ -119,12 +123,12 @@ export const ArchitectureModal: React.FC<ArchitectureModalProps> = ({ isOpen, on
 
           {active === 'cost' && (
             <>
-              <h3 className="text-sm font-semibold text-slate-100">Token Usage</h3>
+              <h3 className="text-sm font-semibold text-slate-100">Cost</h3>
               <ul className="list-disc list-inside space-y-1.5">
-                <li>The model outputs only a short JSON plan, never prose or data.</li>
-                <li>The fixed instructions are prompt-cached, so they are billed at a fraction of the normal rate.</li>
-                <li>Plans are cached by the masked question: "room of Eleanor Vance" and "room of Arthur Pendleton" share one entry, so repeats cost 0 tokens.</li>
-                <li>The Query Inspector shows tokens used per question and per session.</li>
+                <li>No external AI API: there are no per-token charges. The model runs on the application server's CPU.</li>
+                <li>Simple questions use no model at all; the model is used only for questions that need interpretation.</li>
+                <li>Plans are cached by the masked question: "room of Eleanor Vance" and "room of Arthur Pendleton" share one entry, so repeats skip the model.</li>
+                <li>The Query Inspector shows local model tokens per question (informational only).</li>
               </ul>
             </>
           )}

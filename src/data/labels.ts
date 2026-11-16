@@ -3,6 +3,7 @@ import { ResidentStatus, ResidentCareType } from '../types/resident';
 /** Display labels. Resident records themselves live only on the backend. */
 export const STATUS_LABELS: Record<ResidentStatus, string> = {
   active: 'Active',
+  away: 'Away',
   inactive: 'Inactive',
   pending: 'Pending Intake',
   admitted: 'Recently Admitted',

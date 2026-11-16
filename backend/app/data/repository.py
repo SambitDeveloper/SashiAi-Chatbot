@@ -1,16 +1,17 @@
-"""Storage abstraction. The engine only talks to this interface, so the data store can change
-(seed JSON in development, MongoDB in production) without touching understanding or answering logic."""
+"""Storage abstraction. The engine only talks to this interface: the Care App's MongoDB (through the resident view in
+resident_schema.yaml) in every environment, and an in-memory list in tests."""
 
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from app.data.schema_config import identity_fields, is_missing
 from app.models.plan import Filters, GroupField, Sort
 
-# Plan field name → record field name (records use the Care App's camelCase JSON fields)
+# Plan field name → field name in the resident view (app/data/resident_schema.yaml `fields`)
 FIELD_MAP: dict[str, str] = {
     "status": "status",
     "care_type": "careType",
-    "wing": "wing",
+    "facility": "wing",  # plan field → view field (the view keeps the key "wing" for API compatibility)
     "gender": "gender",
     "primary_caregiver": "primaryCaregiver",
     "room_number": "roomNumber",
@@ -32,12 +33,50 @@ class Vocabulary:
     wings: list[str] = field(default_factory=list)
     caregivers: list[str] = field(default_factory=list)
     rooms: list[str] = field(default_factory=list)
+    statuses: list[str] = field(default_factory=list)  # values present in the database (empty = unknown)
+    care_types: list[str] = field(default_factory=list)
 
 
 @dataclass
 class GroupRow:
     key: tuple[str, ...]
     count: int
+
+
+@dataclass
+class GroupAggregateRow:
+    """One group of a grouped aggregate ("average age by status").
+
+    count     residents in the group (every resident, whether or not the aggregated field is recorded)
+    value     the aggregate over the residents whose field IS recorded as a number; None when none of them is
+    n_values  how many residents the value is computed from (count - n_values = field not recorded)
+    """
+
+    key: tuple[str, ...]
+    count: int
+    value: float | None
+    n_values: int
+
+
+# Missing-value rule for every grouping (breakdowns and grouped aggregates), identical in MongoDB and in memory:
+# a resident whose grouped field is not recorded (absent, null, "", an empty list, or a placeholder declared in
+# resident_schema.yaml `missing_values`, e.g. status "unknown") is counted in ONE group with this key — never dropped,
+# never split into "unknown"/"Unknown"/"" variants, never turned back into a filter value.
+MISSING_GROUP = "Not recorded"
+
+
+def group_key(value: Any, view_field: str) -> str:
+    """A text or number is its own group; anything else (a list or object where one value belongs, a bool) is "not
+    recorded" — the same as the MongoDB key expression in resident_view._grouping ($convert onError)."""
+    if is_missing(value, view_field) or not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return MISSING_GROUP
+    return str(value)
+
+
+def numeric(value: Any) -> float | int | None:
+    """A value an aggregate may use: a real number (not a bool, not a numeric-looking string). Anything else is
+    treated as "not recorded", as MongoDB's $avg/$min/$max ignore non-numeric values."""
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 class ResidentRepository(Protocol):
@@ -47,44 +86,82 @@ class ResidentRepository(Protocol):
     async def close(self) -> None: ...
     async def total(self) -> int: ...
     async def count(self, filters: Filters) -> int: ...
-    async def find(self, filters: Filters, sort: Sort | None = None, limit: int | None = None) -> list[Resident]: ...
+    async def find(
+        self, filters: Filters, sort: Sort | None = None, limit: int | None = None, fields: list[str] | None = None
+    ) -> list[Resident]: ...
     async def find_by_ids(self, resident_ids: list[str]) -> list[Resident]: ...
     async def group_count(self, filters: Filters, fields: list[GroupField]) -> list[GroupRow]: ...
     async def aggregate(self, filters: Filters, op: str, field_name: str) -> float | None: ...
+    async def group_aggregate(
+        self, filters: Filters, fields: list[GroupField], op: str, field_name: str
+    ) -> list[GroupAggregateRow]: ...
     async def vocabulary(self) -> Vocabulary: ...
 
 
 def matches(record: Resident, filters: Filters) -> bool:
-    """In-process filter semantics. `mongo_repository.to_mongo_filter` must mirror this exactly."""
-    for plan_field in ("status", "care_type", "wing", "gender", "primary_caregiver", "room_number"):
+    """In-process filter semantics. `resident_view.to_mongo_filter` must mirror this exactly.
+
+    A list value (several assigned staff) matches an include when ANY element is included, like MongoDB's $in.
+    Within one field, `include` OR `missing: true`; `exclude` and `missing: false` are AND-ed. What counts as missing
+    comes from resident_schema.yaml (schema_config.is_missing), the same source the MongoDB filter uses.
+    """
+    for plan_field in ("status", "care_type", "facility", "gender", "primary_caregiver", "room_number"):
         f = getattr(filters, plan_field)
         if f is None:
             continue
-        value = record.get(FIELD_MAP[plan_field])
-        if f.include and value not in f.include:
+        view_field = FIELD_MAP[plan_field]
+        value = record.get(view_field)
+        values = value if isinstance(value, list) else [value]
+        missing = is_missing(value, view_field)
+        if f.include or f.missing is True:
+            hit = bool(f.include) and any(v in f.include for v in values)
+            if not (hit or (f.missing is True and missing)):
+                return False
+        if f.exclude and any(v in f.exclude for v in values):
             return False
-        if f.exclude and value in f.exclude:
+        if f.missing is False and missing:
             return False
 
+    checks: list[tuple[str, Any, Any, Any]] = []
     if filters.age:
-        age = record.get("age")
-        if age is None:
-            return False
-        if filters.age.min is not None and age < filters.age.min:
-            return False
-        if filters.age.max is not None and age > filters.age.max:
-            return False
-
+        checks.append(("age", filters.age, filters.age.min, filters.age.max))
     for plan_field in ("admission_date", "created_date", "discharge_date"):
         r = getattr(filters, plan_field)
-        if r is None:
+        if r is not None:
+            checks.append(
+                (FIELD_MAP[plan_field], r, r.start.isoformat() if r.start else None, r.end.isoformat() if r.end else None)
+            )
+    for view_field, r, lo, hi in checks:
+        value = record.get(view_field)
+        missing = is_missing(value, view_field)
+        if r.has_range:
+            # a value of another type than the bound (text where a number belongs) never satisfies a range, like
+            # MongoDB's type-bracketed comparisons — and never raises
+            in_range = not missing and _comparable(value, lo, hi) and (lo is None or value >= lo) and (hi is None or value <= hi)
+            if not (in_range or (r.missing is True and missing)):
+                return False
+        elif r.missing is not missing:  # missing-only condition: true → must be missing, false → must be recorded
+            return False
+    return True
+
+
+def project(record: Resident, fields: list[str] | None) -> Resident:
+    """Keep the identity fields plus the requested view fields (lists and nested objects whole). None → unchanged.
+    Mirrors the `$project` stage ViewRepository.find adds for a projection."""
+    if fields is None:
+        return record
+    keep = [*identity_fields(), *fields]
+    return {k: record[k] for k in keep if k in record}
+
+
+def _comparable(value: Any, *bounds: Any) -> bool:
+    numbers = (int, float)
+    for b in bounds:
+        if b is None:
             continue
-        value = record.get(FIELD_MAP[plan_field])
-        if not value:
+        if isinstance(b, numbers) and not (isinstance(value, numbers) and not isinstance(value, bool)):
             return False
-        if r.start and value < r.start.isoformat():
-            return False
-        if r.end and value > r.end.isoformat():
+        if isinstance(b, str) and not isinstance(value, str):
             return False
     return True
 
@@ -92,6 +169,16 @@ def matches(record: Resident, filters: Filters) -> bool:
 def sort_key(field_name: str):
     record_field = FIELD_MAP[field_name]
     return lambda r: (r.get(record_field) is None, r.get(record_field) or "", r.get("residentId", ""))
+
+
+def typed_order(value: Any) -> tuple:
+    """Sort key for one value: numbers, then text, then anything else (MongoDB's type order). Never raises a
+    TypeError when a malformed text value sits among numbers."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (0, float(value), "")
+    if isinstance(value, str):
+        return (1, 0.0, value)
+    return (2, 0.0, str(value))
 
 
 def list_view(record: Resident) -> Resident:

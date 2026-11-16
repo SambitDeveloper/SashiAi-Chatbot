@@ -18,12 +18,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.routes import limiter, protected, public
 from app.config import Settings, get_settings
-from app.data.memory_repository import MemoryResidentRepository
 from app.data.repository import ResidentRepository
 from app.engine.service import QueryService
 from app.logging_setup import configure_logging
+from app.nlu.intent_router import DEFAULT_ROUTES_FILE, SemanticIntentRouter
 from app.nlu.topic_gate import TopicGate
-from app.nlu.translator import ClaudeTranslator, Translator
+from app.nlu.translator import QueryTranslator
 
 log = logging.getLogger(__name__)
 
@@ -39,45 +39,46 @@ SECURITY_HEADERS = {
 
 
 def build_repository(settings: Settings) -> ResidentRepository:
-    if settings.data_source == "mongodb":
-        from app.data.mongo_repository import MongoResidentRepository
+    """Answers always come from the Care App's MongoDB; the in-memory test data is refused outside tests."""
+    if settings.data_source == "memory":
+        if settings.environment != "test":
+            raise RuntimeError("DATA_SOURCE=memory is for tests only. Set DATA_SOURCE=mcp and MONGODB_URI.")
+        from app.data.memory_repository import MemoryResidentRepository
 
-        return MongoResidentRepository(settings.mongodb_uri, settings.mongodb_db, settings.mongodb_collection)
-    if settings.environment == "production":
-        log.warning("DATA_SOURCE=memory in production: serving built-in seed data, not the live Care App database")
-    return MemoryResidentRepository()
+        return MemoryResidentRepository()
+    if not settings.mongodb_uri:
+        raise RuntimeError(f"MONGODB_URI is required (DATA_SOURCE={settings.data_source}). Set it in backend/.env.")
+    if settings.data_source == "mcp":
+        from app.data.mcp_repository import McpResidentRepository
+
+        return McpResidentRepository(
+            settings.mcp_server_command,
+            settings.mongodb_uri,
+            settings.mongodb_db,
+            settings.mongodb_collection,
+            max_documents=settings.mcp_max_documents,
+            timeout_seconds=settings.mcp_timeout_seconds,
+            node_path=settings.mcp_node_path,
+        )
+    from app.data.mongo_repository import MongoResidentRepository
+
+    return MongoResidentRepository(settings.mongodb_uri, settings.mongodb_db, settings.mongodb_collection)
 
 
-def build_translator(settings: Settings) -> Translator | None:
-    """Pick the language model provider. LLM_PROVIDER=auto prefers Gemini when GEMINI_API_KEY is set."""
-    import os
+def build_translator(settings: Settings) -> QueryTranslator | None:
+    """The local Qwen2.5-0.5B model (llama.cpp server on the private network). No external model is ever used."""
+    if not settings.llm_enabled:
+        log.warning("LLM_ENABLED=false: only questions the deterministic planner resolves will be answered")
+        return None
+    from app.nlu.qwen_translator import QwenTranslator
 
-    has_gemini = bool(settings.gemini_api_key)
-    has_anthropic = bool(
-        settings.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-    )
-    provider = settings.llm_provider
-    if provider == "auto":
-        provider = "gemini" if has_gemini else "anthropic" if has_anthropic else "none"
-
-    if provider == "gemini" and has_gemini:
-        from app.nlu.gemini_translator import GeminiTranslator
-
-        return GeminiTranslator(settings)
-    if provider == "anthropic" and has_anthropic:
-        return ClaudeTranslator(settings)
-    log.warning(
-        "No language model credentials for provider %r (set GEMINI_API_KEY or ANTHROPIC_API_KEY): "
-        "questions will return 'assistant unavailable'",
-        settings.llm_provider,
-    )
-    return None
+    return QwenTranslator(settings)
 
 
 def create_app(
     settings: Settings | None = None,
     repo: ResidentRepository | None = None,
-    translator: Translator | None = None,
+    translator: QueryTranslator | None = None,
     gate: TopicGate | None = None,
     use_default_translator: bool = True,
 ) -> FastAPI:
@@ -104,11 +105,23 @@ def create_app(
                 else None
             )
         )
-        service = QueryService(repository, model, settings, gate=topic_gate)
+        intent_router = None
+        if settings.semantic_router_enabled:
+            intent_router = SemanticIntentRouter(
+                settings.semantic_router_routes_file or DEFAULT_ROUTES_FILE, cache_dir=settings.topic_gate_cache_dir
+            )
+        service = QueryService(repository, model, settings, gate=topic_gate, intent_router=intent_router)
         await service.start()
-        # Load the embedding model in the background: the API is usable at once, and until the model is
-        # ready every question simply goes to the language model.
+        # Warm the local model's prompt cache in the background (a cold first inference can exceed the timeout).
+        warm_task = (
+            asyncio.create_task(model.warm_up(service.schema_context(), settings.today()))
+            if hasattr(model, "warm_up")
+            else None
+        )
+        # Load the embedding model in the background: the API is usable at once; until it is ready, questions skip
+        # the topic check and the deterministic planner and go to the local model.
         gate_task = asyncio.create_task(topic_gate.start()) if topic_gate and not topic_gate.ready else None
+        router_task = asyncio.create_task(intent_router.start()) if intent_router else None
         app.state.settings = settings
         app.state.service = service
         log.info(
@@ -118,12 +131,15 @@ def create_app(
                 "llm": model is not None,
                 "provider": getattr(model, "provider", None),
                 "model": getattr(model, "model_name", None),
+                "llm_server": settings.llm_server_url if model is not None else None,
                 "topic_check": topic_gate is not None,
+                "semantic_router": intent_router is not None,
             },
         )
         yield
-        if gate_task and not gate_task.done():
-            gate_task.cancel()
+        for task in (gate_task, router_task, warm_task):
+            if task and not task.done():
+                task.cancel()
         await service.stop()
         if hasattr(model, "close"):
             await model.close()

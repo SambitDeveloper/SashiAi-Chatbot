@@ -4,7 +4,18 @@ import pytest
 from pydantic import ValidationError
 
 from app.models.plan import Filters, QueryPlan
-from app.nlu.prompt import OUTPUT_SCHEMA, SYSTEM_PROMPT, conditions_to_filters, filters_to_conditions
+from app.nlu.prompt import build_output_schema, build_system_prompt, conditions_to_filters, filters_to_conditions
+from app.nlu.translator import SchemaContext
+
+# Schema/prompt are built from the live vocabulary; this context stands in for one database's values.
+CTX = SchemaContext(
+    statuses=["active", "discharged", "pending"],
+    care_types=["memory_care", "assisted_living"],
+    wings=["North Wing", "Garden Terrace"],
+    caregivers=["Nurse Sarah Jenkins, RN"],
+)
+OUTPUT_SCHEMA = build_output_schema(CTX)
+SYSTEM_PROMPT = build_system_prompt(CTX)
 
 
 def test_valid_combined_plan():
@@ -49,6 +60,8 @@ def _walk(schema, path="$"):
             yield from _walk(sub, f"{path}.{name}")
     if "items" in schema:
         yield from _walk(schema["items"], f"{path}[]")
+    for i, sub in enumerate(schema.get("anyOf", [])):
+        yield from _walk(sub, f"{path}|{i}")
 
 
 def test_output_schema_objects_forbid_extra_properties():
@@ -61,8 +74,23 @@ def test_output_schema_mirrors_pydantic_model():
     # options are server-generated; uses_previous is a cache hint; the model writes filters as a list of conditions
     model_side = set(OUTPUT_SCHEMA["properties"]) - {"uses_previous", "conditions"} | {"filters"}
     assert model_side == set(QueryPlan.model_fields) - {"options"}
-    condition_fields = OUTPUT_SCHEMA["properties"]["conditions"]["items"]["properties"]["field"]["enum"]
-    assert set(condition_fields) == set(Filters.model_fields)
+    condition_fields = set()
+    for option in OUTPUT_SCHEMA["properties"]["conditions"]["items"]["anyOf"]:
+        f = option["properties"]["field"]
+        condition_fields |= {f["const"]} if "const" in f else set(f["enum"])
+    assert condition_fields == set(Filters.model_fields)
+
+
+def test_output_schema_values_come_from_the_database_vocabulary():
+    options = {
+        o["properties"]["field"].get("const"): o for o in OUTPUT_SCHEMA["properties"]["conditions"]["items"]["anyOf"]
+    }
+    assert options["status"]["properties"]["include"]["items"]["enum"] == CTX.statuses
+    assert options["care_type"]["properties"]["include"]["items"]["enum"] == CTX.care_types
+    assert options["facility"]["properties"]["include"]["items"]["enum"] == CTX.wings
+    # values the database does not contain are not even expressible by the model
+    assert "away" not in str(options["status"]) and "respite_care" not in str(options["care_type"])
+    assert "active | discharged | pending" in SYSTEM_PROMPT and "away" not in SYSTEM_PROMPT
 
 
 def test_conditions_convert_to_filters_in_any_order():

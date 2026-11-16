@@ -1,0 +1,31 @@
+# systemd unit for running the local model WITHOUT Docker on an EC2 host (alternative to docker-compose.yml).
+#   sudo backend/scripts/fetch_model.sh /opt/sashi/models /opt/sashi/llama     # once, pinned + verified
+#   sudo cp deploy/llama-server.service /etc/systemd/system/ && sudo systemctl enable --now llama-server
+# Listens on 127.0.0.1 only: the API on the same host uses LLM_SERVER_URL=http://127.0.0.1:8081.
+[Unit]
+Description=llama.cpp server - Qwen3-0.6B non-thinking, Q8_0 KV (resident query translation)
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+Environment=LD_LIBRARY_PATH=/opt/sashi/llama
+ExecStart=/opt/sashi/llama/llama-server \
+  --model /opt/sashi/models/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
+  --host 127.0.0.1 --port 8081 \
+  --ctx-size 4096 --parallel 2 --threads 4 --threads-batch 4 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --n-predict 256 --timeout 30 --reasoning off --no-webui --no-slots --metrics --offline
+Restart=on-failure
+TimeoutStopSec=20
+MemoryMax=1536M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/opt/sashi
+PrivateTmp=yes
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,5 @@
 import React from 'react';
-import { ShieldCheck, Database, Sliders, RefreshCw, Layers } from 'lucide-react';
+import { Bot, Database, Sliders, RefreshCw, Layers } from 'lucide-react';
 
 interface HeaderProps {
   onOpenInspector: () => void;
@@ -19,58 +19,58 @@ export const Header: React.FC<HeaderProps> = ({
   totalResidents
 }) => {
   return (
-    <header className="flex items-center justify-between gap-8 px-6 py-3.5 bg-slate-900 border-b border-slate-800 text-white shrink-0">
-      {/* Zone 1: Single text element wordmark */}
+    <header className="flex items-center justify-between gap-8 px-6 py-3.5 bg-gradient-to-r from-navy-950 via-navy-900 to-navy-800 text-white shrink-0 shadow-float">
+      {/* Brand: robot mark + product name */}
       <div className="flex items-center gap-3 shrink-0">
-        <div className="w-8 h-8 rounded-lg bg-teal-500/10 border border-teal-500/20 flex items-center justify-center text-teal-400">
-          <ShieldCheck className="w-4 h-4" />
+        <div className="relative w-10 h-10 rounded-2xl bg-white text-brand-600 flex items-center justify-center shadow-bubble">
+          <Bot className="w-6 h-6" strokeWidth={2.2} />
+          <span className="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full bg-emerald-400 ring-2 ring-navy-900" title="Online" />
         </div>
-        <span className="text-base font-semibold tracking-tight text-slate-100 whitespace-nowrap shrink-0">
-          Care App Resident Intelligence
-        </span>
+        <div className="flex flex-col leading-tight">
+          <span className="text-base font-bold tracking-tight whitespace-nowrap">Care App Assistant</span>
+          <span className="text-[11px] text-brand-200 whitespace-nowrap">Ask about residents in plain language</span>
+        </div>
       </div>
 
-      {/* Zone 2: 4 clean single-line navigation controls */}
-      <nav className="hidden md:flex items-center gap-6 text-xs font-medium text-slate-300">
+      {/* Navigation */}
+      <nav className="hidden md:flex items-center gap-6 text-xs font-medium text-white/80">
         <button
           onClick={onOpenInspector}
-          className="flex items-center gap-1.5 hover:text-teal-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          className="flex items-center gap-1.5 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
         >
-          <Sliders className="w-3.5 h-3.5 text-teal-400" />
+          <Sliders className="w-3.5 h-3.5" />
           <span>Query Inspector</span>
-          <span className="text-[11px] font-mono text-teal-400 bg-teal-950/60 border border-teal-800/40 px-1.5 py-0.5 rounded">
-            {totalTokensUsed.toLocaleString()} tokens used
+          <span className="text-[11px] font-mono text-white bg-white/10 border border-white/15 px-2 py-0.5 rounded-full">
+            {totalTokensUsed.toLocaleString()} tokens
           </span>
         </button>
 
         <button
           onClick={onOpenDatabase}
-          className="flex items-center gap-1.5 hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          className="flex items-center gap-1.5 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
         >
-          <Database className="w-3.5 h-3.5 text-slate-400" />
+          <Database className="w-3.5 h-3.5" />
           <span>Resident Records{totalResidents !== undefined ? ` (${totalResidents})` : ''}</span>
         </button>
 
         <button
           onClick={onOpenArchitecture}
-          className="flex items-center gap-1.5 hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          className="flex items-center gap-1.5 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
         >
-          <Layers className="w-3.5 h-3.5 text-slate-400" />
-          <span>System Design Specs</span>
+          <Layers className="w-3.5 h-3.5" />
+          <span>System Design</span>
         </button>
       </nav>
 
-      {/* Zone 3: 1 primary action */}
-      <div className="flex items-center gap-3 shrink-0">
-        <button
-          onClick={onResetChat}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 border border-slate-700 rounded-md hover:bg-slate-700 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          title="Reset conversation state"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          <span>New Session</span>
-        </button>
-      </div>
+      {/* Primary action */}
+      <button
+        onClick={onResetChat}
+        className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-navy-900 bg-white rounded-full hover:bg-brand-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer shadow-bubble"
+        title="Start a new conversation"
+      >
+        <RefreshCw className="w-3.5 h-3.5" />
+        <span>New Session</span>
+      </button>
     </header>
   );
 };

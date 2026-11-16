@@ -98,22 +98,7 @@ async def test_questions_naming_a_resident_skip_the_gate():
     assert (await service.handle("weather for RES-1001"))["tier"] == "llm"
 
 
-async def test_daily_model_call_limit():
-    fake = FakeTranslator(
-        {
-            "How many residents are active?": {"action": "count", "filters": {"status": {"include": ["active"]}}},
-            "How many residents are inactive?": {"action": "count", "filters": {"status": {"include": ["inactive"]}}},
-        }
-    )
-    service = await make_service(fake, None, llm_daily_call_limit=1)
-    assert (await service.handle("How many residents are active?"))["tier"] == "llm"
-    limited = await service.handle("How many residents are inactive?")
-    assert limited["tier"] == "unavailable" and "daily question limit" in limited["response"]["summaryText"]
-    # cached answers still work after the limit is reached
-    assert (await service.handle("How many residents are active?"))["tier"] == "cache"
-
-
 def test_gate_settings_defaults():
     s = Settings(_env_file=None)
     assert s.topic_gate_enabled and s.topic_gate_model == "BAAI/bge-small-en-v1.5" and s.topic_gate_margin == 0.02
-    assert s.llm_daily_call_limit == 0 and s.rate_limit_per_day == 2000
+    assert s.rate_limit_per_day == 2000

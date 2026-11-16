@@ -1,6 +1,6 @@
-"""Turns Claude's raw plan into a validated QueryPlan with exact database values.
+"""Turns a planner's raw plan (deterministic or local model) into a validated QueryPlan with exact database values.
 
-Anything Claude wrote that does not exist in the data (a wing, caregiver, room or resident) becomes a
+Anything the planner wrote that does not exist in the data (a wing, caregiver, room or resident) becomes a
 clarifying question — never a guess and never a silently dropped condition.
 """
 
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from app.models.plan import QueryPlan
+from app.models.plan import QueryPlan, canonical_field
 from app.nlu.prompt import conditions_to_filters
 from app.nlu.vocabulary import EntityIndex, MaskResult, Resolution
 
@@ -19,6 +19,19 @@ from app.nlu.vocabulary import EntityIndex, MaskResult, Resolution
 class ResolveOutcome:
     plan: QueryPlan
     problem: str | None = None  # set when the plan was replaced by a clarification
+    hint: str | None = None  # feedback for a model retry, when the problem is a planning error a model can fix
+
+
+def _resident_reference(text: str, mask: MaskResult) -> str | None:
+    """The resident `text` refers to (as the user wrote it), when a planner put a RESIDENT where a caregiver, facility
+    or room belongs: a resident_N placeholder, or the name of a resident the question mentions. None otherwise."""
+    t = str(text).strip().rstrip(".,;:!?").lower()
+    if re.fullmatch(r"resident_\d+", t):
+        return mask.originals.get(t, t)
+    for original in mask.originals.values():
+        if t == original.strip().rstrip(".,;:!?").lower():
+            return original
+    return None
 
 
 def _clean(value):
@@ -42,11 +55,21 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
         converted = conditions_to_filters(plan.pop("conditions"))
         plan["filters"] = {**converted, **plan.get("filters", {})}
     plan.setdefault("filters", {})
-    plan["filters"] = {k: v for k, v in plan["filters"].items() if v not in ({}, [], None)}
+    if not isinstance(plan["filters"], dict):
+        plan["filters"] = {"_invalid": plan["filters"]}
+    # legacy field names ("wing") → the canonical name BEFORE values are resolved, so an old-style plan is checked
+    # against the database exactly like a new one
+    if any(canonical_field(k) != k and canonical_field(k) in plan["filters"] for k in plan["filters"]):  # both names
+        return ResolveOutcome(
+            _clarify("I couldn't turn that into a safe query. Could you rephrase it?"),
+            problem="invalid: duplicate field names",
+        )
+    plan["filters"] = {canonical_field(k): v for k, v in plan["filters"].items() if v not in ({}, [], None)}
     unknown: list[str] = []
+    misused: list[tuple[str, str, str]] = []  # (field, resident as written, value the planner wrote)
 
     resolvers = {
-        "wing": index.resolve_wing,
+        "facility": index.resolve_wing,
         "primary_caregiver": index.resolve_caregiver,
         "room_number": index.resolve_room,
     }
@@ -58,7 +81,9 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
             values: list[str] = []
             for text in f.get(bucket, []) or []:
                 res: Resolution = resolve(str(text))
-                if not res.values:
+                if not res.values and (who := _resident_reference(str(text), mask)) is not None:
+                    misused.append((field_name, who, str(text)))
+                elif not res.values:
                     unknown.append(str(text))
                 elif res.ambiguous:
                     label = field_name.replace("_", " ")
@@ -105,6 +130,22 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
         lookup["residents"] = list(dict.fromkeys(ids))
         if not lookup["residents"] and not unknown:
             unknown.append("the resident mentioned")
+
+    if misused:
+        # A planning error, not a missing record: the resident exists, but was used as a caregiver/facility/room.
+        field_name, who, written = misused[0]
+        label = field_name.replace("_", " ").replace("primary ", "")
+        return ResolveOutcome(
+            _clarify(
+                f"I couldn't work out how {who} relates to the {label} in your question. Please rephrase it, for "
+                f"example: 'residents whose caregiver is <caregiver name>' or 'what is {who}'s {label}?'."
+            ),
+            problem=f"role:{field_name}",
+            hint=" ".join(
+                f"'{w}' is a resident, not a {f.replace('_', ' ')}: never use a resident as a {f.replace('_', ' ')} value."
+                for f, _, w in misused
+            ),
+        )
 
     if unknown:
         names = ", ".join(f'"{u}"' for u in dict.fromkeys(unknown))
