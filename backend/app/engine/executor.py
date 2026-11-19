@@ -1,8 +1,21 @@
 """Runs a validated QueryPlan against the repository. Pure data access: no wording, no guessing."""
 
 from dataclasses import dataclass, field
+from itertools import product
 
-from app.data.repository import GroupAggregateRow, GroupRow, Resident, ResidentRepository, list_view, matches
+from app.data.repository import (
+    FIELD_MAP,
+    MISSING_GROUP,
+    GroupAggregateRow,
+    GroupRow,
+    Resident,
+    ResidentRepository,
+    group_key,
+    group_keys,
+    list_view,
+    matches,
+    project,
+)
 from app.data.schema_config import output_fields
 from app.models.plan import QueryPlan
 
@@ -15,6 +28,8 @@ class ExecutionData:
     matched: int = 0
     rows: list[Resident] = field(default_factory=list)
     groups: list[GroupRow] | None = None
+    group_residents: dict[tuple[str, ...], list[Resident]] | None = None
+    group_details_complete: bool | None = None
     group_values: list[GroupAggregateRow] | None = None  # grouped aggregate: count + value per group
     aggregate_value: float | None = None
     looked_up: list[Resident] | None = None
@@ -22,14 +37,16 @@ class ExecutionData:
 
 
 def projected_view_fields(plan: QueryPlan) -> list[str] | None:
-    """The view fields a list should return (schema `output_fields`), or None for the default result shape."""
-    if plan.action != "list" or not plan.output_fields:
+    """The view fields requested for resident rows, or None for the default result shape."""
+    if plan.action not in ("list", "breakdown") or not plan.output_fields:
         return None
     mapping = output_fields()
     return [mapping[a] for a in plan.output_fields if a in mapping]
 
 
 async def execute(plan: QueryPlan, repo: ResidentRepository) -> ExecutionData:
+    if not plan.is_data_query:
+        return ExecutionData(total=0)
     total = await repo.total()
     f = plan.filters
 
@@ -43,6 +60,27 @@ async def execute(plan: QueryPlan, repo: ResidentRepository) -> ExecutionData:
 
     if plan.action == "breakdown":
         groups = await repo.group_count(f, plan.group_by)
+        groups = _include_empty_groups(groups, plan)
+        projection = projected_view_fields(plan)
+        if projection is not None:
+            group_fields = [FIELD_MAP[name] for name in plan.group_by]
+            fetch_fields = list(dict.fromkeys([*projection, *group_fields]))
+            found = await repo.find(f, fields=fetch_fields)
+            members: dict[tuple[str, ...], list[Resident]] = {g.key: [] for g in groups}
+            membership_count = 0
+            for resident in found:
+                visible = project(resident, projection)
+                for key in group_keys(resident, plan.group_by):
+                    members.setdefault(key, []).append(visible)
+                    membership_count += 1
+            expected_memberships = sum(g.count for g in groups)
+            return ExecutionData(
+                total=total,
+                matched=sum(g.count for g in groups),
+                groups=groups,
+                group_residents=members,
+                group_details_complete=membership_count == expected_memberships,
+            )
         rows = [list_view(r) for r in await repo.find(f, limit=SAMPLE_SIZE)]
         return ExecutionData(total=total, matched=sum(g.count for g in groups), rows=rows, groups=groups)
 
@@ -70,3 +108,21 @@ async def execute(plan: QueryPlan, repo: ResidentRepository) -> ExecutionData:
         return ExecutionData(total=total, matched=matched, rows=rows)
 
     return ExecutionData(total=total)
+
+
+def _include_empty_groups(groups: list[GroupRow], plan: QueryPlan) -> list[GroupRow]:
+    """Represent explicitly requested group values with zero counts instead of omitting them."""
+    values = []
+    for field_name in plan.group_by:
+        condition = getattr(plan.filters, field_name)
+        if condition is None or (not condition.include and condition.missing is not True):
+            return groups
+        candidates = [group_key(value, FIELD_MAP[field_name]) for value in condition.include or []]
+        if condition.missing is True:
+            candidates.append(MISSING_GROUP)
+        values.append(list(dict.fromkeys(candidates)))
+    existing = {group.key for group in groups}
+    for key in product(*values):
+        if key not in existing:
+            groups.append(GroupRow(key=key, count=0))
+    return groups

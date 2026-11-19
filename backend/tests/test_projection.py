@@ -151,6 +151,44 @@ async def test_validation_of_projection(index):
     assert not dropped.ok and any("skilled nursing" in m for m in dropped.missing)
 
 
+async def test_repeated_counts_require_grouping_and_preserve_projected_fields(index):
+    question = (
+        "Among residents admitted after August 1, 2026, how many are Active and how many are Discharged? "
+        "Show the names and room numbers in each group."
+    )
+    filters = {
+        "admission_date": {"start": "2026-08-02"},
+        "status": {"include": ["active", "discharged"]},
+    }
+    valid = ground(
+        index,
+        question,
+        {"action": "breakdown", "filters": filters, "group_by": ["status"], "fields": ["room_number"]},
+    )
+    assert valid.ok, valid.problems()
+    assert valid.plan.filters.admission_date.start.isoformat() == "2026-08-02"
+
+    combined_count = ground(index, question, {"action": "count", "filters": filters})
+    assert not combined_count.ok
+    assert any("breakdown" in problem for problem in combined_count.missing)
+    assert any("grouping by status" in problem for problem in combined_count.missing)
+
+    omitted = ground(index, question, {"action": "breakdown", "filters": filters, "group_by": ["status"]})
+    assert not omitted.ok and "show room number" in omitted.missing
+
+    invented = ground(
+        index,
+        question,
+        {
+            "action": "breakdown",
+            "filters": filters,
+            "group_by": ["status"],
+            "fields": ["room_number", "primary_caregiver"],
+        },
+    )
+    assert not invented.ok and "show primary caregiver" in invented.invented
+
+
 async def test_single_record_only_fields_are_never_listed(index):
     q = "list active residents and show their emergency contacts"
     g = ground(index, q, {"action": "list", "filters": {"status": {"include": ["active"]}}, "fields": ["emergency_contact"]})
@@ -175,6 +213,67 @@ async def test_projected_rows_and_columns():
     response = build_response(plan, data)
     assert [c["label"] for c in response["columns"]] == ["Room", "Primary Caregiver"]
     assert [c["key"] for c in response["columns"]] == ["roomNumber", "primaryCaregiver"]
+
+
+async def test_breakdown_returns_projected_residents_within_each_group():
+    records = [
+        {
+            "residentId": "RES-1", "id": "RES-1", "firstName": "Alex", "lastName": "Active",
+            "status": "active", "admissionDate": "2026-08-02", "roomNumber": "A-1",
+        },
+        {
+            "residentId": "RES-2", "id": "RES-2", "firstName": "Blair", "lastName": "Active",
+            "status": "active", "admissionDate": "2026-08-10", "roomNumber": "A-2",
+        },
+        {
+            "residentId": "RES-3", "id": "RES-3", "firstName": "Casey", "lastName": "Discharged",
+            "status": "discharged", "admissionDate": "2026-08-03", "roomNumber": "D-1",
+        },
+        {
+            "residentId": "RES-4", "id": "RES-4", "firstName": "Drew", "lastName": "Away",
+            "status": "away", "admissionDate": "2026-08-04", "roomNumber": "X-1",
+        },
+    ]
+    plan = QueryPlan.model_validate(
+        {
+            "action": "breakdown",
+            "filters": {
+                "admission_date": {"start": "2026-08-02"},
+                "status": {"include": ["active", "discharged"]},
+            },
+            "group_by": ["status"],
+            "fields": ["room_number"],
+        }
+    )
+    data = await execute(plan, MemoryResidentRepository(records))
+    response = build_response(plan, data)
+    groups = {item["label"]: item for item in response["breakdown"]}
+    assert groups["Active"]["count"] == 2
+    assert groups["Discharged"]["count"] == 1
+    assert [r["firstName"] for r in groups["Active"]["residents"]] == ["Alex", "Blair"]
+    assert groups["Discharged"]["residents"][0]["roomNumber"] == "D-1"
+    assert all(set(r) <= {*identity_fields(), "roomNumber"} for item in groups.values() for r in item["residents"])
+    assert [column["label"] for column in response["columns"]] == ["Room"]
+
+
+async def test_breakdown_includes_explicit_zero_count_group():
+    records = [
+        {
+            "residentId": "RES-1", "id": "RES-1", "firstName": "Alex", "lastName": "Active",
+            "status": "active", "admissionDate": "2026-08-02", "roomNumber": "A-1",
+        }
+    ]
+    plan = QueryPlan.model_validate(
+        {
+            "action": "breakdown",
+            "filters": {"status": {"include": ["active", "discharged"]}},
+            "group_by": ["status"],
+            "fields": ["room_number"],
+        }
+    )
+    response = build_response(plan, await execute(plan, MemoryResidentRepository(records)))
+    assert {item["label"]: item["count"] for item in response["breakdown"]} == {"Active": 1, "Discharged": 0}
+    assert next(item for item in response["breakdown"] if item["label"] == "Discharged")["residents"] == []
 
 
 async def test_default_shape_without_projection_is_unchanged():

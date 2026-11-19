@@ -151,14 +151,22 @@ async def test_direct_answer_never_calls_the_model(caplog):
 
 
 async def test_unsure_question_goes_to_the_model_and_logs_why(caplog):
-    # an unexplained word ("profiles") → the deterministic planner declines and says why. (Medical topics such as
-    # "diabetes" are now refused by the out-of-scope policy before any model call: see test_grounding.py.)
+    # An interpreter-reported unresolved term is non-executable; unknown vocabulary is not treated as a plan.
     q = "active residents with profiles"
-    fake = FakeTranslator({q: {"action": "count", "conditions": [{"field": "status", "include": ["active"]}]}})
+    from app.nlu.request_ir import request_ir_from_plan
+
+    candidate = request_ir_from_plan(
+        {"action": "count", "filters": {"status": {"include": ["active"]}}},
+        q,
+    )
+    candidate["unresolved"] = [{"reason": "unresolved request material", "evidence": "profiles"}]
+    fake = FakeTranslator({q: {"request_ir": candidate}})
     service = await make_service({"count": 0.93, "list": 0.80}, fake)
     with caplog.at_level(logging.INFO, logger="app.engine.service"):
         result = await service.handle(q)
-    assert result["tier"] == "llm" and result["response"]["count"] == 68 and len(fake.calls) == 1
+    assert result["tier"] == "llm" and len(fake.calls) == 1
+    assert result["response"]["needsClarification"] and result["mcpCall"] is None
+    assert result["failureAttribution"]["requestIR"] == "rejected"
     rec = next(r for r in caplog.records if r.getMessage() == "direct answer not possible; asking language model")
     assert rec.reason == "not_understood"
 

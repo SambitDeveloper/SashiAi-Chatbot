@@ -60,6 +60,7 @@ export interface GenericBreakdown {
   label: string;
   count: number;
   percentage: number;
+  residents?: ResidentRecord[];
 }
 
 export type ResidentAttribute = 
@@ -147,6 +148,7 @@ export interface StatusBreakdown {
   label: string;
   count: number;
   percentage: number;
+  residents?: ResidentRecord[];
 }
 
 export interface CareTypeBreakdown {
@@ -154,6 +156,7 @@ export interface CareTypeBreakdown {
   label: string;
   count: number;
   percentage: number;
+  residents?: ResidentRecord[];
 }
 
 export interface QueryExecutionResult {

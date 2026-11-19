@@ -36,6 +36,8 @@ class ProjectionDetector:
         self.determiners = {str(w).lower() for w in cfg.get("determiners") or []}
         self.joiners = {str(w).lower() for w in cfg.get("joiners") or []}
         self.value_links = {str(w).lower() for w in cfg.get("value_links") or []}
+        self.entity_words = {str(w).lower() for w in cfg.get("entity_words") or []}
+        self.condition_cues = {str(w).lower() for w in cfg.get("condition_cues") or []}
         words = [(attr, " ".join(str(w).lower().split())) for attr, ws in (direct.get("lookup_attributes") or {}).items() for w in ws]
         # identity words name what every result row already shows (the resident's name); they produce no field but
         # are part of a list of shown attributes ("show the name, age and room")
@@ -68,7 +70,9 @@ class ProjectionDetector:
         mentions: list[ProjectionMention] = []
         last_end = -1
         for attr, s, e in found:
-            if attr is not None and self._bound_to_value(low, tokens, e, (values or {}).get(attr, [])):
+            if attr is not None and (
+                self._bound_to_value(low, tokens, e, (values or {}).get(attr, [])) or self._condition_follows(tokens, e)
+            ):
                 last_end = -1  # a condition interrupts a list of shown attributes
                 continue
             cues = self._cue_before(low, tokens, s, last_end)
@@ -100,9 +104,13 @@ class ProjectionDetector:
         before = [t for t in tokens if t[2] <= start]
         cues: list[tuple[int, int]] = []
         i = len(before) - 1
-        while i >= 0 and before[i][0] in self.determiners | self.possessives:
+        # walk back over determiners, possessives and the entity word used as a modifier ("the resident names")
+        while i >= 0 and (
+            before[i][0] in self.determiners | self.possessives | self.entity_words or self._entity_possessive(before[i][0])
+        ):
             cues.append((before[i][1], before[i][2]))
-            if before[i][0] in self.possessives:  # "their room numbers", "along with their room numbers"
+            # "their room numbers", "each resident's room" (a possessive is a cue by itself)
+            if before[i][0] in self.possessives or self._entity_possessive(before[i][0]):
                 return [*cues, *self._verb_ending_at(before, i - 1)]
             i -= 1
         if i < 0:
@@ -115,6 +123,15 @@ class ProjectionDetector:
             return [*cues, (s, e)]
         return None
 
+
+    def _entity_possessive(self, word: str) -> bool:
+        """'resident's' (the tokenizer keeps "'s"; "residents'" arrives as "residents", a modifier)."""
+        return word.endswith("'s") and word[:-2] in self.entity_words
+
+    def _condition_follows(self, tokens, end: int) -> bool:
+        """The attribute is directly followed by a condition cue ("room numbers starting with A")."""
+        nxt = next((w for w, s, _ in tokens if s >= end), None)
+        return nxt in self.condition_cues
 
     def _verb_ending_at(self, tokens, i: int) -> list[tuple[int, int]]:
         """Spans of the display verb whose last word is tokens[i] (longest verb first), or []."""

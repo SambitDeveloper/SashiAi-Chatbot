@@ -88,6 +88,9 @@ def describe_filters(f: Filters) -> list[str]:
             chips.append(f"{label}: recorded")
         if sf.exclude:
             chips.append(f"{label}: not {' / '.join(label_value(field_name, v) for v in sf.exclude)}")
+        for words, needles in (("starts with", sf.starts_with), ("contains", sf.contains)):
+            if needles:  # literal text as the user wrote it (never a vocabulary label)
+                chips.append(f"{label}: {words} " + " or ".join(f'"{n}"' for n in needles))
     if f.age:
         lo, hi = f.age.min, f.age.max
         if not f.age.has_range:
@@ -119,6 +122,8 @@ def describe_plan(plan: QueryPlan, name_of: Callable[[str], str]) -> list[str]:
                 chips.append("Show: " + ", ".join(ATTRIBUTE_LABELS.get(a, a) for a in plan.output_fields))
         case "breakdown":
             chips.append("Breakdown by " + " × ".join(GROUP_LABELS[g] for g in plan.group_by))
+            if plan.output_fields:
+                chips.append("Show: " + ", ".join(ATTRIBUTE_LABELS.get(a, a) for a in plan.output_fields))
         case "aggregate":
             op = {"avg": "Average", "max": "Highest", "min": "Lowest"}[plan.aggregate.op]
             chips.append(

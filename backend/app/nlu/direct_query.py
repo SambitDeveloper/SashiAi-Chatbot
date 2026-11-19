@@ -26,6 +26,7 @@ _TOKEN_RE = re.compile(r"resident_\d+|[a-z]+|\d+")
 _WH_QUESTION = re.compile(r"^\s*(?:when|what|which|who|whom|whose|where|how|tell|show|give|list|find)\b")
 _RESIDENT_ID_RE = re.compile(r"\bres[-_ ]?\d{3,6}\b")
 _GENDERS = {"female": "Female", "male": "Male"}
+_YES_NO_QUESTION = re.compile(r"^\s*(?:is|are|was|were|does|do|did|has|have)\b")
 
 
 def _phrase_re(phrase: str) -> re.Pattern:
@@ -451,6 +452,84 @@ class DirectQueryBuilder:
                     if m.group(0) != phrase:
                         typo_spans.append(m.span())
         return sorted(found, key=found.get), words, typo_spans
+
+    def describe(self, question: str, mask: MaskResult, intent: IntentScore | None, index: EntityIndex, today: date):
+        """What the deterministic analysis understood, for the local model's brief (app/nlu/brief.py).
+
+        Read-only: uses the same configuration and vocabulary as build(), but never decides anything. Works on the
+        masked question, so residents appear only as resident_N and unrecognised words never include their names.
+        """
+        from app.nlu.brief import CLOSE_MARGIN, QuestionBrief, RouteGuess
+
+        brief = QuestionBrief()
+        if intent is not None and intent.scores:
+            # bge-small's own ranking, not choose_route(): its cue words ("who" → list) are what made the fast path
+            # give up on questions such as "who is the caregiver of …"; the model should see the router's reading.
+            ranked = sorted(intent.scores.items(), key=lambda kv: kv[1], reverse=True)
+            meta = lambda n: (self.routes.get(n) or {}).get("metadata") or {}  # noqa: E731
+            brief.routes.append(RouteGuess(ranked[0][0], ranked[0][1], meta(ranked[0][0])))
+            if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < CLOSE_MARGIN:
+                brief.routes.append(RouteGuess(ranked[1][0], ranked[1][1], meta(ranked[1][0])))
+        for key, ids in mask.placeholders.items():
+            brief.residents.append(key)
+            if len(ids) > 1:
+                brief.ambiguous_residents.append(key)
+
+        low = mask.text.lower()
+        no_names = [False] * len(low)  # resident names are already placeholders in the masked text
+        brief.attributes, attr_words, _ = self._lookup_attributes(low, no_names)
+        # attribute words written apart ("care giver", "room no") → the attribute whose one-word phrase they form
+        tokens = [(m.group(0), m.start(), m.end()) for m in _TOKEN_RE.finditer(low)]
+        joined_spans: list[tuple[int, int]] = []
+        for (a, s, _), (b, _, e) in zip(tokens, tokens[1:], strict=False):
+            for attr, phrase, _p in self.lookup_attributes:
+                if " " not in phrase and a + b == phrase:
+                    if attr not in brief.attributes:
+                        brief.attributes.append(attr)
+                    joined_spans.append((s, e))
+                    attr_words.add(phrase)
+
+        values: dict[str, list[str]] = {}
+        for status in index.statuses:
+            if _phrase_re(status).search(low):
+                values.setdefault("status", []).append(status)
+        for care in index.care_types:
+            if _phrase_re(care.replace("_", " ")).search(low):
+                values.setdefault("care_type", []).append(care)
+        for word, gender in _GENDERS.items():
+            if _phrase_re(word).search(low):
+                values.setdefault("gender", []).append(gender)
+        for found, field_name in ((index.mentioned_wings(question), "facility"),
+                                  (index.mentioned_caregivers(question), "primary_caregiver")):  # fmt: skip
+            for vals in found.values():
+                for v in vals:
+                    if v not in values.get(field_name, []):
+                        values.setdefault(field_name, []).append(v)
+        brief.values = values
+        brief.yes_no = bool(_YES_NO_QUESTION.match(low))
+
+        # Words nothing in the configuration or the vocabulary explains (dates and age phrases are explained by the
+        # grammar). Placeholders and digits are never listed.
+        explained = [False] * len(low)
+        for s, e in joined_spans + [(d.start, d.end) for d in parse_dates(low, today)] + [
+            (n.start, n.end) for n in parse_number_ranges(low)
+        ]:
+            for i in range(s, e):
+                explained[i] = True
+        known = (
+            self.filler | self.field_words | self.negation_words | self.blockers | self._value_words(index)
+            | {w for r in self.routes.values() for u in r.get("utterances", []) for w in _TOKEN_RE.findall(u.lower())}
+            | {w for phrase in attr_words for w in phrase.split()}
+            | {w for _, phrase, _ in self.lookup_attributes for w in phrase.split()}
+            | {w for words in self.date_fields.values() for p in words for w in p.split()}
+            | {w for words in self.number_fields.values() for p in words for w in p.split()}
+        )  # fmt: skip
+        for word, s, e in tokens:
+            if word.startswith("resident_") or word.isdigit() or any(explained[s:e]) or word in known:
+                continue
+            if word not in brief.unknown_words:
+                brief.unknown_words.append(word)
+        return brief
 
     @staticmethod
     def _value_words(index: EntityIndex) -> set[str]:

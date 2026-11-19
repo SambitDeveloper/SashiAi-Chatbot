@@ -2,9 +2,11 @@
 resident_schema.yaml) in every environment, and an in-memory list in tests."""
 
 from dataclasses import dataclass, field
+from itertools import product
 from typing import Any, Protocol
 
-from app.data.schema_config import identity_fields, is_missing
+from app.data import text_match
+from app.data.schema_config import identity_fields, is_missing, list_fields
 from app.models.plan import Filters, GroupField, Sort
 
 # Plan field name → field name in the resident view (app/data/resident_schema.yaml `fields`)
@@ -73,6 +75,19 @@ def group_key(value: Any, view_field: str) -> str:
     return str(value)
 
 
+def group_keys(record: Resident, fields: list[GroupField]) -> list[tuple[str, ...]]:
+    """Return every group key for a resident, including one key per value of list-valued fields."""
+    per_field = []
+    for field_name in fields:
+        view_field = FIELD_MAP[field_name]
+        value = record.get(view_field)
+        if view_field in list_fields() and isinstance(value, list) and value:
+            per_field.append([group_key(item, view_field) for item in value])
+        else:
+            per_field.append([group_key(value, view_field)])
+    return list(product(*per_field))
+
+
 def numeric(value: Any) -> float | int | None:
     """A value an aggregate may use: a real number (not a bool, not a numeric-looking string). Anything else is
     treated as "not recorded", as MongoDB's $avg/$min/$max ignore non-numeric values."""
@@ -120,6 +135,8 @@ def matches(record: Resident, filters: Filters) -> bool:
         if f.exclude and any(v in f.exclude for v in values):
             return False
         if f.missing is False and missing:
+            return False
+        if f.has_text_match and not text_match.value_matches(value, view_field, f.starts_with, f.contains):
             return False
 
     checks: list[tuple[str, Any, Any, Any]] = []

@@ -16,7 +16,8 @@ class MongoResidentRepository(ViewRepository):
 
     def __init__(self, uri: str, db: str, collection: str, view: ResidentView | None = None):
         super().__init__(view)
-        self._client: AsyncMongoClient = AsyncMongoClient(uri, maxPoolSize=20, serverSelectionTimeoutMS=5000)
+        # a cold Atlas connection took 8-10 s from the dev machine (SRV + TLS + auth, 2026-11-18): 5 s failed startup
+        self._client: AsyncMongoClient = AsyncMongoClient(uri, maxPoolSize=20, serverSelectionTimeoutMS=30000)
         self._col = self._client[db][collection]
 
     async def init(self) -> None:

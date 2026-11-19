@@ -58,7 +58,9 @@ async def ready(service: QueryService = Depends(get_service)) -> dict:
         raise HTTPException(status_code=503, detail="index not ready")
     # The local model is optional for readiness: simple questions are answered without it.
     model_ready = await service.translator.health() if service.translator is not None else False
-    return {"status": "ready", "llmConfigured": service.translator is not None, "llmReady": model_ready}
+    warm = getattr(service.translator, "warm", None) if service.translator is not None else None
+    # llmWarm: the model's prompt is cached (startup warm-up finished); until then model questions are declined quickly
+    return {"status": "ready", "llmConfigured": service.translator is not None, "llmReady": model_ready, "llmWarm": warm}
 
 
 @protected.get("/meta")
@@ -68,7 +70,7 @@ async def meta(service: QueryService = Depends(get_service), settings: Settings 
         "llmEnabled": service.translator is not None,
         "provider": getattr(service.translator, "provider", None),
         "model": getattr(service.translator, "model_name", None),
-        "externalLlm": False,
+        "externalLlm": bool(getattr(service.translator, "external", False)),
         "dataBrowserEnabled": settings.enable_data_browser,
     }
 

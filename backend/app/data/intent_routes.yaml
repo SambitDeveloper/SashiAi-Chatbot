@@ -54,7 +54,7 @@ direct:
   # word appears in the question; with no anchor word the date is ambiguous and the question goes to the model.
   date_fields:
     admission_date: [admission date, admission dates, admitted, admission, admissions, joined, enrolled, enrolment,
-      enrollment, intake, admit]
+      enrollment, intake, admit, came in]
     discharge_date: [discharge date, discharge dates, discharged, discharge, discharges, released, release]
     created_date: [registration date, created date, registered, registration, created, added, onboarded]
   # Numeric comparisons are parsed locally. An anchor word (or none, using the default) chooses the field.
@@ -104,6 +104,12 @@ direct:
     value_links: [is, are, was, "=", ":", named, called, of]   # "caregiver is Sarah Jenkins" stays a condition
     # what every row already shows (the resident's name): no extra column, but part of a list of shown attributes
     identity_words: [name, names, full name, full names]
+    # The entity the rows are about. As a modifier it may sit between a cue and an attribute ("include the resident
+    # names", "show the residents' rooms"); its possessive ("each resident's room") is a possessive like "their".
+    entity_words: [resident, residents, patient, patients]
+    # Words right AFTER an attribute that make it a condition, not something to show ("with room numbers starting
+    # with A"), like a value does ("room 101"). The text-match verbs of grounding's text-match check.
+    condition_cues: [start, starts, starting, begin, begins, beginning, contain, contains, containing]
   # Lookups answer only what was asked: these words pick the resident attributes to show ("what is the room number of
   # resident_1" → room_number). No match → the full profile ("tell me about resident_1"). Single words of 5+ letters
   # also match with a small typo ("staus" → status).

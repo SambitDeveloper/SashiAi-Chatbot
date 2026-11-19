@@ -1,20 +1,19 @@
 # Resident Query API (Python / FastAPI)
 
-Staff ask questions in plain language. Each question becomes a JSON **query plan**; the backend validates the plan,
-runs it against the resident database and builds the answer from the results with templates. Simple questions are
-planned **deterministically, with no model call**. Only questions the deterministic planner cannot resolve safely go to
-a small model running **on our own server**: Qwen2.5-0.5B-Instruct (GGUF Q4_K_M) on llama.cpp. No external AI API is
-used anywhere; there are no per-token costs. The model never sees resident records and never produces a number.
+Staff ask questions in plain language. The interpreter emits a compositional **RequestIR**; a deterministic compiler
+lowers supported operations to the restricted **QueryPlan**, which the backend validates before querying the resident
+database. Simple questions are interpreted **deterministically, with no model call**. Only questions the fast path
+cannot safely interpret go to the configured local Qwen model on llama.cpp. No external AI API is used; the model
+never sees resident records and never produces a number.
 
 ```
 question → mask resident names → plan cache?
          → topic check (BGE embeddings, local) / out-of-scope policy (medications, billing, …) → "not available"
          → deterministic planner: semantic router + grammar.py dates/ages + database values   (no model call)
-              └─ declined → local Qwen2.5-0.5B via llama-server (grammar-constrained JSON plan)
-         → SHARED VALIDATION for every plan, whichever planner produced it:
-              resolver (exact DB values) → Pydantic QueryPlan → grounding check (app/engine/grounding.py):
-              every named value kept, nothing invented, dates/ages/sort/limit/aggregate follow the question;
-              model plans failing it are retried once, then the user is asked to clarify
+              └─ declined → local Qwen via llama-server (grammar-constrained RequestIR)
+         → deterministic RequestIR compiler → resolver (exact DB values) → Pydantic QueryPlan
+         → grounding check (app/engine/grounding.py) → read-only database query
+         → model plans failing validation are retried once, then the user is asked to clarify
          → MongoDB MCP tools (read-only) → deterministic answer template + "Interpreted as" chips
 ```
 
@@ -28,7 +27,8 @@ uv sync                                    # install dependencies into .venv
 # local model, once (pinned + SHA-256 verified; ~491 MB model + llama.cpp b12017 CPU build):
 scripts/fetch_model.sh ~/.local/share/sashi-llm/models ~/.local/share/sashi-llm/bin
 scripts/run_llm_server.sh                  # llama-server on 127.0.0.1:8081 (separate terminal)
-uv run uvicorn app.main:app --reload --port 8000
+scripts/run_api.sh                         # API on :8000 with auto-reload (polling on WSL /mnt/c — plain
+                                           # `uvicorn --reload` there silently keeps serving old code)
 ```
 
 In a second terminal, from the repository root: `npm run dev`, then open http://localhost:3000.
@@ -128,6 +128,44 @@ mounted read-only; nothing is downloaded at application start. `deploy/docker-co
 container on an internal-only network with no published port; `deploy/llama-server.service` is the systemd alternative
 bound to 127.0.0.1.
 
+## AWS Bedrock model (Gemma 4 31B, `LLM_PROVIDER=bedrock`)
+
+`LLM_PROVIDER` picks the model client: `local` (default in code: Qwen on llama-server, above) or `bedrock`
+(`app/nlu/bedrock_translator.py`). Exactly one is used; **a Bedrock failure is never retried on Qwen** — it gets the
+normal "couldn't interpret that question" answer. The Qwen GGUF, `qwen_translator.py` and `run_llm_server.sh` are kept
+for switching back (`LLM_PROVIDER=local`, start llama-server, restart the API).
+
+API facts (AWS Bedrock user guide, checked 2026-11-19): Gemma 4 is served **only** on `bedrock-mantle`, under the
+**`/openai/v1`** prefix — `POST https://bedrock-mantle.us-west-2.api.aws/openai/v1/chat/completions`, model
+`google.gemma-4-31b`, In-Region only. `/v1/chat/completions`, bedrock-runtime, Converse and InvokeModel reject it.
+Auth is an Amazon Bedrock API key sent as `Authorization: Bearer <key>`.
+
+```bash
+# backend/.env (git-ignored) — never commit the key
+LLM_PROVIDER=bedrock
+BEDROCK_API_KEY=<your Bedrock API key>     # or AWS_BEARER_TOKEN_BEDROCK
+BEDROCK_REGION=us-west-2                   # default
+BEDROCK_MODEL_ID=google.gemma-4-31b    # default
+LLM_TIMEOUT_SECONDS=30                     # the 120 s default is sized for the local CPU
+LLM_MAX_CONCURRENCY=4                      # 1 is sized for one llama-server slot
+```
+
+Differences from the local client (same prompt, RequestIR schema, validation, grounding check and retry):
+
+- **No constrained decoding by default.** Structured outputs are not listed for Gemma 4 on bedrock-mantle, and Bedrock's
+  JSON-Schema subset rejects parts of the RequestIR schema (numeric bounds, >12 optional properties, objects without
+  `additionalProperties: false`). The reply is parsed as JSON (a ```` ```json ```` fence is tolerated) and validated as
+  usual; malformed or off-schema output becomes `invalid_json` or a validator retry. `BEDROCK_RESPONSE_FORMAT=json_object|json_schema`
+  is an opt-in experiment.
+- `top_k`, `seed`, `cache_prompt` and `LLM_CHAT_TEMPLATE_KWARGS` are local-only and not sent. No warm-up is needed.
+- `BEDROCK_REASONING_EFFORT=low|medium|high` (unset = model default). Reasoning tokens are not returned on Chat Completions.
+- Failures: 401/403 → `auth`, 429 → `overloaded` (mantle throughput ramps up over time), 5xx → `unavailable`, other 4xx →
+  `api_error`. `/api/ready` `llmReady` = `GET https://bedrock-mantle.{region}.api.aws/v1/models` returns 200 (endpoint +
+  key; cached 30 s).
+- **Data leaves the server.** The masked question (resident names replaced by placeholders), the wing list and the
+  status/care-type vocabulary are sent to AWS. Model calls are counted as `externalLlmCalls`, `/api/meta` reports
+  `externalLlm: true`, and logs show `plannerName: bedrock_gemma`.
+
 ## Benchmark (gold set, 2026-11-13)
 
 `uv run python -m scripts.benchmark --mode deterministic|qwen [--llama-pid PID]` runs `tests/data/gold_questions.py`
@@ -175,13 +213,20 @@ uv run ruff check app tests
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LLM_ENABLED` | `true` | Use the local model for questions the deterministic planner cannot resolve |
+| `LLM_ENABLED` | `true` | Use a model for questions the deterministic planner cannot resolve |
+| `LLM_PROVIDER` | `local` | `local` = Qwen on llama-server; `bedrock` = Gemma 4 on AWS Bedrock (no fallback between them) |
+| `BEDROCK_API_KEY` / `AWS_BEARER_TOKEN_BEDROCK` | – | Bedrock API key (required with `LLM_PROVIDER=bedrock`; `.env` only, never logged) |
+| `BEDROCK_REGION` | `us-west-2` | bedrock-mantle region |
+| `BEDROCK_MODEL_ID` | `google.gemma-4-31b` | Bedrock model id |
+| `BEDROCK_BASE_URL` | `https://bedrock-mantle.{region}.api.aws/openai/v1` | Override only if AWS changes the path |
+| `BEDROCK_RESPONSE_FORMAT` | `none` | `json_object` / `json_schema`: opt-in output constraint (experimental) |
+| `BEDROCK_REASONING_EFFORT` | unset | `low` / `medium` / `high` |
 | `LLM_SERVER_URL` | `http://127.0.0.1:8081` | llama-server address (private network only; compose sets `http://llm:8081`) |
 | `LLM_MODEL_NAME` | `qwen2.5-0.5b-instruct-q4_k_m` | Reported in responses/logs |
-| `LLM_MAX_TOKENS` | `256` | Output cap per plan |
-| `LLM_TIMEOUT_SECONDS` | `15` | Per-inference timeout (also the wait for a free slot) |
+| `LLM_MAX_TOKENS` | `512` | Output cap per plan |
+| `LLM_TIMEOUT_SECONDS` | `60` | Per-inference deadline shared by waiting for a free slot and inference |
 | `LLM_MAX_CONCURRENCY` | `2` | Concurrent inferences; keep equal to llama-server `--parallel` |
-| llama-server flags | see `deploy/` | `--ctx-size 4096 --parallel 2 --threads 4 --n-predict 256 --no-webui --no-slots --offline` |
+| llama-server flags | see `deploy/` | `--ctx-size 4096 --parallel 2 --threads 4 --n-predict 512 --no-webui --no-slots --offline` |
 | `APP_TIMEZONE` | `UTC` | Facility timezone for "today", "last week", … (e.g. `Asia/Kolkata`) |
 | `DATA_SOURCE` | `mcp` | `mcp` (MongoDB MCP Server tools, read-only) or `mongodb` (driver); `memory` is test-only |
 | `MCP_SERVER_COMMAND` | `mongodb-mcp-server` | How to start the MCP server (Docker image sets the bundled path) |
@@ -194,13 +239,72 @@ uv run ruff check app tests
 | `TOPIC_GATE_ENABLED` | `true` | Local topic check: a small embedding model on this server stops clearly off-topic questions before any planning |
 | `TOPIC_GATE_MODEL` / `TOPIC_GATE_CACHE_DIR` | `BAAI/bge-small-en-v1.5` / `.models` | Embedding model (~65 MB, downloaded once) and where it is stored |
 | `TOPIC_GATE_MARGIN` | `0.02` | How clearly off-topic a question must be to block it; higher blocks less. Tuned so no resident test question is blocked. Reference examples: `app/nlu/topic_examples.py` |
-| `CACHE_MAX_ENTRIES` / `CACHE_TTL_SECONDS` | `5000` / `86400` | Plan cache (repeat questions skip planning) |
+| `CACHE_MAX_ENTRIES` | `5000` | Failure cache: a question whose model plan failed validation is not re-planned in the same context. (`CACHE_TTL_SECONDS` and the exact successful-plan cache were removed 2026-11-18.) |
+| `PLAN_CACHE_ENABLED` | `false` | Semantic plan-template cache (see "Semantic plan cache"). Off = no successful-plan caching at all |
+| `PLAN_CACHE_MONGODB_URI` | – | **Dedicated** credential: `readWrite` on `PLAN_CACHE_DATABASE` only. Must differ from `MONGODB_URI` (startup fails otherwise) |
+| `PLAN_CACHE_DATABASE` / `PLAN_CACHE_COLLECTION` | `sal_staging_vector` / `residents_ai` | Where templates live (never the resident database; startup fails if equal to `MONGODB_DB`) |
+| `PLAN_CACHE_VECTOR_INDEX` | `query_plan_embedding_index` | Atlas Vector Search index name |
+| `PLAN_CACHE_SIMILARITY_THRESHOLD` | `0.88` | **Experimental** cosine threshold for nominating candidates — not a safety boundary |
+| `PLAN_CACHE_TOP_K` / `PLAN_CACHE_MAX_CANDIDATES` | `5` / `50` | `$vectorSearch` `limit` / `numCandidates` |
+| `PLAN_CACHE_TIMEOUT_SECONDS` | `2.0` | Embedding or Atlas call slower than this → cache miss (the question goes to Qwen) |
+| `PLAN_CACHE_TTL_HOURS` | `12` | Each template is deleted automatically this long after it was first stored (`expires_at` + MongoDB TTL index `expires_at_ttl`, created by the app at startup); reuse does not extend it |
+| `PLAN_CACHE_STORE_TEMPLATES` | `true` | Store checked, executed plans as reusable templates (re-validated on every reuse) |
 | `SESSION_TTL_SECONDS` | `1800` | How long follow-up context is kept per conversation |
 | `RATE_LIMIT_PER_MINUTE` / `RATE_LIMIT_PER_DAY` | `60` / `2000` | Per-IP limits on `POST /api/query` |
 | `API_TOKEN` | – | If set, `/api/*` (except health/ready) requires `Authorization: Bearer <token>` |
 | `CORS_ORIGINS` | – | Comma-separated allowed origins when the UI is served from another domain |
 | `ENABLE_DATA_BROWSER` | `false` | Exposes `GET /api/residents` for the in-app record browser |
 | `ENVIRONMENT` | `development` | `production` disables the interactive API docs |
+
+## Semantic plan cache (`app/engine/semantic_cache.py`, since 2026-11-18)
+
+Replaces the exact-fingerprint successful-plan cache. A **template** is a checked plan whose variable values are typed
+slots, stored with the BGE-small embedding of the slot-replaced question in a dedicated Atlas collection.
+
+```
+question → fast path (unchanged, first) → if not answered: slot-replaced text → BGE embedding (the topic gate's
+model) → $vectorSearch (revoked=false, same compatibility key) → per candidate ≥ threshold:
+  logic words equal (and/or/not/each/total/oldest …) → every slot refilled from THIS question (residents, dates,
+  age bounds, statuses, care types, genders, facilities, caregivers, limit — same shape: "after" never fills "before",
+  "older" never fills "younger") → existing resolve_plan + check_plan (must pass unchanged)
+→ exactly one distinct plan passes → executed;  otherwise → failure cache → Qwen (unchanged)
+```
+
+Similarity only nominates. Measured with BGE-small: "older than 75"/"younger than 75" 0.984, "Active or Discharged"/
+"Active and Discharged" 0.988 — higher than true paraphrases (0.915–0.927). `tests/test_semantic_cache.py` runs every
+safety test with an embedder that makes every template a perfect match.
+
+**No review step (decided 2026-11-18).** A fast-path or Qwen plan that passed validation unchanged and executed is
+stored with `revoked: false` and is reusable immediately; every reuse is re-validated against the new question. A wrong
+template is switched off with `revoke` (`revoked: true`, effective on the next query; storing it again never re-enables
+it). Only standalone questions: follow-ups ("of them") are neither stored nor served.
+
+**Compatibility key** (any change → old templates are ignored): RequestIR version, statuses + care types of the
+database (adding a resident/room/caregiver does NOT invalidate templates), QueryPlan schema + `resident_schema.yaml`,
+LLM model + chat-template settings, embedding model, template format version.
+
+**Stored document** (no raw question, no names, ids, rooms, dates or results):
+`_id/template_id`, `question_text` (slot-replaced, e.g. `How many {status} residents were admitted after {date}?`),
+`embedding` (384 floats), `logic_signature`, `plan_template` (QueryPlan with `{"$slot": …}` markers), `slots`,
+`mention_counts`, `action`, `source` (`fast_path`/`local_model`), `revoked`, `compat_key` + its parts,
+`created_at`, `expires_at` (TTL), `last_seen_at`, `seen_count`, `usage_count`, `last_used_at`, `revoked_by/at/reason`.
+
+**Atlas setup (once, by an Atlas admin — not the app's credential):**
+1. Database user with `readWrite` on `PLAN_CACHE_DATABASE` only → `PLAN_CACHE_MONGODB_URI`.
+2. Vector index (`uv run python -m scripts.plan_templates create-index --admin-uri-env ATLAS_ADMIN_URI`, or the Atlas UI
+   with this definition on `PLAN_CACHE_COLLECTION`, type *Vector Search*, name `PLAN_CACHE_VECTOR_INDEX`):
+   `{"fields": [{"type": "vector", "path": "embedding", "numDimensions": 384, "similarity": "cosine"},
+   {"type": "filter", "path": "revoked"}, {"type": "filter", "path": "compat_key"}]}` (an existing index: `update-index`)
+3. `uv run python -m scripts.plan_templates verify` until the index is `queryable`, then `PLAN_CACHE_ENABLED=true`.
+
+**Admin:** `scripts.plan_templates list` (active) / `list --revoked`, `show <id>`; a wrong template:
+`revoke <id> --by <name> --reason <why>` (effective on the next query).
+
+**Trade-offs (deliberate):** a repeat question no longer hits an in-process dictionary — it pays one embedding (~10 ms
+CPU) plus one Atlas round trip, and is only served once a stored template covers it; follow-ups are not cached;
+a plan the validator wrongly accepts is reused for similar
+questions until it is revoked. The step log (`step-10 semantic_cache`) records hit/miss, the reason,
+similarity, candidates and per-reason rejections, and embedding/search/check times.
 
 ## API
 

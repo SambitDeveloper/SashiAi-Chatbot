@@ -1,8 +1,7 @@
-"""QueryTranslator contract: masked question + permitted schema context → raw query-plan candidate (JSON dict).
+"""QueryTranslator contract: masked question + permitted schema context → candidate RequestIR (JSON dict).
 
-The application depends only on this interface, never on a model runtime. The one implementation is the local
-Qwen2.5-0.5B-Instruct model served by llama.cpp (app/nlu/qwen_translator.py). A candidate plan is never trusted:
-it always goes through the resolver, Pydantic validation and the grounding checks before anything touches the data.
+The application depends only on this interface, never on a model runtime. The local model returns semantic IR, which
+is compiled to QueryPlan and independently validated before anything touches the data.
 """
 
 from dataclasses import dataclass, field
@@ -48,14 +47,19 @@ class TranslationRequest:
     masked_question: str
     today: str
     context: SchemaContext
-    previous_plan_json: str | None = None
+    previous_ir_json: str | None = None
     date_hints: list[str] = field(default_factory=list)  # e.g. 'last month' = 2026-10-01 to 2026-10-31
     hint: str | None = None  # completeness / grounding feedback on a retry
+    brief: str | None = None  # what the deterministic analysis understood (app/nlu/brief.py)
+    retry_ir_json: str | None = None  # previous candidate for this same question, not conversation memory
+    # What is left of the REQUEST's model-time budget (service.py). A call never gets more than this, so a retry
+    # cannot restart the clock; None = only the per-call LLM_TIMEOUT_SECONDS applies (warm-up, direct callers).
+    timeout_s: float | None = None
 
 
 @dataclass
 class Translation:
-    plan: dict
+    request_ir: dict
     usage: ModelUsage
     model: str
 

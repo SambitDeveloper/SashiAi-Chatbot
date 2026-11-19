@@ -158,7 +158,14 @@ class StructureAnalyzer:
         words = [m.group(0) for m in _TOKEN.finditer(masked_question.lower())]
         out = QuestionStructure()
         for op, phrases in self.operation_cues:
-            if self._find(words, phrases) and op not in out.operations:
+            matches = self._find(words, phrases)
+            if op == "count":
+                matches = [
+                    (i, phrase)
+                    for i, phrase in matches
+                    if not self._count_cue_is_part_of_field(words, i, phrase)
+                ]
+            if matches and op not in out.operations:
                 out.operations.append(op)
 
         placeholders = [i for i, w in enumerate(words) if _PLACEHOLDER.match(w)]
@@ -193,6 +200,16 @@ class StructureAnalyzer:
             elif c.op is None:
                 out.undetermined.append(f"comparison for {c.field} ({c.cue} {c.reference})")
         return out
+
+    def _count_cue_is_part_of_field(self, words: list[str], start: int, phrase: list[str]) -> bool:
+        """A field name such as "room number" must not turn "number of resident" into a count operation."""
+        end = start + len(phrase)
+        for field_phrase, _ in self.field_words:
+            for field_start in range(max(0, start - len(field_phrase) + 1), end):
+                field_end = field_start + len(field_phrase)
+                if field_start < end and start < field_end and self._at(words, field_start, field_phrase):
+                    return True
+        return False
 
     def _frame_before(self, words: list[str], i: int):
         """The comparison construction whose last word sits directly before position i (determiners may intervene:

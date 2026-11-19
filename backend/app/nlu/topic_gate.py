@@ -61,6 +61,12 @@ class TopicGate:
     def ready(self) -> bool:
         return self._embedder is not None
 
+    @property
+    def embedder(self) -> Embedder | None:
+        """The loaded BGE embedder (None until start() finished), shared with the semantic plan cache so the same
+        model, preprocessing and vectors are used for storing and searching templates."""
+        return self._embedder
+
     def load(self) -> None:
         """Load the model and embed the reference examples (blocking; call via start())."""
         embedder = self._factory()

@@ -14,6 +14,7 @@ from typing import Any
 
 import yaml
 
+from app.data import text_match
 from app.data.repository import FIELD_MAP, MISSING_GROUP, GroupAggregateRow, GroupRow, Resident, Vocabulary
 from app.data.schema_config import identity_fields, list_fields, missing_markers
 from app.models.plan import Filters, GroupField, Sort
@@ -49,13 +50,16 @@ def to_mongo_filter(filters: Filters) -> dict[str, Any]:
         if f is None:
             continue
         field = FIELD_MAP[plan_field]
+        if f.has_text_match:  # AND-ed clauses; the semantics live in text_match (shared with repository.matches)
+            extra.extend(text_match.mongo_clauses(field, f.starts_with, f.contains))
         if f.missing is None:
             cond: dict[str, Any] = {}
             if f.include:
                 cond["$in"] = list(f.include)
             if f.exclude:
                 cond["$nin"] = list(f.exclude)
-            q[field] = cond
+            if cond:  # a text-only filter has no value condition ({field: {}} would mean "equals {}")
+                q[field] = cond
             continue
         if f.missing:
             alternatives = [_missing_clause(field, True)]

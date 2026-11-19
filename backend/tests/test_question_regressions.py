@@ -37,7 +37,7 @@ def _vocab(**kw) -> EntityIndex:
 
 # ---------------------------------------------------------------- names
 def test_name_at_end_of_sentence_is_still_inside_the_care_type():
-    """"Skilled Nursing." is the care type, not the staff member "Director Nursing" (trailing full stop)."""
+    """ "Skilled Nursing." is the care type, not the staff member "Director Nursing" (trailing full stop)."""
     idx = _vocab(caregivers=["Director Nursing"], care_types=["skilled_nursing"])
     assert idx.mentioned_caregivers("Find residents older than 90 who belong to Skilled Nursing.") == {}
 
@@ -97,8 +97,8 @@ async def test_age_and_care_type_with_belong_to(builder, index):
 
 
 # ---------------------------------------------------------------- grounding of model plans
-async def test_model_date_bounds_are_corrected_from_the_question():
-    """The model read "before 2026" as "during 2026": the deterministic date replaces it."""
+async def test_inconsistent_model_date_bounds_are_rejected_without_execution():
+    """The model read "before 2026" as "during 2026"; the inconsistent plan must not execute."""
     from tests.test_direct_query import make_service
 
     q = "how many residents were admitted before 2026?"
@@ -106,7 +106,8 @@ async def test_model_date_bounds_are_corrected_from_the_question():
     service = await make_service({"count": 0.50, "list": 0.40}, fake)  # router unsure: the model plans
     r = await service.handle(q)
     assert r["tier"] == "llm"
-    assert r["intent"]["parameters"]["filters"]["admission_date"] == {"end": "2025-12-31"}
+    assert r["response"]["needsClarification"] is True
+    assert r["mcpCall"] is None
 
 
 async def test_model_placeholder_for_an_unnamed_resident_is_rejected(make_service):
@@ -130,7 +131,7 @@ async def test_comparison_between_residents_is_answered_without_the_model(make_s
 
 
 def test_function_word_before_a_name_is_not_part_of_the_name():
-    """"as" is a substring of "aakash": it must not be masked together with the name ("same room as <name>")."""
+    """ "as" is a substring of "aakash": it must not be masked together with the name ("same room as <name>")."""
     idx = _vocab(residents=[{"residentId": "R1", "firstName": "Bansal", "lastName": "Aakash"},
                             {"residentId": "R2", "firstName": "Ann", "lastName": "Lee"}])  # fmt: skip
     m = idx.mask("residents in the same room as Bansal Aakash")

@@ -5,7 +5,7 @@
 
 N simulated staff members each ask M questions back-to-back, all users at the same time. Questions are the gold
 "complex" phrasings (the ones that need the model), so every request exercises local inference. Production settings
-are used (LLM_TIMEOUT_SECONDS default 15 s, concurrency capped at LLM_MAX_CONCURRENCY): a request that cannot get a
+are used (LLM_TIMEOUT_SECONDS default 60 s, concurrency capped at LLM_MAX_CONCURRENCY): a request that cannot get a
 slot in time, or times out, is reported as unavailable — the user sees a controlled message, not a hang.
 """
 

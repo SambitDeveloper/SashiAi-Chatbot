@@ -39,6 +39,9 @@ _POINT = (
     r"|(?P<y4>\d{4})(?![\d-]))"
 )
 _POINT_RE = re.compile(r"\b" + _POINT + r"\b")
+# "between <point> and <point>" / "from <point> to <point>": the opening word, then the joiner between the two points
+_RANGE_OPEN_RE = re.compile(r"\b(?:between|from)\s+(?:the\s+)?")
+_RANGE_JOIN_RE = re.compile(r"\s*,?\s*(?:and|to|through|until|till|-)\s+(?:the\s+)?")
 # Comparison words before a point. "before"/"prior to" exclude the point itself and "after" starts once it is over;
 # "since", "from" and "until"/"up to"/"by"/"through" include it.
 _EXCLUSIVE_END = ("before", "prior to")
@@ -123,9 +126,17 @@ def parse_dates(text: str, today: date) -> list[DateMatch]:
             matches.append(DateMatch(start, end, rng))
             taken.append((start, end))
 
-    # between D1 and D2 / from D1 to D2  (ISO dates only; other wording is left to the model)
-    for m in re.finditer(r"\b(?:between|from)\s+(\d{4}-\d{2}-\d{2})\s+(?:and|to|through|until)\s+(\d{4}-\d{2}-\d{2})\b", low):
-        add(m.start(), m.end(), {"start": m.group(1), "end": m.group(2)})
+    # between D1 and D2 / from D1 to D2 — ONE inclusive range, for every point form (ISO, "january 1, 2024",
+    # "1 march 2025", "march 2024", "2024"): from the first day of D1 to the last day of D2. Must run before the
+    # single-point rules: read separately, "between january 1, 2024, and december 31, 2025" became two single days,
+    # so a correct 2024-01-01..2025-12-31 plan was rejected as "not asked" (benchmark Q36, 2026-11-17).
+    for m in _RANGE_OPEN_RE.finditer(low):
+        a = _POINT_RE.match(low, m.end())
+        joiner = _RANGE_JOIN_RE.match(low, a.end()) if a else None
+        b = _POINT_RE.match(low, joiner.end()) if joiner else None
+        pa, pb = (_point(a, today), _point(b, today)) if b else (None, None)
+        if pa and pb and pa[0] <= pb[1]:
+            add(m.start(), b.end(), {"start": _iso(pa[0]), "end": _iso(pb[1])})
 
     # before / after / since / until / by  <date point>. The point is a whole period ("2026", "june 2026") or one
     # day; "before" ends the day before the period starts, "after" starts the day after it ends.

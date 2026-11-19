@@ -37,7 +37,9 @@ async def test_resident_names_never_sent_to_model(make_service):
     assert result["response"]["headline"] == "Nurse Sarah Jenkins, RN — Primary Caregiver"
 
 
-async def test_masked_template_is_cached_across_residents(make_service):
+async def test_no_successful_plan_cache_without_the_semantic_cache(make_service):
+    # The exact-fingerprint plan cache was removed on 2026-11-18. Reuse now needs a stored semantic template
+    # (tests/test_semantic_cache.py); without the semantic cache every question is planned, for every resident.
     fake = FakeTranslator(
         {
             "What is resident_1's room?": {
@@ -49,8 +51,7 @@ async def test_masked_template_is_cached_across_residents(make_service):
     service = await make_service(fake)
     first = await service.handle("What is Eleanor Vance's room?")
     second = await service.handle("What is Arthur Pendleton's room?")
-    assert len(fake.calls) == 1, "second question must be served from the cache"
-    assert second["tier"] == "cache" and second["tokensConsumed"] == 0
+    assert len(fake.calls) == 2 and first["tier"] == second["tier"] == "llm"
     assert first["response"]["headline"].startswith("MC-101")
     assert second["response"]["headline"].startswith("MC-104")
 
@@ -74,7 +75,7 @@ async def test_follow_up_uses_previous_plan(make_service):
     service = await make_service(fake)
     await service.handle("How many active residents does Sarah Jenkins look after?", session_id="s1")
     result = await service.handle(q2, session_id="s1")
-    assert fake.calls[1]["previous"] is not None and "Nurse Sarah Jenkins, RN" in fake.calls[1]["previous"]
+    assert fake.calls[1]["previous"] is not None and "Sarah Jenkins" in fake.calls[1]["previous"]
     assert result["response"]["count"] == 9
 
     # A follow-up answer is tied to its conversation: the same words in a fresh chat must not reuse it.
@@ -85,7 +86,9 @@ async def test_follow_up_uses_previous_plan(make_service):
     assert fresh["response"].get("needsClarification") and fresh["mcpCall"] is None
 
 
-async def test_repeated_question_in_same_chat_uses_cache(make_service):
+async def test_repeated_question_in_same_chat_is_planned_again(make_service):
+    # intentional behaviour change (2026-11-18): no in-memory successful-plan cache; repeats cost a model call unless
+    # a stored semantic template covers them
     q = "Who is the primary caretaker of Eleanor Vance ?"
     fake = FakeTranslator(
         {
@@ -100,8 +103,8 @@ async def test_repeated_question_in_same_chat_uses_cache(make_service):
     tiers = [
         (await service.handle(x, session_id="tab-1"))["tier"] for x in [q, q, q, "How many residents are active?", q]
     ]
-    assert tiers == ["llm", "cache", "cache", "llm", "cache"]
-    assert len(fake.calls) == 2
+    assert tiers == ["llm", "llm", "llm", "llm", "llm"]
+    assert len(fake.calls) == 5
 
 
 async def test_no_previous_plan_without_session(make_service):
@@ -155,13 +158,23 @@ async def test_unknown_resident_not_found(make_service):
     assert "John Smith" in result["response"]["summaryText"]
 
 
-async def test_invalid_model_output_is_not_executed(make_service):
+async def test_invalid_model_output_is_not_executed(make_service, repo):
     q = "How many residents are alive?"
+    total_calls = 0
+    original_total = repo.total
+
+    async def tracked_total():
+        nonlocal total_calls
+        total_calls += 1
+        return await original_total()
+
+    repo.total = tracked_total
     service = await make_service(
         FakeTranslator({q: {"action": "count", "filters": {"status": {"include": ["alive"]}}}})
     )
     result = await service.handle(q)
     assert result["response"]["needsClarification"] and result["mcpCall"] is None
+    assert total_calls == 0
 
 
 async def test_unsupported_is_passed_through(make_service):
@@ -231,9 +244,9 @@ async def test_dropped_caregiver_is_caught_and_retried(make_service):
     assert "Caregiver: Care Aide Elena Rostova" in result["interpretation"]
     assert len(fake.calls) == 2 and "Elena Rostova" in fake.calls[1]["hint"]
     assert result["tokensConsumed"] == 2 * 740 and result["modelCalls"] == 2  # both calls are counted
-    # the corrected plan is what gets cached
+    # no successful-plan cache any more (2026-11-18): asking again is planned again and still answered correctly
     again = await service.handle(ELENA_Q)
-    assert again["tier"] == "cache" and again["response"]["count"] == 2
+    assert again["tier"] == "llm" and again["response"]["count"] == 2
 
 
 async def test_still_incomplete_after_retry_asks_the_user(make_service):
@@ -313,7 +326,7 @@ async def test_empty_invented_condition_is_ignored(make_service):
                 "action": "count",
                 "conditions": [
                     {"field": "care_type", "include": ["memory_care"]},
-                    {"field": "admission_date", "start": "2026-01-01", "end": "2026-11-09"},
+                    {"field": "admission_date", "start": "2026-01-01", "end": "2026-12-31"},
                     {"field": "discharge_date"},
                 ],
             }
@@ -325,7 +338,7 @@ async def test_empty_invented_condition_is_ignored(make_service):
     assert not any(c.startswith("Discharged") for c in result["interpretation"])
 
 
-async def test_previous_plan_is_shown_as_conditions(make_service):
+async def test_previous_interpretation_is_shown_as_request_ir(make_service):
     q1, q2 = "How many active residents are there?", "And in memory care?"
     fake = FakeTranslator(
         {
@@ -344,7 +357,8 @@ async def test_previous_plan_is_shown_as_conditions(make_service):
     await service.handle(q1, session_id="c1")
     result = await service.handle(q2, session_id="c1")
     previous = json.loads(fake.calls[1]["previous"])
-    assert "filters" not in previous and {"field": "status", "include": ["active"]} in previous["conditions"]
+    assert "filters" not in previous and "conditions" not in previous
+    assert previous["where"]["field"] == "status" and previous["where"]["value"] == "active"
     assert result["response"]["count"] == 15
 
 
@@ -362,18 +376,24 @@ async def test_model_plans_are_reported_and_logged_without_names(make_service, c
     assert [p["attempt"] for p in plans] == [1, 2]
     assert plans[0]["plan"] == ACTIVE_OCTOBER and "primary_caregiver" not in json.dumps(plans[0])
     assert any("Elena Rostova" in f for f in plans[1]["feedback"])  # what the retry was told to fix
-    assert result["fallbackReason"] == "planner_not_ready"  # this test service has no semantic router
-    logged = [r for r in caplog.records if r.getMessage() == "local model plan generated"]
+    assert result["fallbackReason"] == "no_deterministic_plan"  # this test service has no semantic router
+    logged = [r for r in caplog.records if r.getMessage() == "local model RequestIR generated"]
     assert [r.attempt for r in logged] == [1, 2]
 
 
 def test_logged_model_plan_never_contains_resident_names():
     from app.engine.service import _redact_for_log
 
-    raw = {"action": "lookup", "lookup": {"residents": ["Kessler Alphonse", "resident_1"]}, "message": "Is it Kessler?"}
+    raw = {
+        "action": "lookup",
+        "lookup": {"residents": ["Kessler Alphonse", "resident_1"]},
+        "where": {"value": "Nurse Sarah Jenkins, RN", "evidence": "Kessler Alphonse"},
+        "message": "Is it Kessler?",
+    }
     red = _redact_for_log(raw)
-    assert red["lookup"]["residents"] == ["<resident name>", "resident_1"]
-    assert "Kessler" not in json.dumps(red) and raw["lookup"]["residents"][0] == "Kessler Alphonse"  # original intact
+    assert red["lookup"]["residents"] == ["<resident>", "resident_1"]
+    assert "Kessler" not in json.dumps(red) and "Sarah Jenkins" not in json.dumps(red)
+    assert raw["lookup"]["residents"][0] == "Kessler Alphonse"  # original intact
 
 
 async def test_model_text_never_shows_placeholders(make_service):

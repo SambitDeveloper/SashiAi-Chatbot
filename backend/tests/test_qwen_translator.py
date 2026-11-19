@@ -14,7 +14,30 @@ from app.nlu.qwen_translator import QwenTranslator
 from app.nlu.translator import SchemaContext, TranslationRequest, TranslatorUnavailable
 
 CTX = SchemaContext(["active", "discharged"], ["memory_care"], ["North Wing"], ["Nurse Sarah Jenkins, RN"])
-PLAN = {"action": "count", "conditions": [{"field": "status", "include": ["active"]}]}
+REQUEST_IR = {
+    "action": "count",
+    "action_status": "supported",
+    "action_evidence": "How many",
+    "where": {
+        "kind": "predicate",
+        "status": "supported",
+        "field": "status",
+        "operator": "eq",
+        "value": "active",
+        "evidence": "active",
+    },
+    "group_by": [],
+    "aggregate": None,
+    "projection": [],
+    "sort": None,
+    "limit": None,
+    "lookup": None,
+    "message": None,
+    "uses_previous": False,
+    "unsupported": [],
+    "unresolved": [],
+    "ambiguous": [],
+}
 
 
 def settings(**kw) -> Settings:
@@ -48,7 +71,7 @@ async def test_request_is_deterministic_and_grammar_constrained():
     def handler(req: httpx.Request) -> httpx.Response:
         seen["path"] = req.url.path
         seen["body"] = json.loads(req.content)
-        return ok_response(json.dumps(PLAN))
+        return ok_response(json.dumps(REQUEST_IR))
 
     t = translator(handler)
     result = await t.translate(request(date_hints=["'last month' = 2026-10-01 to 2026-10-31"]))
@@ -57,11 +80,12 @@ async def test_request_is_deterministic_and_grammar_constrained():
     assert body["temperature"] == 0.0 and body["top_k"] == 1 and body["cache_prompt"] is True
     schema = body["response_format"]["json_schema"]["schema"]
     assert schema["properties"]["action"]["enum"][0] == "count"
+    assert "$defs" in schema and "IRNode" in schema["$defs"]
     # the real request is the LAST message; system prompt + few-shot examples come first (cacheable prefix)
     assert body["messages"][0]["role"] == "system"
     last = body["messages"][-1]["content"]
     assert "Question: How many active residents?" in last and "Dates: 'last month' = 2026-10-01" in last
-    assert result.plan == PLAN and result.usage.calls == 1 and result.usage.prompt_tokens == 812
+    assert result.request_ir == REQUEST_IR and result.usage.calls == 1 and result.usage.prompt_tokens == 812
 
 
 async def test_system_prompt_and_examples_are_identical_across_requests():
@@ -70,7 +94,7 @@ async def test_system_prompt_and_examples_are_identical_across_requests():
 
     def handler(req):
         prefixes.append(json.loads(req.content)["messages"][:-1])
-        return ok_response(json.dumps(PLAN))
+        return ok_response(json.dumps(REQUEST_IR))
 
     t = translator(handler)
     await t.translate(request())
@@ -116,7 +140,7 @@ async def test_concurrency_is_capped_and_overflow_fails_fast():
         active["max"] = max(active["max"], active["now"])
         await release.wait()
         active["now"] -= 1
-        return ok_response(json.dumps(PLAN))
+        return ok_response(json.dumps(REQUEST_IR))
 
     t = translator(handler, llm_max_concurrency=1, llm_timeout_seconds=0.2)
     first = asyncio.create_task(t.translate(request()))
@@ -124,7 +148,7 @@ async def test_concurrency_is_capped_and_overflow_fails_fast():
     with pytest.raises(TranslatorUnavailable, match="overloaded"):
         await t.translate(request())  # no free slot within the timeout
     release.set()
-    assert (await first).plan == PLAN
+    assert (await first).request_ir == REQUEST_IR
     assert active["max"] == 1
 
 
@@ -139,7 +163,7 @@ async def test_chat_template_kwargs_are_sent_only_when_configured():
 
     def handler(req):
         bodies.append(json.loads(req.content))
-        return ok_response(json.dumps(PLAN))
+        return ok_response(json.dumps(REQUEST_IR))
 
     await translator(handler, llm_chat_template_kwargs={}).translate(request())  # e.g. Qwen2.5 configured explicitly
     await translator(handler).translate(request())  # default: Qwen3 non-thinking
@@ -156,7 +180,9 @@ def test_chat_template_kwargs_from_environment(monkeypatch):
 
 def test_default_model_is_qwen3_non_thinking():
     s = Settings(_env_file=None)
-    assert s.llm_model_name == "qwen3-4b-instruct-2507-q4_k_m" and s.llm_chat_template_kwargs == {"enable_thinking": False}
+    assert s.llm_model_name == "qwen3-4b-instruct-2507-q4_k_m" and s.llm_chat_template_kwargs == {
+        "enable_thinking": False
+    }
 
 
 async def test_warm_up_fills_every_slot_and_never_raises():
@@ -164,7 +190,7 @@ async def test_warm_up_fills_every_slot_and_never_raises():
 
     def handler(req):
         calls.append(1)
-        return ok_response(json.dumps(PLAN))
+        return ok_response(json.dumps(REQUEST_IR))
 
     await translator(handler, llm_max_concurrency=2).warm_up(CTX, "2026-11-09")
     assert len(calls) == 2
@@ -177,16 +203,26 @@ async def test_warm_up_fills_every_slot_and_never_raises():
 
 async def test_thinking_output_is_never_parsed_or_returned():
     """Thoughts arrive in reasoning_content (or, defensively, inline before </think>); only the final JSON counts."""
+
     def handler(req):
-        return httpx.Response(200, json={
-            "choices": [{"message": {"reasoning_content": "Okay, the user wants {\"action\": \"list\"} maybe...",
-                                     "content": "<think>stray {not json}</think>\n" + json.dumps(PLAN)},
-                         "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1170, "completion_tokens": 314},
-        })
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "reasoning_content": 'Okay, the user wants {"action": "list"} maybe...',
+                            "content": "<think>stray {not json}</think>\n" + json.dumps(REQUEST_IR),
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1170, "completion_tokens": 314},
+            },
+        )
 
     result = await translator(handler).translate(request())
-    assert result.plan == PLAN and "reasoning" not in json.dumps(result.plan)
+    assert result.request_ir == REQUEST_IR and "reasoning" not in json.dumps(result.request_ir)
 
 
 async def test_sampling_settings_are_sent():
@@ -194,7 +230,7 @@ async def test_sampling_settings_are_sent():
 
     def handler(req):
         bodies.append(json.loads(req.content))
-        return ok_response(json.dumps(PLAN))
+        return ok_response(json.dumps(REQUEST_IR))
 
     await translator(handler, llm_temperature=0.6, llm_top_p=0.95, llm_top_k=20).translate(request())
     assert (bodies[0]["temperature"], bodies[0]["top_p"], bodies[0]["top_k"]) == (0.6, 0.95, 20)
@@ -217,7 +253,7 @@ async def test_prompt_does_not_grow_with_the_facility_list():
 
     def handler(req):
         bodies.append(json.loads(req.content))
-        return ok_response(json.dumps(PLAN))
+        return ok_response(json.dumps(REQUEST_IR))
 
     t = translator(handler)
     from datetime import date

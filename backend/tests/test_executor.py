@@ -1,5 +1,7 @@
 """Execution correctness against the seed data (expected values computed independently from residents.json)."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from app.engine.executor import execute
@@ -89,3 +91,12 @@ async def test_single_lookup_includes_emergency_contact(repo):
         repo, {"action": "lookup", "lookup": {"residents": ["RES-1001"], "attributes": ["emergency_contact"]}}
     )
     assert "555-0192" in build_response(plan, data)["summaryText"]
+
+
+async def test_non_data_plan_does_not_access_the_repository(repo):
+    repo.total = AsyncMock(side_effect=AssertionError("non-data plan must not query residents"))
+
+    data = await execute(QueryPlan(action="clarify", message="Please clarify."), repo)
+
+    assert data.matched == 0
+    repo.total.assert_not_awaited()

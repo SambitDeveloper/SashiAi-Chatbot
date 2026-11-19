@@ -62,83 +62,43 @@ def _readable(r: Resident) -> Resident:
 
 
 def spotlight(r: Resident, attribute: str) -> dict[str, Any]:
+    """One asked-for fact about one resident. The answer states ONLY that fact (data minimisation, 2026-11-19: a
+    caregiver question used to also show the room and facility); the supporting line just says whose fact it is."""
     r = _readable(r)
     name = _name(r)
+
+    def fact(label: str, value: Any, detail: str | None = None) -> dict[str, Any]:
+        text = str(value).strip() if value is not None else NOT_RECORDED
+        return {"attribute": attribute, "label": label, "value": text, "supportingDetail": detail or f"{label} of {name}."}
+
     match attribute:
         case "primary_caregiver":
-            return {
-                "attribute": attribute,
-                "label": "Primary Caregiver",
-                "value": r["primaryCaregiver"],
-                "supportingDetail": f"Assigned to {name}, room {r['roomNumber']} ({r['wing']}).",
-            }
+            return fact("Primary Caregiver", r["primaryCaregiver"])
         case "room_number":
-            return {
-                "attribute": attribute,
-                "label": "Room",
-                "value": f"{r['roomNumber']} · {r['wing']}",
-                "supportingDetail": f"{name} is in room {r['roomNumber']}, {r['wing']}.",
-            }
+            return fact("Room", r["roomNumber"])
         case "facility":
-            return {
-                "attribute": attribute,
-                "label": "Facility",
-                "value": r["wing"],
-                "supportingDetail": f"Room {r['roomNumber']}.",
-            }
+            return fact("Facility", r["wing"])
         case "admission_date":
-            return {
-                "attribute": attribute,
-                "label": "Admission Date",
-                "value": r["admissionDate"],
-                "supportingDetail": f"{name} was admitted on {r['admissionDate']}.",
-            }
+            return fact("Admission Date", r["admissionDate"])
         case "created_date":
-            return {"attribute": attribute, "label": "Registration Date", "value": r["createdDate"]}
+            return fact("Registration Date", r["createdDate"])
         case "discharge_date":
-            return {
-                "attribute": attribute,
-                "label": "Discharge Date",
-                "value": r.get("dischargeDate") or "Not discharged",
-            }
+            return fact("Discharge Date", r.get("dischargeDate") or "Not discharged")
         case "resident_id":
-            return {
-                "attribute": attribute,
-                "label": "Resident ID",
-                "value": r["residentId"],
-                "supportingDetail": f"Record ID of {name}.",
-            }
+            return fact("Resident ID", r["residentId"])
         case "emergency_contact":
             c = r["emergencyContact"]
             relation = f" ({c['relationship']})" if c.get("relationship") else ""
-            return {
-                "attribute": attribute,
-                "label": "Emergency Contact",
-                "value": f"{c.get('name') or NOT_RECORDED}{relation}",
-                "supportingDetail": f"Phone: {c['phone']}" if c.get("phone") else "",
-            }
+            phone = f"Phone: {c['phone']}." if c.get("phone") else None  # part of the contact that was asked for
+            return fact("Emergency Contact", f"{c.get('name') or NOT_RECORDED}{relation}", phone)
         case "status":
-            return {
-                "attribute": attribute,
-                "label": "Status",
-                "value": status_label(r.get("status")),
-                "supportingDetail": f"Discharged on {r['dischargeDate']}." if r.get("dischargeDate") else None,
-            }
+            return fact("Status", status_label(r.get("status")))
         case "care_type":
-            return {
-                "attribute": attribute,
-                "label": "Care Type",
-                "value": care_label(r.get("careType")),
-            }
+            return fact("Care Type", care_label(r.get("careType")))
         case "age":
-            return {
-                "attribute": attribute,
-                "label": "Age",
-                "value": f"{r['age']} years",
-                "supportingDetail": r["gender"],
-            }
+            return fact("Age", f"{r['age']} years" if r["age"] != NOT_RECORDED else NOT_RECORDED)
         case "gender":
-            return {"attribute": attribute, "label": "Gender", "value": r["gender"]}
+            return fact("Gender", r.get("gender") or NOT_RECORDED)
     return {"attribute": "fullProfile", "label": "Overview", "value": name}
 
 
@@ -248,9 +208,9 @@ def build_response(plan: QueryPlan, data: ExecutionData) -> dict[str, Any]:
             "headline": f"{spots[0]['value']} — {spots[0]['label']}"
             if len(spots) == 1
             else " · ".join(str(s["value"]) for s in spots),
-            "summaryText": (spots[0].get("supportingDetail") or f"{_name(r)} ({r['residentId']}).")
+            "summaryText": (spots[0].get("supportingDetail") or f"{_name(r)}.")
             if len(spots) == 1
-            else f"{_name(r)} ({r['residentId']}): " + "; ".join(f"{s['label']}: {s['value']}" for s in spots) + ".",
+            else f"{_name(r)}: " + "; ".join(f"{s['label']}: {s['value']}" for s in spots) + ".",
             "count": 1,
             "attributeSpotlight": spots[0],
             "multiSpotlight": spots,
@@ -260,6 +220,25 @@ def build_response(plan: QueryPlan, data: ExecutionData) -> dict[str, Any]:
         groups = data.groups or []
         denom = data.matched or 1
         label = " × ".join(GROUP_LABELS[g] for g in plan.group_by)
+        if plan.output_fields and data.group_details_complete is False:
+            return {
+                "headline": f"{_plural(data.matched)} by {label}",
+                "summaryText": (
+                    "The group counts are available, but all requested resident details exceed the result limit. "
+                    "Narrow the filters to retrieve the complete names and requested fields."
+                ),
+                "count": data.matched,
+                "needsClarification": True,
+                "breakdown": [
+                    {
+                        "key": "|".join(g.key),
+                        "label": " · ".join(label_value(f, k) for f, k in zip(plan.group_by, g.key, strict=True)),
+                        "count": g.count,
+                        "percentage": round(g.count / denom * 100),
+                    }
+                    for g in groups
+                ],
+            }
         return {
             "headline": f"{_plural(data.matched)} by {label}",
             "summaryText": f"Breakdown of {_plural(data.matched)}{scope} (of {data.total} in the census).",
@@ -270,10 +249,15 @@ def build_response(plan: QueryPlan, data: ExecutionData) -> dict[str, Any]:
                     "label": " · ".join(label_value(f, k) for f, k in zip(plan.group_by, g.key, strict=True)),
                     "count": g.count,
                     "percentage": round(g.count / denom * 100),
+                    **(
+                        {"residents": (data.group_residents or {}).get(g.key, [])}
+                        if plan.output_fields
+                        else {}
+                    ),
                 }
                 for g in groups
             ],
-            "residentsSample": data.rows,
+            **({"columns": _columns(plan)} if plan.output_fields else {"residentsSample": data.rows}),
         }
 
     if plan.action == "aggregate":

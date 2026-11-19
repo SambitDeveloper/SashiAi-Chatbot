@@ -296,6 +296,7 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
                 const count = item.count;
                 const percentage = item.percentage;
                 const label = item.label;
+                const groupResidents = item.residents;
 
                 return (
                   <div key={idx} className="space-y-1">
@@ -312,6 +313,37 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
                         style={{ width: `${Math.max(percentage, 2)}%` }}
                       />
                     </div>
+                    {groupResidents && groupResidents.length > 0 && (
+                      <div className="mt-2 overflow-x-auto border border-brand-100 rounded-xl">
+                        <table className="w-full text-left text-xs">
+                          <thead className="bg-white text-slate-500 border-b border-brand-100">
+                            <tr>
+                              <th className="py-2 px-3 font-semibold">Name</th>
+                              {columns?.map(c => (
+                                <th key={c.key} className="py-2 px-3 font-semibold">{c.label}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-brand-50 bg-white">
+                            {groupResidents.map(r => {
+                              const row = r as unknown as Record<string, unknown>;
+                              return (
+                                <tr key={String(row.residentId ?? row.id)}>
+                                  <td className="py-2 px-3 font-semibold text-navy-900">
+                                    {r.firstName} {r.lastName}
+                                  </td>
+                                  {columns?.map(c => (
+                                    <td key={c.key} className="py-2 px-3 text-slate-700">
+                                      {formatCell(c.key, row[c.key])}
+                                    </td>
+                                  ))}
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
                   </div>
                 );
               })}

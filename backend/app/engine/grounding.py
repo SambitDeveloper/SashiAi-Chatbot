@@ -19,8 +19,10 @@ from datetime import date as date_type
 
 from rapidfuzz import fuzz
 
+from app.data import text_match
+from app.data.repository import FIELD_MAP
 from app.data.schema_config import output_fields, single_record_only
-from app.models.plan import AgeRange, DateRange, QueryPlan
+from app.models.plan import TEXT_MATCH_FIELDS, AgeRange, DateRange, QueryPlan
 from app.nlu.grammar import DateMatch, NumberMatch, parse_dates, parse_number_ranges
 from app.nlu.missing_values import MissingValueDetector
 from app.nlu.projection import ProjectionDetector, value_starts
@@ -182,10 +184,13 @@ def _list_size(low: str, scan: "DateScan") -> int | None:
     return None
 
 
-def _check_structure(plan: QueryPlan, low: str, scan: "DateScan", g: "Grounding") -> None:
+def _check_structure(
+    plan: QueryPlan, low: str, scan: "DateScan", g: "Grounding", implied_group_fields: set[str] | None = None
+) -> None:
     """Action, grouping, ordering, limit and aggregate must follow from the question's words."""
     groups = plan.group_by or []
     named_groups = [f for f, words in GROUP_WORDS.items() if any(_has(w, low) for w in words)]
+    named_groups.extend(f for f in implied_group_fields or set() if f not in named_groups)
     grouping_cue = any(_has(c, low) for c in GROUP_CUES)
     for f in groups:
         if f not in named_groups:
@@ -214,7 +219,13 @@ def _check_structure(plan: QueryPlan, low: str, scan: "DateScan", g: "Grounding"
         g.missing.append({"avg": "average", "min": "minimum", "max": "maximum"}[agg_ops[0]] + " age")
 
     # counting questions answered with a plain list
-    if plan.action == "list" and not plan.sort and not plan.limit and any(_has(c, low) for c in COUNT_CUES):
+    if (
+        plan.action == "list"
+        and not plan.sort
+        and not plan.limit
+        and not plan.output_fields
+        and any(_has(c, low) for c in COUNT_CUES)
+    ):
         plan.action = "count"
         g.fixes.append("list → count (question asks how many)")
 
@@ -276,6 +287,61 @@ class Grounding:
 
     def problems(self) -> list[str]:
         return [*self.blocking, *self.missing, *(f"not asked: {x}" for x in self.invented)]
+
+
+# Text-match phrases ("room starts with A", "facility containing 'Garden'"). The needle is the quoted text, or the one
+# word after the cue (optionally after "the letter/prefix/text/word"). Used both ways: a phrase the plan lacks is a
+# dropped condition, and a plan needle that no such phrase supports is invented.
+_TEXT_CUES = {
+    "starts_with": r"(?:starts?|starting|begins?|beginning)\s+with",
+    "contains": r"(?:contains?|containing)",
+}
+_TEXT_LEAD = r"\s+(?:(?:the|a|an)\s+(?:letters?|prefix|text|word|string|characters?)\s+)?"
+_TEXT_NEEDLE = r"(?:\"([^\"]{1,60})\"|'([^']{1,60})'|“([^”]{1,60})”|‘([^’]{1,60})’|([A-Za-z0-9][\w\-/]*))"
+_TEXT_STOP = {"a", "an", "the", "any", "all", "more", "most", "fewer", "less", "only", "at", "no", "some", "each",
+              "every", "than", "their", "his", "her", "its"}  # fmt: skip
+
+
+def text_match_phrases(question: str) -> list[tuple[str, str]]:
+    """(operator, needle) for every text-match phrase in the question, in order."""
+    out: list[tuple[str, str]] = []
+    for op, cue in _TEXT_CUES.items():
+        for m in re.finditer(r"\b" + cue + _TEXT_LEAD + _TEXT_NEEDLE, question, re.IGNORECASE):
+            quoted = next((grp for grp in m.groups()[:4] if grp), None)
+            needle = quoted if quoted is not None else m.group(5)
+            if quoted is None and needle.lower() in _TEXT_STOP:
+                continue  # "contains the most", "start with a B": not a needle (the invented check still finds "B")
+            out.append((op, needle.strip()))
+    return out
+
+
+def _needle_after_cue(op: str, needle: str, question: str) -> bool:
+    """The plan's needle follows a cue of the same operator within a few words (quotes allowed)."""
+    pattern = r"\b" + _TEXT_CUES[op] + r"\W+(?:[\w'’-]+\W+){0,3}?[\"'“‘]?" + re.escape(needle) + r"(?![\w])"
+    return re.search(pattern, question, re.IGNORECASE) is not None
+
+
+def _check_text_matches(f, question: str, prev: dict, g: "Grounding") -> None:
+    used: list[tuple[str, str, str]] = []  # (field, op, needle)
+    for name in TEXT_MATCH_FIELDS:
+        sf = getattr(f, name)
+        for op in ("starts_with", "contains"):
+            for needle in (getattr(sf, op) or []) if sf is not None else []:
+                used.append((name, op, needle))
+    for name, op, needle in used:
+        kept = needle in ((prev.get(name) or {}).get(op) or [])  # carried over from the previous question
+        if not kept and not _needle_after_cue(op, needle, question):
+            g.invented.append(f'{name.replace("_", " ")} {op.replace("_", " ")} "{needle}"')
+    for op, needle in text_match_phrases(question):
+        if not any(o == op and n.casefold() == needle.casefold() for _, o, n in used):
+            g.missing.append(f'the text match {op.replace("_", " ")} "{needle}"')
+
+
+def _text_covers(sf, view_field: str, values: list[str]) -> bool:
+    """A facility/caregiver the question mentions is covered by a text match on that field (same semantics as execution)."""
+    return sf is not None and sf.has_text_match and any(
+        text_match.value_matches(v, view_field, sf.starts_with, sf.contains) for v in values
+    )
 
 
 def check_plan(
@@ -428,13 +494,18 @@ def check_plan(
     if "primary_caregiver" not in groups and "primary_caregiver" not in attrs:
         used = set((f.primary_caregiver.include or []) + (f.primary_caregiver.exclude or [])) if f.primary_caregiver else set()
         for text, values in index.mentioned_caregivers(question).items():
-            if not used & set(values) and not in_resident_name(text):
+            covered = _text_covers(f.primary_caregiver, FIELD_MAP["primary_caregiver"], list(values))
+            if not used & set(values) and not covered and not in_resident_name(text):
                 g.missing.append(f'caregiver "{text}"')
     if "facility" not in groups and not attrs & {"facility", "room_number"}:
         used = set((f.facility.include or []) + (f.facility.exclude or [])) if f.facility else set()
         for text, values in index.mentioned_wings(question).items():
-            if not used & set(values) and not in_resident_name(text):
+            covered = _text_covers(f.facility, FIELD_MAP["facility"], list(values))
+            if not used & set(values) and not covered and not in_resident_name(text):
                 g.missing.append(f'facility "{text}"')
+
+    # ---------------------------------------------------------------- text matches ("starts with A")
+    _check_text_matches(f, question, prev, g)
 
     # ---------------------------------------------------------------- age
     # an age range needs an age expression the grammar parsed ("over 80", "between 70 and 80"); any other number in
@@ -503,7 +574,27 @@ def check_plan(
     # ---------------------------------------------------------------- projection (what to show), independently
     _check_projection(plan, question, low, mask, index, scan, missing_detector, projection_detector, g)
 
-    _check_structure(plan, low, scan, g)
+    repeated_groups = _repeated_count_groups(question, mask, index, scan, date_anchors)
+    _check_structure(plan, low, scan, g, set(repeated_groups))
+    if repeated_groups:
+        requested_fields = set(repeated_groups)
+        if len(requested_fields) > 2:
+            g.blocking.append("separate counts across more than two fields are not supported")
+        else:
+            if plan.action != "breakdown":
+                g.missing.append("a breakdown with a separate count for each requested value")
+            actual_fields = set(plan.group_by or [])
+            for name in sorted(requested_fields - actual_fields):
+                g.missing.append(f"grouping by {name.replace('_', ' ')}")
+            for name in sorted(actual_fields - requested_fields):
+                g.invented.append(f"grouping by {name.replace('_', ' ')}")
+            for name, requested_values in repeated_groups.items():
+                condition = getattr(f, name)
+                included = set(condition.include or []) if condition else set()
+                for value in sorted(set(requested_values) - included):
+                    g.missing.append(f"including {name.replace('_', ' ')} {value} in the breakdown")
+                for value in sorted(included - set(requested_values)):
+                    g.invented.append(f"{name.replace('_', ' ')} {value} outside the requested groups")
     g.plan = plan
     return g
 
@@ -600,17 +691,17 @@ def _check_projection(plan, question, low, mask, index, scan, missing_detector, 
     """Output fields are validated on their own, separately from the conditions:
       • every field must be one the schema can return (blocking: no model output can change the schema);
       • fields that are single-record-only (emergency contacts) are never listed for several residents (blocking);
-      • for a list: every field the question asks to see is present (omitted → correctable) and no field is shown that
-        the question did not ask for (invented → correctable)."""
+      • for resident rows: every field the question asks to see is present (omitted → correctable) and no field is
+        shown that the question did not ask for (invented → correctable)."""
     supported = output_fields()
     for attr in plan.output_fields:
         if attr not in supported:
             g.blocking.append(f"'{attr.replace('_', ' ')}' is not a field the resident records can show")
-    if plan.action == "list":
+    if plan.action in ("list", "breakdown"):
         for attr in plan.output_fields:
             if supported.get(attr) in single_record_only():
                 g.blocking.append(f"{attr.replace('_', ' ')} is only shown for one resident at a time")
-    if detector is None or plan.action != "list":
+    if detector is None or plan.action not in ("list", "breakdown", "lookup"):
         return
     not_attribute = [False] * len(low)
     for original in mask.originals.values():
@@ -623,8 +714,62 @@ def _check_projection(plan, question, low, mask, index, scan, missing_detector, 
                 not_attribute[i] = True
     starts = value_starts(question, index, dates=scan.dates, numbers=scan.numbers)
     requested = {p.attribute for p in detector.scan(low, not_attribute, starts) if p.attribute is not None}
+    if plan.action == "lookup":
+        masked_low = mask.text.lower()
+        requested |= {
+            attribute
+            for attribute, pattern in detector.phrases
+            if attribute is not None and pattern.search(masked_low)
+        }
     shown = set(plan.output_fields)
-    for attr in sorted(requested - shown):
+    conditions = {
+        field_name
+        for field_name in type(plan.filters).model_fields
+        if getattr(plan.filters, field_name) is not None
+    } if plan.action == "lookup" else set()
+    for attr in sorted(requested - (shown | conditions)):
         g.missing.append(f"show {attr.replace('_', ' ')}")
-    for attr in sorted(set(plan.fields or []) - requested):
+    for attr in sorted(shown - requested - conditions):
         g.invented.append(f"show {attr.replace('_', ' ')}")
+
+
+def _repeated_count_groups(
+    question: str, mask: MaskResult, index: EntityIndex, scan: DateScan, date_anchors: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Recognize separate count clauses over multiple named values of the same groupable field."""
+    low = mask.text.lower()
+    count_mentions = sum(
+        len(list(re.finditer(r"(?<![a-z])" + re.escape(cue) + r"(?![a-z])", low)))
+        for cue in COUNT_CUES
+    )
+    if count_mentions < 2:
+        return {}
+
+    values: dict[str, set[str]] = {}
+    status_text = low
+    if scan.dates and "admission_date" in date_fields_mentioned(question, date_anchors):
+        status_text = re.sub(r"\badmitted\b", " ", status_text)
+    for field_name in ("status", "care_type", "gender"):
+        available = {
+            "status": set(index.statuses),
+            "care_type": set(index.care_types),
+            "gender": {"Female", "Male", "Other"},
+        }[field_name]
+        for value, forms in NAMED[field_name].items():
+            text = status_text if field_name == "status" else low
+            if value in available and any(_has(form, text) for form in forms):
+                values.setdefault(field_name, set()).add(value)
+
+    def is_resident_name(text: str) -> bool:
+        normal = text.lower().strip()
+        return any(normal in original.lower() for original in mask.originals.values())
+
+    for field_name, mentions in (
+        ("facility", index.mentioned_wings(question)),
+        ("primary_caregiver", index.mentioned_caregivers(question)),
+    ):
+        for text, found in mentions.items():
+            if not is_resident_name(text):
+                values.setdefault(field_name, set()).update(found)
+
+    return {field_name: sorted(found) for field_name, found in values.items() if len(found) > 1}

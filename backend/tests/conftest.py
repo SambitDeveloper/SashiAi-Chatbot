@@ -5,6 +5,8 @@ import pytest
 from app.config import Settings
 from app.data.memory_repository import MemoryResidentRepository
 from app.engine.service import QueryService
+from app.nlu.prompt import conditions_to_filters
+from app.nlu.request_ir import request_ir_from_plan
 from app.nlu.translator import ModelUsage, Translation, TranslationRequest, TranslatorUnavailable
 
 TODAY = "2026-11-09"
@@ -31,9 +33,10 @@ class FakeTranslator:
                 "question": masked_question,
                 "today": request.today,
                 "wings": request.context.wings,
-                "previous": request.previous_plan_json,
+                "previous": request.previous_ir_json,
                 "hint": request.hint,
                 "dates": request.date_hints,
+                "retry_ir_json": request.retry_ir_json,
             }
         )
         if self.fail:
@@ -43,8 +46,15 @@ class FakeTranslator:
             plan = plan.pop(0) if len(plan) > 1 else plan[0]
         if plan is None:
             raise AssertionError(f"no fake plan for masked question: {masked_question!r}")
+        model_plan = copy.deepcopy(plan)
+        if set(model_plan) == {"request_ir"}:
+            request_ir = model_plan["request_ir"]
+        else:
+            if isinstance(model_plan.get("conditions"), list):
+                model_plan["filters"] = conditions_to_filters(model_plan.pop("conditions"))
+            request_ir = request_ir_from_plan(model_plan, masked_question)
         return Translation(
-            plan=copy.deepcopy(plan),
+            request_ir=request_ir,
             usage=ModelUsage(calls=1, prompt_tokens=700, completion_tokens=40, inference_ms=5),
             model="fake",
         )

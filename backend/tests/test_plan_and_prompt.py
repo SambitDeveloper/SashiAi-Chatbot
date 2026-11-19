@@ -3,8 +3,9 @@ import re
 import pytest
 from pydantic import ValidationError
 
-from app.models.plan import Filters, QueryPlan
+from app.models.plan import QueryPlan
 from app.nlu.prompt import build_output_schema, build_system_prompt, conditions_to_filters, filters_to_conditions
+from app.nlu.request_ir import RequestIR
 from app.nlu.translator import SchemaContext
 
 # Schema/prompt are built from the live vocabulary; this context stands in for one database's values.
@@ -29,6 +30,20 @@ def test_valid_combined_plan():
         }
     )
     assert plan.filters.status.include == ["active"]
+
+
+def test_breakdown_can_project_resident_fields():
+    plan = QueryPlan.model_validate(
+        {
+            "action": "breakdown",
+            "filters": {"status": {"include": ["active", "discharged"]}},
+            "group_by": ["status"],
+            "fields": ["room_number"],
+        }
+    )
+    assert plan.output_fields == ["room_number"]
+    with pytest.raises(ValidationError):
+        QueryPlan.model_validate({"action": "count", "group_by": ["status"]})
 
 
 @pytest.mark.parametrize(
@@ -71,26 +86,27 @@ def test_output_schema_objects_forbid_extra_properties():
 
 
 def test_output_schema_mirrors_pydantic_model():
-    # options are server-generated; uses_previous is a cache hint; the model writes filters as a list of conditions
-    model_side = set(OUTPUT_SCHEMA["properties"]) - {"uses_previous", "conditions"} | {"filters"}
-    assert model_side == set(QueryPlan.model_fields) - {"options"}
-    condition_fields = set()
-    for option in OUTPUT_SCHEMA["properties"]["conditions"]["items"]["anyOf"]:
-        f = option["properties"]["field"]
-        condition_fields |= {f["const"]} if "const" in f else set(f["enum"])
-    assert condition_fields == set(Filters.model_fields)
+    assert set(OUTPUT_SCHEMA["properties"]) == set(RequestIR.model_fields)
+    assert OUTPUT_SCHEMA["properties"]["where"]["anyOf"]
+    assert OUTPUT_SCHEMA["$defs"]["IRNode"]["properties"]["kind"]["enum"] == [
+        "predicate",
+        "and",
+        "or",
+        "not",
+        "relationship",
+    ]
 
 
-def test_output_schema_values_come_from_the_database_vocabulary():
-    options = {
-        o["properties"]["field"].get("const"): o for o in OUTPUT_SCHEMA["properties"]["conditions"]["items"]["anyOf"]
-    }
-    assert options["status"]["properties"]["include"]["items"]["enum"] == CTX.statuses
-    assert options["care_type"]["properties"]["include"]["items"]["enum"] == CTX.care_types
-    assert options["facility"]["properties"]["include"]["items"]["enum"] == CTX.wings
-    # values the database does not contain are not even expressible by the model
-    assert "away" not in str(options["status"]) and "respite_care" not in str(options["care_type"])
-    assert "active | discharged | pending" in SYSTEM_PROMPT and "away" not in SYSTEM_PROMPT
+def test_request_ir_compiler_enforces_live_values_beyond_schema_shape():
+    from app.nlu.request_ir import IRCompilationError, compile_request_ir, request_ir_from_plan
+
+    raw = request_ir_from_plan(
+        {"action": "count", "filters": {"status": {"include": ["away"]}}},
+        "How many residents are away?",
+    )
+    with pytest.raises(IRCompilationError, match="live vocabulary"):
+        compile_request_ir(raw, "How many residents are away?", CTX.statuses, CTX.care_types)
+    assert "active | discharged | pending" in SYSTEM_PROMPT and "memory_care | assisted_living" in SYSTEM_PROMPT
 
 
 def test_conditions_convert_to_filters_in_any_order():
@@ -125,3 +141,33 @@ def test_system_prompt_is_static_for_prompt_caching():
     assert not re.search(r"\d{4}-\d{2}-\d{2}", SYSTEM_PROMPT), (
         "dates must go in the user message, not the cached prefix"
     )
+    assert "resident in a breakdown" in SYSTEM_PROMPT
+    assert "never invent resident placeholders" in SYSTEM_PROMPT
+
+
+def test_retry_candidate_is_distinct_from_conversation_memory():
+    from app.nlu.prompt import build_user_message
+
+    message = build_user_message(
+        "Question text",
+        "2026-11-09",
+        [],
+        previous_ir_json='{"action":"count"}',
+        retry_ir_json='{"action":"list"}',
+        hint="Use a breakdown.",
+    )
+    assert 'Previous RequestIR (use only if the question refers back to it): {"action":"count"}' in message
+    assert 'Retry candidate RequestIR (same question): {"action":"list"}' in message
+
+
+def test_prompt_uses_one_compositional_interpretation_not_a_requirements_ledger():
+    from app.nlu.prompt import build_messages, build_user_message
+
+    user = build_user_message("Question text", "2026-11-09", [], None)
+    assert "RequestRequirements" not in user
+    examples = build_messages(CTX, "Question text")
+    dialogue = "\n".join(message["content"] for message in examples)
+    assert "Count September 2026 admissions per care type" in dialogue
+    assert '"kind":"and"' in dialogue
+    assert "resident_1" not in dialogue
+    assert "Sarah Jenkins" not in dialogue

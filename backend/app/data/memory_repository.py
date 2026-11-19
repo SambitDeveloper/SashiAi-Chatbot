@@ -2,7 +2,6 @@
 
 import json
 from collections import Counter
-from itertools import product
 from pathlib import Path
 
 from app.data.repository import (
@@ -11,13 +10,12 @@ from app.data.repository import (
     GroupRow,
     Resident,
     Vocabulary,
-    group_key,
+    group_keys,
     matches,
     numeric,
     project,
     typed_order,
 )
-from app.data.schema_config import list_fields
 from app.models.plan import Filters, GroupField, Sort
 
 # test data only: production always reads the Care App MongoDB (see app/main.py build_repository)
@@ -68,15 +66,7 @@ class MemoryResidentRepository:
     def _group_keys(record: Resident, fields: list[GroupField]) -> list[tuple[str, ...]]:
         """The group key(s) of one record — several for a list field (one per value), like MongoDB's $unwind with
         preserveNullAndEmptyArrays; a missing or empty value is the single "not recorded" group (repository.MISSING_GROUP)."""
-        per_field = []
-        for f in fields:
-            vf = FIELD_MAP[f]
-            value = record.get(vf)
-            if vf in list_fields() and isinstance(value, list) and value:
-                per_field.append([group_key(v, vf) for v in value])
-            else:
-                per_field.append([group_key(value, vf)])
-        return list(product(*per_field))
+        return group_keys(record, fields)
 
     async def group_count(self, filters: Filters, fields: list[GroupField]) -> list[GroupRow]:
         counter = Counter(k for r in self._filtered(filters) for k in self._group_keys(r, fields))

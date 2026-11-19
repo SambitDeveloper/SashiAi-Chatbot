@@ -64,6 +64,20 @@ async def test_lookup_of_a_subject_is_still_accepted(index):
     assert g.ok
 
 
+async def test_lookup_reference_not_present_in_question_is_rejected_before_resolution(index):
+    question = "How many residents are active?"
+    mask = index.mask(question)
+    outcome = resolve_plan(
+        {"action": "lookup", "lookup": {"residents": ["resident_1"]}},
+        index,
+        mask,
+        question,
+    )
+    assert outcome.problem == "invented:resident_reference"
+    assert "safely identify" in outcome.plan.message
+    assert "Do not invent resident references" in outcome.hint
+
+
 # ---------------------------------------------------------------- the operation must be the one asked for
 @pytest.mark.parametrize(
     ("question", "action", "ok"),

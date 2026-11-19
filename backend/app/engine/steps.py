@@ -1,12 +1,12 @@
 """Numbered step logging: one log line per pipeline step, for every question, in a fixed order.
 
-    step-01 receive_question     step-08 comparison_check     step-15 model_retry
-    step-02 mask_names           step-09 intent_classifier    step-16 execute_query
-    step-03 question_structure   step-10 fast_path            step-17 build_answer
+    step-01 receive_question     step-08 intent_classifier    step-15 model_retry
+    step-02 mask_names           step-09 fast_path            step-16 execute_query
+    step-03 question_structure   step-10 semantic_cache       step-17 build_answer
     step-04 conversation_memory  step-11 failure_cache        step-18 remember
-    step-05 plan_cache           step-12 local_model          step-19 finished
-    step-06 topic_check          step-13 resolve_values
-    step-07 policy_check         step-14 validate_plan
+    step-05 topic_check          step-12 local_model          step-19 finished
+    step-06 policy_check         step-13 resolve_values
+    step-07 comparison_check     step-14 validate_plan
 
 Each step is logged exactly once per question: with its outcome (and how long it took when it did work), or as
 `skipped` with the reason. A question that stops early (off-topic, refused, model unavailable, an error) still gets
@@ -25,12 +25,12 @@ STEPS: tuple[str, ...] = (
     "mask_names",  # 02 resident names → resident_N placeholders (live vocabulary)
     "question_structure",  # 03 operation, subjects, references, comparisons (grammar only)
     "conversation_memory",  # 04 the previous plan of this chat, for follow-ups
-    "plan_cache",  # 05 exact fingerprint lookup of an earlier checked plan (no embedding)
-    "topic_check",  # 06 embedding model (bge-small): is this about residents at all?
-    "policy_check",  # 07 topics the records do not hold (medications, billing …)
-    "comparison_check",  # 08 comparisons with another resident: not supported yet
-    "intent_classifier",  # 09 embedding model (bge-small): count / list / breakdown … route scores
-    "fast_path",  # 10 deterministic planner, no model
+    "topic_check",  # 05 embedding model (bge-small): is this about residents at all?
+    "policy_check",  # 06 topics the records do not hold (medications, billing …)
+    "comparison_check",  # 07 comparisons with another resident: not supported yet
+    "intent_classifier",  # 08 embedding model (bge-small): count / list / breakdown … route scores
+    "fast_path",  # 09 deterministic planner, no model
+    "semantic_cache",  # 10 stored plan template found by meaning (bge-small + Atlas Vector Search), slots refilled
     "failure_cache",  # 11 the model already failed on this exact question in this context
     "local_model",  # 12 Qwen3-4B-Instruct via llama.cpp writes a plan
     "resolve_values",  # 13 names/rooms/facilities in the plan → real database values
@@ -38,7 +38,7 @@ STEPS: tuple[str, ...] = (
     "model_retry",  # 15 one retry with feedback when the model's mistake is fixable
     "execute_query",  # 16 read-only MongoDB query
     "build_answer",  # 17 template answer
-    "remember",  # 18 plan cache + conversation memory
+    "remember",  # 18 pending plan template + conversation memory
     "finished",  # 19 outcome and total time
 )
 NUMBER = {name: i + 1 for i, name in enumerate(STEPS)}
@@ -51,9 +51,11 @@ class StepTrace:
         self.started = time.perf_counter()
         self.logged: set[str] = set()
         self._timers: dict[str, float] = {}
+        self.current_step: str | None = None
 
     def start(self, name: str) -> None:
         self._timers[name] = time.perf_counter()
+        self.current_step = name
 
     def record(self, name: str, status: str, duration_ms: int | None = None, **details: Any) -> None:
         """Log one step (once). The duration comes from start(name) unless given explicitly."""
@@ -67,6 +69,8 @@ class StepTrace:
             extra["duration_ms"] = duration_ms
         extra.update({k: v for k, v in details.items() if v is not None})
         self.logged.add(name)
+        if self.current_step == name:
+            self.current_step = None
         self.log.info(f"step-{n:02d} {name}: {status}", extra=extra)
 
     def skip(self, name: str, reason: str) -> None:

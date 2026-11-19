@@ -48,6 +48,17 @@ def _clarify(message: str, options: list[dict] | None = None) -> QueryPlan:
     return QueryPlan(action="clarify", message=message, options=options or None)
 
 
+def _reference_was_mentioned(ref: str, question: str, mask: MaskResult) -> bool:
+    value = ref.strip()
+    lowered = value.lower()
+    if re.fullmatch(r"resident_\d+", lowered):
+        return lowered in mask.placeholders
+    mentioned_ids = {rid.upper() for ids in mask.placeholders.values() for rid in ids}
+    if value.upper() in mentioned_ids:
+        return True
+    return bool(re.search(r"(?<![\w])" + re.escape(value) + r"(?![\w])", question, re.IGNORECASE))
+
+
 def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str) -> ResolveOutcome:
     plan = _clean(copy.deepcopy(raw)) if isinstance(raw, dict) else {}
     # The model returns an order-free list of conditions; convert it to filters (older cached plans use filters).
@@ -104,6 +115,18 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
             plan["filters"].pop(field_name)
 
     lookup = plan.get("lookup")
+    if isinstance(lookup, dict) and isinstance(lookup.get("residents"), list):
+        invented = [
+            str(ref)
+            for ref in lookup["residents"]
+            if not _reference_was_mentioned(str(ref), question, mask)
+        ]
+        if invented:
+            return ResolveOutcome(
+                _clarify("I couldn't safely identify the resident reference in that plan. Please rephrase the question."),
+                problem="invented:resident_reference",
+                hint="Only look up resident placeholders or identifiers explicitly present in the question. Do not invent resident references.",
+            )
     if isinstance(lookup, dict):
         ids: list[str] = []
         for ref in lookup.get("residents", []) or []:

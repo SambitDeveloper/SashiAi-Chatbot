@@ -1,55 +1,75 @@
-"""Prompt, few-shot examples and constrained-output schema for question → query-plan translation.
+"""Prompt, few-shot examples and constrained-output schema for question → RequestIR interpretation.
 
 Application-level definitions (actions, which fields exist, their operators, security limits) are code.
-Database-specific knowledge (which statuses and care types exist, wing/facility names, caregiver names) is NOT:
-it comes from the live vocabulary as a SchemaContext, so the prompt and the JSON grammar always match the data and
-the model cannot emit a status, care type or wing that the database does not contain.
+Database-specific values (statuses, care types, facilities and caregivers) come from the live vocabulary as a
+SchemaContext. The IR schema constrains structure; backend compilation and entity resolution enforce actual values.
 
-The prompt is short and example-led because the model is small (0.5B). It is rebuilt only when the vocabulary
+The prompt is short and example-led because the model is small. It is rebuilt only when the vocabulary
 changes, so llama.cpp can keep the system prompt + examples in its prompt (KV) cache between requests.
 """
 
 import json
 
 from app.models.plan import canonical_field
+from app.nlu.request_ir import ATTRIBUTES as ATTRIBUTES_IR
+from app.nlu.request_ir import CONDITION_FIELDS as CONDITION_FIELDS_IR
+from app.nlu.request_ir import GROUP_FIELDS as GROUP_FIELDS_IR
+from app.nlu.request_ir import RANGE_FIELDS as RANGE_FIELDS_IR
+from app.nlu.request_ir import SET_FIELDS as SET_FIELDS_IR
+from app.nlu.request_ir import SORT_FIELDS as SORT_FIELDS_IR
+from app.nlu.request_ir import TEXT_OPERATORS, RequestIR, operators_for, request_ir_from_plan
 from app.nlu.translator import SchemaContext
 
-SET_FIELDS = ["status", "care_type", "facility", "gender", "primary_caregiver", "room_number"]
-RANGE_FIELDS = {
-    "age": ("min", "max"),
-    "admission_date": ("start", "end"),
-    "created_date": ("start", "end"),
-    "discharge_date": ("start", "end"),
-}
-CONDITION_FIELDS = SET_FIELDS + list(RANGE_FIELDS)
-GROUP_FIELDS = ["status", "care_type", "facility", "gender", "primary_caregiver"]
-SORT_FIELDS = ["admission_date", "created_date", "discharge_date", "age", "last_name"]
-ATTRIBUTES = [
-    "primary_caregiver",
-    "room_number",
-    "facility",
-    "admission_date",
-    "created_date",
-    "discharge_date",
-    "emergency_contact",
-    "resident_id",
-    "status",
-    "care_type",
-    "age",
-    "gender",
-]
-ACTIONS = ["count", "list", "breakdown", "aggregate", "lookup", "clarify", "unsupported", "help"]
-GENDERS = ["Female", "Male", "Other"]
+# Field lists come from the compiler (app/nlu/request_ir.py), so the prompt and schema never drift from what it accepts.
+SET_FIELDS = list(SET_FIELDS_IR)
+RANGE_FIELDS = list(RANGE_FIELDS_IR)
+CONDITION_FIELDS = list(CONDITION_FIELDS_IR)
+GROUP_FIELDS = list(GROUP_FIELDS_IR)
+SORT_FIELDS = list(SORT_FIELDS_IR)
+# Longest evidence quote in a few-shot EXAMPLE. Short example quotes teach short evidence (copying the whole question
+# into every node made a 4-condition plan exceed 256 tokens, 2026-11-17). This is deliberately NOT enforced in the
+# output grammar: a grammar cap forced the quote closed mid-phrase and both Qwen3-4B and Phi-4-mini then closed the
+# AND node with no conditions (Q31/Q32/Q36 benchmark, 2026-11-17). The RequestIR model's own max_length still applies.
+EVIDENCE_MAX_CHARS = 60
 
-# Grammar-size guard: beyond this many wings the wing value is a free string resolved server-side.
-MAX_ENUM_WINGS = 150
+# llama.cpp (b12017 common/json-schema-to-grammar.cpp, _build_object_rule) emits an object's REQUIRED properties
+# first, then the optional ones, whatever order the schema lists them in. Examples must use that same order: an
+# example with "group_by" before "unsupported" teaches a key the grammar forbids at that point, and once the model has
+# written the last required key ("ambiguous") every example it has seen ends there — so group_by, projection,
+# aggregate, sort and limit became unreachable (benchmark 2026-11-17: 0 of 20 first attempts wrote either).
+_IR_SCHEMA = RequestIR.model_json_schema()
+_IR_REQUIRED = [k for k in _IR_SCHEMA["properties"] if k in _IR_SCHEMA.get("required", [])]
+GRAMMAR_KEY_ORDER = _IR_REQUIRED + [k for k in _IR_SCHEMA["properties"] if k not in _IR_REQUIRED]
+ATTRIBUTES = list(ATTRIBUTES_IR)
 
 
-def build_system_prompt(ctx: SchemaContext) -> str:
+def _operator_rules(full: bool) -> str:
+    """Predicate operators, generated from the compiler's definitions (request_ir.operators_for).
+
+    full=False (grammar-constrained models, e.g. Qwen on llama.cpp): the output grammar already allows only the
+    operators in PredicateOperator, so one compact line says which fields take text matching (keeps the prompt within
+    its CPU size budget). full=True (no output grammar, e.g. Bedrock): the whole per-field table."""
+    text_fields = [n for n in CONDITION_FIELDS if set(TEXT_OPERATORS) <= set(operators_for(n))]
+    if not full:
+        return f"- {'/'.join(TEXT_OPERATORS)}: only {', '.join(text_fields)}"
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for name in CONDITION_FIELDS:
+        groups.setdefault(operators_for(name), []).append(name)
+    lines = ["- Predicate operators — use ONLY these, per field:"]
+    lines += [f"  {', '.join(names)}: {' | '.join(ops)}" for ops, names in groups.items()]
+    lines.append(
+        f"  {' / '.join(TEXT_OPERATORS)}: case-insensitive match on literal text; value is the text only (no %, * or "
+        'regex), e.g. "room starts with B" is room_number starts_with "B". Anything needing another operator goes '
+        "in unsupported."
+    )
+    return "\n".join(lines)
+
+
+def build_system_prompt(ctx: SchemaContext, operator_table: bool = False) -> str:
     statuses = " | ".join(ctx.statuses)
     care = " | ".join(ctx.care_types)
-    return f"""You convert a care-home staff question into ONE JSON query plan. Never answer the question. \
-Never invent values. The database computes every number.
+    return f"""Interpret care-home questions as one compositional RequestIR JSON object. Never answer or invent values;
+data determines counts.
 
 Fields:
 - status: {statuses}
@@ -63,175 +83,194 @@ Fields:
 Actions:
 - count: how many residents match.
 - list: which residents; with sort + limit for oldest, youngest, latest, top N.
-- breakdown: counts per field (group_by), e.g. "by status", "per facility", "each care type".
+- breakdown: counts per field (group_by), e.g. "by status", "per facility", "each care type". If the question also
+  asks to show residents in each group, set "projection" for those rows just as for a list; resident identity is included.
 - aggregate: average/min/max age.
-- lookup: facts about a named resident (resident_1, resident_2 ...).
+- lookup: facts about a resident named in the current question. Use only a resident_N placeholder present in Question;
+  never invent resident placeholders or look up a resident when none is named.
 - clarify: the question is missing something essential; ask one short question in message.
 - unsupported: needs data not listed above (diagnosis, medication, diet, billing, visitors ...) or is not about \
 residents; give a short reason in message.
 - help: greetings, thanks, what can you do.
 
+RequestIR fields:
+- Evidence is the shortest exact phrase from Question that supports that part (a few words, e.g. "over 85"), never
+  the whole question.
+- action/action_status/action_evidence: operation, its status, and exact supporting quote.
+- where: predicate/and/or/not/relationship AST. Every node has status (supported, ambiguous, unsupported, unresolved)
+  and exact evidence. Predicates use field/operator/value. Relationship nodes use relation/target and are rejected.
+{_operator_rules(operator_table)}
+- group_by and projection: arrays of {{field, status, evidence}}; grouping is not filtering. Projection is what to SHOW,
+  separate from where (for example "show room numbers" is projection, not a room filter).
+- aggregate, sort, limit, lookup: each has status and exact evidence.
+- A lookup MUST include "lookup": {{"residents": ["resident_N"], "attributes": [...], "status": ..., "evidence": ...}}
+  after "ambiguous". attributes = exactly what is asked: "which room is resident_N in" → ["room_number"],
+  "who looks after resident_N" → ["primary_caregiver"]; an empty list means the whole profile.
+- ambiguous/unsupported/unresolved: list uncertain or unrepresentable material with evidence; any non-empty list
+  blocks execution. Status/completeness claims are diagnostic; backend allowlists authorize compilation.
+
 Rules:
-- One condition per field mentioned in the question. Add nothing the question does not say.
-- "not", "except", "excluding" go in exclude. Several values of one field go together in include.
-- What to SHOW goes in "fields" (list/lookup), separate from what to filter by: "show their room numbers" → \
-"fields": ["room_number"]. One attribute can be both ("in room 101 … show their rooms").
-- No value recorded ("no caregiver", "without a room", "admission date missing", "not assigned") → \
-{{"field": F, "missing": true}}. "has a caregiver assigned" → "missing": false.
-- Copy dates exactly from the "Dates" line of the request. Admitted/joined → admission_date. \
-Discharged/left → discharge_date plus status discharged. Registered/added → created_date.
-- age uses min/max: "over 80" → min 81, "80 or older" → min 80, "under 70" → max 69.
-- Copy resident_N placeholders unchanged into lookup.residents.
-- If the question refers to the previous plan ("them", "those", "of these", "what about"), start from its \
-conditions, apply the change and set uses_previous true.
-- Output only the JSON plan."""
+- Preserve all conditions and their exact boolean scope. "Active or Discharged" is OR; "Active and Discharged" is AND.
+  Do not convert one into the other. Same-field OR values may use an OR node or one in predicate.
+- Strict and inclusive comparisons differ: "after X" is gt; "on or after X" is gte; "before X" is lt;
+  "on or before X" is lte. Copy normalized dates exactly from the Dates line. Admitted/joined → admission_date;
+  discharged/left → discharge_date plus status discharged; registered/added → created_date.
+- Negation is explicit: "not Active" is not(eq(status, active)); never silently turn it into inclusion.
+- The result's name/identity is implicit. "show their room numbers" adds room_number to projection, including for
+  each resident in a breakdown.
+- If the question asks separate counts for multiple values of one groupable field, use breakdown and group_by.
+- Age is an integer in years: "over 80" is gt 80; "80 or older" is gte 80.
+- If Question contains a resident_N placeholder, copy it unchanged into lookup.residents; never create one.
+- An "Analysis" block is only a hint; the original Question is authoritative.
+- For a follow-up, use the previous RequestIR only as context and set uses_previous true; preserve earlier semantics
+  unless the question changes them. On retry, repair only issues in Check, preserve valid components, and honor the
+  original Question.
+- Source evidence proves only that a quote occurs in Question, not that its meaning was interpreted correctly.
+- Output only the RequestIR JSON object."""
 
 
-def _examples(ctx: SchemaContext, today: str) -> list[tuple[str, dict]]:
-    """Few-shot pairs built from real vocabulary values, so no example names a value the database lacks."""
-    has = lambda xs, v: v in xs  # noqa: E731
+def _examples(ctx: SchemaContext, today: str) -> list[tuple[str, dict, dict[str, str]]]:
+    """Few-shot pairs built from real vocabulary values, so no example names a value the database lacks.
+
+    Each example carries short evidence quotes (see _short_evidence): "action", "where" (a node combining different
+    fields), "aggregate", and one per field; the examples teach the model what evidence should look like.
+    """
     st = ctx.statuses
     ct = ctx.care_types
-    # Fixed example values (not this question's wings), so the examples are identical on every request and stay in
-    # llama.cpp's prompt cache.
-    wing = ctx.example_wing or (ctx.wings[0] if ctx.wings else None)
-    cg = _short_caregiver(ctx.caregivers[0]) if ctx.caregivers else None
-    ex: list[tuple[str, dict]] = []
+    ex: list[tuple[str, dict, dict[str, str]]] = []
 
     def req(q: str, dates: list[str] | None = None, wings: bool = False) -> str:
-        return build_user_message(q, today, [wing] if wings and wing else [], None, dates or [])
+        return build_user_message(q, today, [], None, dates or [])
 
-    if has(st, "active") and has(ct, "memory_care"):
-        ex.append(
-            (
-                req("How many active female residents are in memory care?"),
-                {
-                    "action": "count",
-                    "conditions": [
-                        {"field": "status", "include": ["active"]},
-                        {"field": "gender", "include": ["Female"]},
-                        {"field": "care_type", "include": ["memory_care"]},
-                    ],
-                },
-            )
-        )
-    if has(st, "active"):
-        ex.append(
-            (
-                req("which residents are not active and over 85"),
-                {
-                    "action": "list",
-                    "conditions": [{"field": "status", "exclude": ["active"]}, {"field": "age", "min": 86}],
-                },
-            )
-        )
-    if wing and cg:
+    if "active" in st and "away" in st:
         ex.append(
             (
                 req(
-                    f"residents of {cg} in {wing} admitted last month",
-                    ["'last month' = 2026-10-01 to 2026-10-31"],
-                    True,
+                    "List residents who are either Active or Away and were admitted after January 1, 2025.",
+                    ["'January 1, 2025' = 2025-01-01"],
                 ),
                 {
                     "action": "list",
-                    "conditions": [
-                        {"field": "primary_caregiver", "include": [cg]},
-                        {"field": "facility", "include": [wing]},
-                        {"field": "admission_date", "start": "2026-10-01", "end": "2026-10-31"},
-                    ],
+                    "filters": {
+                        "status": {"include": ["active", "away"]},
+                        "admission_date": {"start": "2025-01-02"},
+                    },
+                },
+                {
+                    "action": "List residents",
+                    "where": "Active or Away and were admitted",
+                    "status": "Active or Away",
+                    "admission_date": "admitted after January 1, 2025",
                 },
             )
         )
-    if has(ct, "skilled_nursing") and has(ct, "assisted_living"):
+    if "active" in st and "memory_care" in ct:
         ex.append(
             (
-                req("breakdown by gender for skilled nursing or assisted living"),
+                req("Which residents are not Active and over 85?"),
+                {
+                    "action": "list",
+                    "filters": {"status": {"exclude": ["active"]}, "age": {"min": 86}},
+                },
+                {"action": "Which residents", "where": "not Active and over 85", "status": "not Active", "age": "over 85"},
+            )
+        )
+    if "memory_care" in ct:
+        ex.append(
+            (
+                req(
+                    "Count September 2026 admissions per care type; show names and rooms.",
+                    ["'September 2026' = 2026-09-01 to 2026-09-30"],
+                ),
                 {
                     "action": "breakdown",
-                    "group_by": ["gender"],
-                    "conditions": [{"field": "care_type", "include": ["skilled_nursing", "assisted_living"]}],
+                    "filters": {"admission_date": {"start": "2026-09-01", "end": "2026-09-30"}},
+                    "group_by": ["care_type"],
+                    "fields": ["room_number"],
                 },
-            )
-        )
-    if has(st, "discharged"):
-        ex.append(
-            (
-                req("who was discharged since March", ["'since March' = from 2026-03-01 (no end)"]),
                 {
-                    "action": "list",
-                    "conditions": [
-                        {"field": "status", "include": ["discharged"]},
-                        {"field": "discharge_date", "start": "2026-03-01"},
-                    ],
+                    "action": "Count",
+                    "admission_date": "September 2026 admissions",
+                    "care_type": "per care type",
+                    "room_number": "rooms",
                 },
             )
         )
-    ex.append(
-        (
-            req("the 3 youngest residents"),
-            {"action": "list", "sort": {"field": "age", "direction": "asc"}, "limit": 3},
-        )
-    )
-    ex.append(
-        (
-            req("average age per care type"),
-            {"action": "aggregate", "aggregate": {"op": "avg", "field": "age"}, "group_by": ["care_type"]},
-        )
-    )
-    ex.append(
-        (
-            req("what is resident_1's room and caregiver"),
-            {
-                "action": "lookup",
-                "lookup": {"residents": ["resident_1"], "attributes": ["room_number", "primary_caregiver"]},
-            },
-        )
-    )
-    if has(st, "active") and has(ct, "memory_care"):  # only values this database has
-        ex.append(
+    ex.extend(
+        [
             (
-                req("list active residents in memory care and show their rooms and caregivers"),
+                req("Average age per care type."),
                 {
-                    "action": "list",
-                    "conditions": [
-                        {"field": "status", "include": ["active"]},
-                        {"field": "care_type", "include": ["memory_care"]},
-                    ],
-                    "fields": ["room_number", "primary_caregiver"],
+                    "action": "aggregate",
+                    "aggregate": {"op": "avg", "field": "age"},
+                    "group_by": ["care_type"],
                 },
-            )
-        )
-    ex.append(
-        (
-            req("how many residents have no caregiver assigned"),
-            {"action": "count", "conditions": [{"field": "primary_caregiver", "missing": True}]},
-        )
-    )
-    ex.append(
-        (
-            req("which residents have diabetes"),
-            {"action": "unsupported", "message": "Diagnoses are not available in the resident records."},
-        )
+                {"action": "Average age", "aggregate": "Average age", "care_type": "per care type"},
+            ),
+            (
+                req("Diabetes?"),
+                {"action": "unsupported", "message": "Diagnosis data is not recorded."},
+                {"action": "Diabetes?"},
+            ),
+        ]
     )
     return ex
 
 
-def _short_caregiver(value: str) -> str:
-    """'Nurse Sarah Jenkins, RN' → 'Sarah Jenkins' (how staff are usually named in questions)."""
-    name = value.split(",")[0].split()
-    titles = {"nurse", "head", "care", "aide", "coordinator", "wellness", "senior", "charge", "dr", "dr."}
-    while len(name) > 2 and name[0].lower() in titles:
-        name = name[1:]
-    return " ".join(name)
+def _short_evidence(ir: dict, quotes: dict[str, str], question: str) -> dict:
+    """Replace the whole-question evidence request_ir_from_plan writes with each part's short quote (in place).
+
+    Predicates, projection and group_by items use the quote for their field; a boolean node whose predicates all share
+    one field uses that field's quote, otherwise quotes["where"]. A missing or non-verbatim quote raises at prompt build,
+    so a broken example can never reach the model.
+    """
+
+    def quote(key: str) -> str:
+        text = quotes[key]
+        if text.casefold() not in question.casefold() or len(text) > EVIDENCE_MAX_CHARS:
+            raise ValueError(f"example evidence {text!r} is not a short quote from {question!r}")
+        return text
+
+    def fields(node: dict) -> set[str]:
+        if node.get("kind") == "predicate":
+            return {node["field"]}
+        kids = [*(node.get("children") or []), *([node["child"]] if node.get("child") else [])]
+        return set().union(*(fields(k) for k in kids)) if kids else set()
+
+    def visit(node: dict | None) -> None:
+        if not node:
+            return
+        names = fields(node)
+        node["evidence"] = quote(next(iter(names)) if len(names) == 1 else "where")
+        for kid in [*(node.get("children") or []), *([node["child"]] if node.get("child") else [])]:
+            visit(kid)
+
+    ir["action_evidence"] = quote("action")
+    visit(ir.get("where"))
+    for item in [*(ir.get("group_by") or []), *(ir.get("projection") or [])]:
+        item["evidence"] = quote(item["field"])
+    for key in ("aggregate", "sort", "limit", "lookup"):
+        if ir.get(key):
+            ir[key]["evidence"] = quote(key)
+    return ir
 
 
-def build_messages(ctx: SchemaContext, user_message: str, today_for_examples: str = "2026-11-09") -> list[dict]:
-    """Chat messages: static system prompt + few-shot turns (cacheable prefix), then the real request."""
-    messages: list[dict] = [{"role": "system", "content": build_system_prompt(ctx)}]
-    for q, plan in _examples(ctx, today_for_examples):
+def build_messages(
+    ctx: SchemaContext, user_message: str, today_for_examples: str = "2026-11-09", operator_table: bool = False
+) -> list[dict]:
+    """Chat messages: static system prompt + few-shot turns (cacheable prefix), then the real request.
+    operator_table: spell out every allowed operator per field (for models without a constrained output grammar)."""
+    messages: list[dict] = [{"role": "system", "content": build_system_prompt(ctx, operator_table)}]
+    for q, plan, quotes in _examples(ctx, today_for_examples):
         messages.append({"role": "user", "content": q})
-        messages.append({"role": "assistant", "content": json.dumps(plan, separators=(",", ":"))})
+        example = dict(plan)
+        if isinstance(example.get("conditions"), list):
+            example["filters"] = conditions_to_filters(example.pop("conditions"))
+        question = q.split("Question: ", 1)[-1]
+        raw = _short_evidence(request_ir_from_plan(example, question), quotes, question)
+        ir = RequestIR.model_validate(raw).model_dump(mode="json", exclude_defaults=True)
+        ir = {key: ir[key] for key in GRAMMAR_KEY_ORDER if key in ir}  # the order the output grammar allows
+        messages.append({"role": "assistant", "content": json.dumps(ir, separators=(",", ":"))})
     messages.append({"role": "user", "content": user_message})
     return messages
 
@@ -240,119 +279,50 @@ def build_user_message(
     masked_question: str,
     today: str,
     wings: list[str],
-    previous_plan_json: str | None,
+    previous_ir_json: str | None,
     date_hints: list[str] | None = None,
     hint: str | None = None,
+    brief: str | None = None,
+    retry_ir_json: str | None = None,
 ) -> str:
     parts = [f"Today: {today}"]
     if wings:
         parts.append(f"Wings: {', '.join(wings)}")
     if date_hints:
         parts.append(f"Dates: {'; '.join(date_hints)}")
-    if previous_plan_json:
-        parts.append(f"Previous plan (use only if the question refers back to it): {previous_plan_json}")
+    if previous_ir_json:
+        parts.append(f"Previous RequestIR (use only if the question refers back to it): {previous_ir_json}")
+    if retry_ir_json:
+        parts.append(f"Retry candidate RequestIR (same question): {retry_ir_json}")
     parts.append(f"Question: {masked_question}")
+    if brief:
+        parts.append(brief)
     if hint:
         parts.append(f"Check: {hint}")
     return "\n".join(parts)
 
 
-def _set_condition(field: str, values: dict | None) -> dict:
-    item = {"type": "array", "items": values or {"type": "string", "maxLength": 80}, "minItems": 1, "maxItems": 6}
-    return {
-        "type": "object",
-        "properties": {"field": {"const": field}, "include": item, "exclude": item, "missing": {"type": "boolean"}},
-        "required": ["field"],
-        "additionalProperties": False,
-    }
-
-
 def build_output_schema(ctx: SchemaContext) -> dict:
-    """JSON Schema for grammar-constrained generation (llama.cpp converts it to a GBNF grammar).
+    """Schema-constrained RequestIR; backend compilation remains the execution boundary."""
+    schema = RequestIR.model_json_schema()
+    defs = schema["$defs"]
+    _enum_schema(defs["IRNode"]["properties"]["field"], CONDITION_FIELDS)
+    _enum_schema(defs["IRField"]["properties"]["field"], GROUP_FIELDS + ATTRIBUTES)
+    _enum_schema(defs["IRSort"]["properties"]["field"], SORT_FIELDS)
+    _enum_schema(defs["IRLookup"]["properties"]["attributes"]["items"], ATTRIBUTES)
+    _enum_schema(defs["IRAggregate"]["properties"]["field"], ["age"])
+    return schema
 
-    Value enums come from the live vocabulary. Valid JSON is still not proof of a correct plan: the resolver,
-    Pydantic models and grounding checks validate every candidate afterwards.
-    """
-    wing_values = {"enum": ctx.wings} if 0 < len(ctx.wings) <= MAX_ENUM_WINGS else None
-    date_cond = {
-        "type": "object",
-        "properties": {
-            "field": {"enum": ["admission_date", "created_date", "discharge_date"]},
-            "start": {"type": "string", "format": "date"},
-            "end": {"type": "string", "format": "date"},
-            "missing": {"type": "boolean"},
-        },
-        "required": ["field"],
-        "additionalProperties": False,
-    }
-    age_cond = {
-        "type": "object",
-        "properties": {
-            "field": {"const": "age"},
-            "min": {"type": "integer", "minimum": 0, "maximum": 130},
-            "max": {"type": "integer", "minimum": 0, "maximum": 130},
-            "missing": {"type": "boolean"},
-        },
-        "required": ["field"],
-        "additionalProperties": False,
-    }
-    conditions = {
-        "type": "array",
-        "maxItems": 8,
-        "items": {
-            "anyOf": [
-                _set_condition("status", {"enum": ctx.statuses}),
-                _set_condition("care_type", {"enum": ctx.care_types}),
-                _set_condition("gender", {"enum": GENDERS}),
-                _set_condition("facility", wing_values),
-                _set_condition("primary_caregiver", None),
-                _set_condition("room_number", None),
-                age_cond,
-                date_cond,
-            ]
-        },
-    }
-    return {
-        "type": "object",
-        "properties": {
-            "action": {"enum": ACTIONS},
-            "conditions": conditions,
-            "group_by": {"type": "array", "items": {"enum": GROUP_FIELDS}, "minItems": 1, "maxItems": 2},
-            "aggregate": {
-                "type": "object",
-                "properties": {"op": {"enum": ["avg", "min", "max"]}, "field": {"const": "age"}},
-                "required": ["op"],
-                "additionalProperties": False,
-            },
-            "sort": {
-                "type": "object",
-                "properties": {"field": {"enum": SORT_FIELDS}, "direction": {"enum": ["asc", "desc"]}},
-                "required": ["field", "direction"],
-                "additionalProperties": False,
-            },
-            "limit": {"type": "integer", "minimum": 1, "maximum": 200},
-            # projection (what to show), independent of the conditions
-            "fields": {"type": "array", "items": {"enum": ATTRIBUTES}, "minItems": 1, "maxItems": len(ATTRIBUTES)},
-            "lookup": {
-                "type": "object",
-                "properties": {
-                    "residents": {
-                        "type": "array",
-                        "items": {"type": "string", "maxLength": 60},
-                        "minItems": 1,
-                        "maxItems": 5,
-                    },
-                    "attributes": {"type": "array", "items": {"enum": ATTRIBUTES}, "maxItems": len(ATTRIBUTES)},
-                },
-                "required": ["residents"],
-                "additionalProperties": False,
-            },
-            "message": {"type": "string", "maxLength": 300},
-            "uses_previous": {"type": "boolean"},
-        },
-        "required": ["action"],
-        "additionalProperties": False,
-    }
+
+def _enum_schema(schema: dict, values: list[str]) -> None:
+    if "anyOf" in schema:
+        target = next((item for item in schema["anyOf"] if item.get("type") == "string"), None)
+        if target is not None:
+            target.clear()
+            target["enum"] = values
+    else:
+        schema.clear()
+        schema["enum"] = values
 
 
 def conditions_to_filters(conditions: list) -> dict:

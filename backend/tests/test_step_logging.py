@@ -53,27 +53,36 @@ async def test_model_path_logs_every_step_in_order(caplog):
     result, recs = await ask(service, caplog, q)
     assert_complete(recs)
     s = by_name(recs)
-    assert s["plan_cache"].status == "miss"
-    assert s["local_model"].status == "planned" and s["local_model"].completion_tokens == 40
+    assert s["semantic_cache"].status == "skipped" and s["semantic_cache"].reason == "semantic cache disabled"
+    assert s["local_model"].status == "interpreted" and s["local_model"].completion_tokens == 40
     assert s["validate_plan"].status == "passed"
     assert s["execute_query"].status == "ok" and s["execute_query"].matched == result["response"]["count"]
-    assert s["remember"].plan_cached is True
+    assert not hasattr(s["remember"], "template_recorded")  # no semantic cache configured: nothing recorded
     assert s["finished"].status == "answered" and s["finished"].tier == "llm" and s["finished"].model_calls == 1
     assert isinstance(s["finished"].total_ms, int)
 
 
-async def test_cache_hit_skips_model_steps_with_reason(caplog):
+async def test_template_hit_skips_the_model_and_keeps_every_step(caplog):
+    # replaces the exact-fingerprint "plan cache hit" test (removed 2026-11-18): a stored semantic template is used
+    # AFTER the fast path, so the earlier steps run normally and only the model steps are skipped
+    from app.engine.semantic_cache import SemanticPlanCache
+    from tests.test_semantic_cache import FakeStore, SameVector
+
     q = "How many residents are active?"
     service = await service_with(FakeTranslator({q.lower(): COUNT_PLAN}))
+    store = FakeStore()
+    service.semantic_cache = SemanticPlanCache(store, SameVector, threshold=0.0, top_k=5, max_candidates=50,
+                                               timeout_s=1.0, embedding_model="t")  # fmt: skip
     await ask(service, caplog, q)
+    await service.semantic_cache.drain()
     caplog.clear()
-    result, recs = await ask(service, caplog, q)
+    result, recs = await ask(service, caplog, "How many residents are currently active?")
     assert_complete(recs)
     s = by_name(recs)
-    assert s["plan_cache"].status == "hit" and result["tier"] == "cache"
-    for name in ("topic_check", "policy_check", "intent_classifier", "fast_path", "local_model"):
-        assert s[name].status == "skipped" and s[name].reason == "plan cache hit"
-    assert s["execute_query"].status == "ok"
+    assert s["semantic_cache"].status == "hit" and result["tier"] == "template"
+    assert s["local_model"].status == "skipped" and s["local_model"].reason == "already decided"
+    assert s["failure_cache"].status == "skipped"
+    assert s["execute_query"].status == "ok" and s["remember"].template_used
 
 
 async def test_off_topic_stops_at_topic_check_and_still_logs_19(caplog):

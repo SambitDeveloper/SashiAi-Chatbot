@@ -5,6 +5,7 @@ Run locally:   uv run uvicorn app.main:app --reload --port 8000
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -66,13 +67,60 @@ def build_repository(settings: Settings) -> ResidentRepository:
 
 
 def build_translator(settings: Settings) -> QueryTranslator | None:
-    """The local Qwen2.5-0.5B model (llama.cpp server on the private network). No external model is ever used."""
+    """The model client for LLM_PROVIDER: "local" = Qwen on llama-server (private network), "bedrock" = Gemma 4 on AWS
+    Bedrock (bedrock-mantle). Exactly one is built; there is no fallback from one to the other."""
     if not settings.llm_enabled:
         log.warning("LLM_ENABLED=false: only questions the deterministic planner resolves will be answered")
         return None
+    if settings.llm_provider == "bedrock":
+        from app.nlu.bedrock_translator import BedrockTranslator
+
+        return BedrockTranslator(settings)
     from app.nlu.qwen_translator import QwenTranslator
 
     return QwenTranslator(settings)
+
+
+def build_semantic_cache(settings: Settings, topic_gate: TopicGate | None):
+    """The semantic plan template cache (off unless PLAN_CACHE_ENABLED). Uses its own Atlas connection string and the
+    topic gate's already-loaded BGE model (a private instance of the same model only when the gate is disabled)."""
+    if not settings.plan_cache_enabled:
+        return None
+    from app.engine.semantic_cache import AtlasTemplateStore, SemanticPlanCache
+    from app.nlu.topic_gate import FastEmbedEmbedder
+
+    own: list = []
+
+    def embedder():
+        if topic_gate is not None and topic_gate.embedder is not None:
+            return topic_gate.embedder
+        if not own:
+            own.append(FastEmbedEmbedder(settings.topic_gate_model, settings.topic_gate_cache_dir))
+        return own[0]
+
+    store = AtlasTemplateStore(
+        settings.plan_cache_mongodb_uri,
+        settings.plan_cache_database,
+        settings.plan_cache_collection,
+        settings.plan_cache_vector_index,
+        settings.plan_cache_timeout_seconds,
+        ttl_seconds=settings.plan_cache_ttl_hours * 3600,
+    )
+    log.info(
+        "semantic plan cache enabled",
+        extra={"database": settings.plan_cache_database, "collection": settings.plan_cache_collection,
+               "index": settings.plan_cache_vector_index, "threshold": settings.plan_cache_similarity_threshold},
+    )  # fmt: skip
+    return SemanticPlanCache(
+        store,
+        embedder,
+        threshold=settings.plan_cache_similarity_threshold,
+        top_k=settings.plan_cache_top_k,
+        max_candidates=settings.plan_cache_max_candidates,
+        timeout_s=settings.plan_cache_timeout_seconds,
+        embedding_model=settings.topic_gate_model,
+        store_templates=settings.plan_cache_store_templates,
+    )
 
 
 def create_app(
@@ -110,14 +158,31 @@ def create_app(
             intent_router = SemanticIntentRouter(
                 settings.semantic_router_routes_file or DEFAULT_ROUTES_FILE, cache_dir=settings.topic_gate_cache_dir
             )
-        service = QueryService(repository, model, settings, gate=topic_gate, intent_router=intent_router)
-        await service.start()
-        # Warm the local model's prompt cache in the background (a cold first inference can exceed the timeout).
-        warm_task = (
-            asyncio.create_task(model.warm_up(service.schema_context(), settings.today()))
-            if hasattr(model, "warm_up")
-            else None
+        semantic_cache = build_semantic_cache(settings, topic_gate)
+        cache_connect_task = None
+        if semantic_cache is not None:  # a cold Atlas connection takes seconds: open it before the first question
+
+            async def connect_cache():
+                try:
+                    await semantic_cache.store.connect()
+                    log.info("semantic plan cache connected")
+                except Exception as exc:  # questions still work: every lookup is a miss until Atlas is reachable
+                    log.warning("semantic plan cache not reachable at startup: %s", type(exc).__name__)
+
+            cache_connect_task = asyncio.create_task(connect_cache())
+        service = QueryService(
+            repository, model, settings, gate=topic_gate, intent_router=intent_router, semantic_cache=semantic_cache
         )
+        await service.start()
+        # Warm the local model's prompt cache in the background (a cold first read of the prompt takes minutes on a
+        # CPU), then keep watching: if llama-server restarts, its cache is empty again and is re-warmed automatically.
+        async def warm_and_watch():
+            await model.warm_up(service.schema_context(), settings.today())
+            await model.keep_warm(service.schema_context, settings.today)
+
+        warm_task = asyncio.create_task(warm_and_watch()) if hasattr(model, "keep_warm") else (
+            asyncio.create_task(model.warm_up(service.schema_context(), settings.today())) if hasattr(model, "warm_up") else None
+        )  # fmt: skip
         # Load the embedding model in the background: the API is usable at once; until it is ready, questions skip
         # the topic check and the deterministic planner and go to the local model.
         gate_task = asyncio.create_task(topic_gate.start()) if topic_gate and not topic_gate.ready else None
@@ -131,16 +196,19 @@ def create_app(
                 "llm": model is not None,
                 "provider": getattr(model, "provider", None),
                 "model": getattr(model, "model_name", None),
-                "llm_server": settings.llm_server_url if model is not None else None,
+                "llm_server": (getattr(model, "endpoint", None) or settings.llm_server_url) if model is not None else None,
                 "topic_check": topic_gate is not None,
                 "semantic_router": intent_router is not None,
             },
         )
         yield
-        for task in (gate_task, router_task, warm_task):
+        for task in (gate_task, router_task, warm_task, cache_connect_task):
             if task and not task.done():
                 task.cancel()
         await service.stop()
+        if semantic_cache is not None:
+            await semantic_cache.drain()
+            await semantic_cache.store.close()
         if hasattr(model, "close"):
             await model.close()
         await repository.close()
@@ -165,9 +233,16 @@ def create_app(
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
+        started = time.perf_counter()
         response = await call_next(request)
         for k, v in SECURITY_HEADERS.items():
             response.headers.setdefault(k, v)
+        if request.url.path == "/api/query":
+            # end-to-end time as the client sees it: request received → response returned (pipeline + HTTP handling)
+            total_ms = round((time.perf_counter() - started) * 1000)
+            response.headers["Server-Timing"] = f"total;dur={total_ms}"
+            log.info("http request completed", extra={"method": request.method, "path": request.url.path,
+                                                      "status": response.status_code, "total_ms": total_ms})  # fmt: skip
         return response
 
     @app.exception_handler(RateLimitExceeded)
