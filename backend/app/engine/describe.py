@@ -41,7 +41,11 @@ ATTRIBUTE_LABELS = {
     "care_type": "Care Type",
     "age": "Age",
     "gender": "Gender",
+    "family_members": "Family Members",
+    "family_count": "Number of Family Members",
 }
+FAMILY_FLAG_LABELS = {"portal_access": "portal access", "app_access": "app access", "health_access": "health access",
+                      "guarantor": "guarantor"}  # fmt: skip
 _SET_FIELDS = [
     ("status", "Status"),
     ("care_type", "Care Type"),
@@ -49,6 +53,9 @@ _SET_FIELDS = [
     ("gender", "Gender"),
     ("primary_caregiver", "Caregiver"),
     ("room_number", "Room"),
+    ("family_relation", "Family"),
+    ("family_type", "Family contact"),
+    ("family_flags", "Family with"),
 ]
 
 
@@ -59,6 +66,10 @@ def label_value(field_name: str, value: str) -> str:
         return STATUS_LABELS.get(value, value)
     if field_name == "care_type":
         return CARE_TYPE_LABELS.get(value, value)
+    if field_name == "family_flags":
+        return FAMILY_FLAG_LABELS.get(value, value)
+    if field_name in ("family_relation", "family_type"):
+        return value.replace("_", " ")
     return value
 
 
@@ -91,6 +102,16 @@ def describe_filters(f: Filters) -> list[str]:
         for words, needles in (("starts with", sf.starts_with), ("contains", sf.contains)):
             if needles:  # literal text as the user wrote it (never a vocabulary label)
                 chips.append(f"{label}: {words} " + " or ".join(f'"{n}"' for n in needles))
+    if f.family_count:
+        lo, hi = f.family_count.min, f.family_count.max
+        if hi == 0:
+            chips.append("Family: none recorded")
+        elif lo is not None and lo == hi:
+            chips.append(f"Family members: exactly {lo}")
+        elif lo is not None and hi is not None:
+            chips.append(f"Family members: {lo} to {hi}")
+        else:
+            chips.append(f"Family members: at least {lo}" if lo is not None else f"Family members: at most {hi}")
     if f.age:
         lo, hi = f.age.min, f.age.max
         if not f.age.has_range:
@@ -139,5 +160,7 @@ def describe_plan(plan: QueryPlan, name_of: Callable[[str], str]) -> list[str]:
             what = "Oldest first" if s.direction == "desc" else "Youngest first"
         else:
             what = f"{'Most recent' if s.direction == 'desc' else 'Earliest'} {ATTRIBUTE_LABELS.get(s.field, s.field).lower()}"
+        if s.field == "family_count":
+            what = "Most family members first" if s.direction == "desc" else "Fewest family members first"
         chips.append(f"{what} · top {plan.limit}" if plan.limit else what)
     return chips

@@ -42,6 +42,8 @@ def output_fields() -> dict[str, str]:
     actually defines (an attribute whose field is not mapped is not supported)."""
     cfg = schema_config()
     mapped = set((cfg.get("fields") or {}).keys())
+    if (cfg.get("relations") or {}).get("family"):  # fields the family relation derives (app/data/relations.py)
+        mapped |= {"familyCount", "familyMembers", "familyContacts"}
     return {a: f for a, f in (cfg.get("output_fields") or {}).items() if f in mapped}
 
 

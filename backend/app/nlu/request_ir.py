@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.models.plan import TEXT_MATCH_FIELDS, QueryPlan, canonical_field
+from app.nlu import placeholders as ph
 
 Action = Literal["count", "list", "breakdown", "aggregate", "lookup", "clarify", "unsupported", "help"]
 PredicateOperator = Literal[
@@ -17,25 +18,36 @@ Scalar = str | int
 
 # The ONE source of which fields and operators an interpretation may use. The prompt (nlu/prompt.py) and the output
 # schema are generated from these, so what the model is told can never drift from what this compiler accepts.
-SET_FIELDS: tuple[str, ...] = ("status", "care_type", "facility", "gender", "primary_caregiver", "room_number")
+SET_FIELDS: tuple[str, ...] = (
+    "status", "care_type", "facility", "gender", "primary_caregiver", "room_number",
+    "family_relation", "family_type", "family_flags",  # family relation (app/data/relations.py): ANY member
+    "family_member",  # a specific family member: a family_N / person_N placeholder, resolved by the backend
+)  # fmt: skip
 DATE_FIELDS: tuple[str, ...] = ("admission_date", "created_date", "discharge_date")
-RANGE_FIELDS: tuple[str, ...] = ("age", *DATE_FIELDS)
+COUNT_FIELDS: tuple[str, ...] = ("family_count",)  # number of related records per resident (0 = none)
+RANGE_FIELDS: tuple[str, ...] = ("age", *DATE_FIELDS, *COUNT_FIELDS)
 CONDITION_FIELDS: tuple[str, ...] = (*SET_FIELDS, *RANGE_FIELDS)
 GROUP_FIELDS: tuple[str, ...] = ("status", "care_type", "facility", "gender", "primary_caregiver")
-SORT_FIELDS: tuple[str, ...] = ("admission_date", "created_date", "discharge_date", "age", "last_name")
+SORT_FIELDS: tuple[str, ...] = ("admission_date", "created_date", "discharge_date", "age", "last_name", "family_count")
 ATTRIBUTES: tuple[str, ...] = (
     "primary_caregiver", "room_number", "facility", "admission_date", "created_date", "discharge_date",
-    "emergency_contact", "resident_id", "status", "care_type", "age", "gender",
+    "emergency_contact", "resident_id", "status", "care_type", "age", "gender", "family_members", "family_count",
+    "family_relationship",
 )  # fmt: skip
 SET_OPERATORS: tuple[str, ...] = ("eq", "ne", "in", "not_in", "missing", "present")
 TEXT_OPERATORS: tuple[str, ...] = ("starts_with", "contains")  # only on TEXT_MATCH_FIELDS (app/models/plan.py)
 RANGE_OPERATORS: tuple[str, ...] = ("gt", "gte", "lt", "lte", "between", "missing", "present")
+COUNT_OPERATORS: tuple[str, ...] = ("eq", "gt", "gte", "lt", "lte", "between")  # a count is always recorded
 assert set(PredicateOperator.__args__) == {*SET_OPERATORS, *TEXT_OPERATORS, *RANGE_OPERATORS}  # type: ignore[attr-defined]
 assert set(TEXT_MATCH_FIELDS) <= set(SET_FIELDS)
 
 
 def operators_for(field: str) -> tuple[str, ...]:
     """The predicate operators the compiler accepts on one condition field."""
+    if field == "family_member":
+        return ("eq", "in")
+    if field in COUNT_FIELDS:
+        return COUNT_OPERATORS
     if field in RANGE_FIELDS:
         return RANGE_OPERATORS
     if field in TEXT_MATCH_FIELDS:
@@ -75,7 +87,9 @@ class IRNode(_Strict):
                 raise ValueError("predicate needs a field and operator and cannot have children")
             if self.operator in ("missing", "present"):
                 if self.value is not None:
-                    raise ValueError("missingness predicates do not take a value")
+                    raise ValueError(
+                    "missing/present take no value (they test whether ANY value is recorded); to test a value use eq or in"
+                )
             elif self.value is None:
                 raise ValueError("comparison predicate needs a value")
             if self.operator == "between" and (not isinstance(self.value, list) or len(self.value) != 2):
@@ -350,6 +364,7 @@ def compile_request_ir(
     _validate_node_status(ir.where)
 
     filters = _compile_where(ir.where, allowed_statuses, allowed_care_types) if ir.where else {}
+    _check_person_placeholders(filters, source_text)
     group_by = [_known_field(item.field, _GROUP_FIELDS, "grouping") for item in ir.group_by]
     projection = [_known_field(item.field, _ATTRIBUTES, "projection") for item in ir.projection]
     aggregate = None
@@ -449,7 +464,7 @@ def request_ir_from_plan(plan: dict, evidence: str) -> dict:
             elif parts:
                 where_terms.append({"kind": "and", "status": "supported", "evidence": evidence, "children": parts})
             continue
-        if field == "age":
+        if field == "age" or field in COUNT_FIELDS:
             bounds = []
             if body.get("min") is not None:
                 bounds.append(_predicate(field, "gte", body["min"], evidence))
@@ -642,7 +657,7 @@ def _compile_where(
                          f"(fields: {', '.join(sorted(fields))}). If the question really needs it, list it in unsupported."],
                 capability="combining conditions on different fields with OR",
             )  # fmt: skip
-        field = _known_field(next(iter(fields)), _SET_FIELDS | _DATE_FIELDS | {"age"}, "filter")
+        field = _known_field(next(iter(fields)), _SET_FIELDS | set(RANGE_FIELDS), "filter")
         per_field.setdefault(field, []).append(term)
 
     filters: dict[str, dict] = {}
@@ -734,6 +749,9 @@ def _compile_field_terms(field: str, terms: list[IRNode]) -> dict | None:
         if text_or and out.get("missing") is False:
             out.pop("missing")  # a text match implies a recorded value
         return out
+    if field in COUNT_FIELDS:  # "exactly 2 family members" = between 2 and 2
+        terms = [_count_eq_as_between(term) for term in terms]
+        return _compile_range_and(field, terms)
     if field == "age" or field in _DATE_FIELDS:
         if any(op in ("eq", "ne", "in", "not_in") for op in operators):
             raise IRCompilationError("set comparison on a range field")
@@ -970,6 +988,26 @@ def _shift_boundary(value, days: int, is_date: bool):
         return value + timedelta(days=days) if is_date else value + days
     except OverflowError as exc:
         raise IRCompilationError("comparison boundary is outside the supported range") from exc
+
+
+def _check_person_placeholders(filters: dict, source_text: str) -> None:
+    """family_member values must be family_N / person_N placeholders of THIS (masked) question: never a name, an id or
+    a placeholder the question does not contain. Identity is decided by the backend (engine/resolver.py)."""
+    values = (filters.get("family_member") or {}).get("include") or []
+    present = {m.group(0).lower() for m in ph.ANY_IN_TEXT.finditer(source_text)}
+    bad = [v for v in values if not (ph.is_placeholder(v, (ph.FAMILY, ph.PERSON)) and str(v).lower() in present)]
+    if bad:
+        raise IRCompilationError(
+            "family_member needs a family_N / person_N placeholder from the question", code="value",
+            details=[f"family_member values {bad} must be family_N or person_N placeholders that appear in the Question"],
+        )  # fmt: skip
+
+
+def _count_eq_as_between(term: IRNode) -> IRNode:
+    if term.operator != "eq":
+        return term
+    return IRNode(kind="predicate", status=term.status, field=term.field, operator="between",
+                  value=[term.value, term.value], evidence=term.evidence)  # fmt: skip
 
 
 def _declared(message: str, flagged: list[tuple[str, str]]) -> IRCompilationError:

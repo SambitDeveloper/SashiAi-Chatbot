@@ -98,6 +98,18 @@ class Settings(BaseSettings):
     # RequestIR validation + retry decide. Structured outputs are not listed for Gemma 4 on bedrock-mantle and Bedrock's
     # JSON-Schema subset rejects parts of the RequestIR schema, so json_object / json_schema are opt-in experiments.
     bedrock_response_format: Literal["none", "json_object", "json_schema"] = "none"
+    # Family-member NAMES as a third kind of person (family_N / person_N placeholders; app/nlu/vocabulary.py). On by
+    # default in every environment (decided 2026-11-20); this setting only exists as an off switch, nothing needs to be
+    # configured. Note: masking protects names from the model, it does not decide who may see them. Until the API has
+    # trusted caller identity, every caller of the shared API_TOKEN gets the CallerContext built from the settings
+    # below (all facilities, the configured family permissions).
+    family_name_resolution_enabled: bool = True
+    # Caller defaults while the API has no per-user identity (app/engine/caller.py). Separate permissions: names and
+    # relationships vs phone and email. caller_facility_ids: restrict every query to these resident facilityIds (tests,
+    # staging); None = unrestricted (today's behaviour).
+    family_names_permitted: bool = True
+    family_contacts_permitted: bool = True
+    caller_facility_ids: list[str] | None = None
     # Gemma 4 reasons by default; Chat Completions does not return the reasoning, only its latency. None = model default.
     bedrock_reasoning_effort: Literal["low", "medium", "high"] | None = None
 

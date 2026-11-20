@@ -40,6 +40,10 @@ class SchemaContext:
     caregivers: list[str] = field(default_factory=list)
     # A fixed real wing for the few-shot example, the same for every request so the prompt prefix stays cacheable.
     example_wing: str | None = None
+    # normalised relation values found in familymembers (son, daughter, ...): labels, never a person's data
+    family_relations: list[str] = field(default_factory=list)
+    # family-member names are masked as family_N / person_N (Settings.family_name_resolution_enabled)
+    family_names: bool = False
 
 
 @dataclass

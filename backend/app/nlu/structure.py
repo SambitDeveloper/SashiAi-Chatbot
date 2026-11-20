@@ -25,8 +25,9 @@ import re
 from dataclasses import asdict, dataclass, field
 
 from app.data.schema_config import comparable_fields
+from app.nlu import placeholders as ph
 
-_TOKEN = re.compile(r"resident_\d+|[a-z]+(?:'[a-z]+)?|\d+|[,.?!;]")
+_TOKEN = re.compile(ph.TOKEN + r"|[a-z]+(?:'[a-z]+)?|\d+|[,.?!;]")
 _PLACEHOLDER = re.compile(r"^resident_\d+$")
 _DETERMINERS = {"the", "a", "an", "their", "his", "her", "its", "this", "that"}
 

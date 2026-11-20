@@ -10,7 +10,10 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
+from app.data.relations import FAMILY_ATTRIBUTES, FAMILY_PLAN_FIELDS, family_relation
+from app.engine.caller import current_caller
 from app.models.plan import QueryPlan, canonical_field
+from app.nlu import placeholders as ph
 from app.nlu.prompt import conditions_to_filters
 from app.nlu.vocabulary import EntityIndex, MaskResult, Resolution
 
@@ -77,6 +80,52 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
         )
     plan["filters"] = {canonical_field(k): v for k, v in plan["filters"].items() if v not in ({}, [], None)}
     unknown: list[str] = []
+
+    # ---------------------------------------------------------------- family members as people (family_N / person_N)
+    caller = current_caller()
+    attrs = [*(plan.get("fields") or []), *((plan.get("lookup") or {}).get("attributes") or [])]
+    uses_family = any(k in FAMILY_PLAN_FIELDS for k in plan["filters"]) or any(a in FAMILY_ATTRIBUTES for a in attrs)
+    if uses_family and not caller.can_read_family:
+        return ResolveOutcome(_clarify("You don't have access to family information."), problem="forbidden:family")
+    people = {**mask.family, **mask.persons} if hasattr(mask, "family") else {}
+    if people:
+        written = _placeholders_written(plan)
+        unused = [p for p in people if p not in written]
+        if unused:  # a person the question names is never silently dropped
+            who = mask.entity_originals.get(unused[0], unused[0])
+            return ResolveOutcome(
+                _clarify(f'I couldn\'t tell how "{who}" relates to your question. Could you rephrase it?'),
+                problem="unused:person",
+                hint=" ".join(f"The question names {p}: use it (family_member eq {p}, or a person_N as a primary_caregiver"
+                              " value when the question is about a caregiver); never drop it." for p in unused),
+            )  # fmt: skip
+        caregiver = plan["filters"].get("primary_caregiver")
+        if isinstance(caregiver, dict):
+            for bucket in ("include", "exclude"):
+                values: list[str] = []
+                for text in caregiver.get(bucket, []) or []:
+                    kind = ph.kind_of(str(text))
+                    if kind == ph.FAMILY:  # a family member is never turned into a caregiver condition
+                        who = mask.entity_originals.get(str(text).lower(), str(text))
+                        return ResolveOutcome(
+                            _clarify(f'"{who}" is recorded as a family member, not as a caregiver. Could you rephrase it?'),
+                            problem="role:family_as_caregiver",
+                            hint=f"{text} is a family member, not a caregiver: use family_member eq {text}.",
+                        )
+                    if kind == ph.PERSON:  # the staff reading of a name that is also a family member's
+                        staff = mask.persons.get(str(text).lower(), {}).get("staff") or []
+                        if not staff:
+                            who = mask.entity_originals.get(str(text).lower(), str(text))
+                            return ResolveOutcome(
+                                _clarify(f'"{who}" is not a staff member in the records. Could you rephrase it?'),
+                                problem="role:person_not_staff",
+                                hint=f"{text} is not a staff member: use family_member eq {text}.",
+                            )
+                        values.extend(staff)
+                    else:
+                        values.append(text)
+                if values:
+                    caregiver[bucket] = list(dict.fromkeys(values))
     misused: list[tuple[str, str, str]] = []  # (field, resident as written, value the planner wrote)
 
     resolvers = {
@@ -113,6 +162,20 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
                 f.pop(bucket, None)
         if not f:
             plan["filters"].pop(field_name)
+
+    # family relation words → the normalised relation values they mean ("spouse" → spouse, wife, husband;
+    # "daughters" → daughter). Not looked up as names: a relation nobody has recorded simply matches no one.
+    fr = plan["filters"].get("family_relation")
+    rel = family_relation()
+    if isinstance(fr, dict) and rel is not None:
+        for bucket in ("include", "exclude"):
+            values = [v for text in fr.get(bucket, []) or [] for v in rel.expand(str(text))]
+            if values:
+                fr[bucket] = list(dict.fromkeys(values))
+            else:
+                fr.pop(bucket, None)
+        if not fr:
+            plan["filters"].pop("family_relation")
 
     lookup = plan.get("lookup")
     if isinstance(lookup, dict) and isinstance(lookup.get("residents"), list):
@@ -154,6 +217,40 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
         if not lookup["residents"] and not unknown:
             unknown.append("the resident mentioned")
 
+    fm = plan["filters"].get("family_member")
+    if isinstance(fm, dict):
+        scope_ids = {str(r).upper() for r in ((lookup or {}).get("residents") or [])} if isinstance(lookup, dict) else set()
+        ids: list[str] = []
+        for text in fm.get("include", []) or []:
+            key = str(text).lower()
+            who = mask.entity_originals.get(key, str(text))
+            cands = (mask.family.get(key) or (mask.persons.get(key) or {}).get("family") or []) if people else []
+            cands = [c for c in cands if caller.allows_facility(c.get("facilityId"))]  # authorised facilities only
+            if scope_ids:
+                cands = [c for c in cands if str(c.get("residentId", "")).upper() in scope_ids]
+            if not cands:  # never says whether the name exists for someone the caller cannot see
+                whose = " and ".join(index.display_by_id.get(i, i) for i in sorted(scope_ids)) if scope_ids else ""
+                msg = (f'No family member named "{who}" is recorded for {whose}.' if whose
+                       else f'No family member named "{who}" is recorded.')  # fmt: skip
+                return ResolveOutcome(_clarify(msg), problem="not_found:family_member")
+            residents = list(dict.fromkeys(str(c["residentId"]).upper() for c in cands))
+            if len(cands) > 1:
+                if len(residents) > 1:  # e.g. the same name in two residents' families: ask, authorised residents only
+                    return ResolveOutcome(
+                        _clarify(f'"{who}" is a family member of more than one resident. Which resident do you mean?',
+                                 [{"label": index.display_by_id.get(r, r),
+                                   "query": f"What is the relationship between {who} and {index.display_by_id.get(r, r)}?"}
+                                  for r in residents[:6]]),
+                        problem="ambiguous",
+                    )  # fmt: skip
+                return ResolveOutcome(
+                    _clarify(f'{index.display_by_id.get(residents[0], residents[0])} has more than one family contact named '
+                             f'"{who}". Please check the family records.'),
+                    problem="ambiguous",
+                )  # fmt: skip
+            ids.append(str(cands[0]["id"]))
+        fm["include"] = list(dict.fromkeys(ids))
+
     if misused:
         # A planning error, not a missing record: the resident exists, but was used as a caregiver/facility/room.
         field_name, who, written = misused[0]
@@ -183,6 +280,16 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
         return ResolveOutcome(
             _clarify("I couldn't turn that into a safe query. Could you rephrase it?"), problem=f"invalid: {errors}"
         )
+
+
+def _placeholders_written(plan: dict) -> set[str]:
+    """family_N / person_N placeholders the plan uses (family_member or caregiver values), lower case."""
+    out: set[str] = set()
+    for name in ("family_member", "primary_caregiver"):
+        f = plan.get("filters", {}).get(name)
+        if isinstance(f, dict):
+            out |= {str(v).lower() for b in ("include", "exclude") for v in f.get(b, []) or [] if ph.is_placeholder(str(v))}
+    return out
 
 
 def _replace(question: str, original: str, replacement: str) -> str:

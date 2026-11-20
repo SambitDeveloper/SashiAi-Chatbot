@@ -1,0 +1,13 @@
+[
+  {"_id": "fm01", "residentId": "RES-1001", "name": "Margaret Vance", "relation": "Daughter", "type": "Family", "phone": "555-0101", "email": "margaret.vance@example.com", "hasPortalAccess": true, "isAuthorizedAppAccess": false},
+  {"_id": "fm02", "residentId": "RES-1001", "name": "Thomas Vance", "relation": "Son", "type": "Family", "phone": "555-0102", "email": "", "hasPortalAccess": false},
+  {"_id": "fm03", "residentId": "RES-1001", "name": "Eleanor Vance", "relation": "Self", "type": "Family", "phone": "555-0100", "hasPortalAccess": true},
+  {"_id": "fm04", "residentId": "RES-1001", "name": "Peter Vance", "relation": " spouse ", "type": "Emergency", "phone": "555-0103", "pcc_is_guarantor": true},
+  {"_id": "fm05", "residentId": "RES-1002", "name": "Linda Pendleton", "relation": "Daughter in law", "type": "Family", "phone": "555-0201", "hasPortalAccess": false},
+  {"_id": "fm06", "residentId": "RES-1002", "name": "Amy Pendleton", "relation": "Granddaugter", "type": "Family", "phone": "555-0202", "isAuthorizedAppAccess": true},
+  {"_id": "fm07", "residentId": "RES-1003", "name": "John Wells", "relation": "Brother", "type": "Family", "phone": "555-0301"},
+  {"_id": "fm08", "residentId": "RES-1003", "name": "Sue Wells", "relation": "Sister", "type": "Family", "phone": "555-0302", "healthAccess": true},
+  {"_id": "fm09", "residentId": "RES-1003", "name": "Kim Wells", "relation": "", "type": "Family", "phone": "555-0303"},
+  {"_id": "fm10", "residentId": "RES-1004", "name": "Grace Finch", "relation": "Wife", "type": "Emergency", "phone": "555-0401", "hasPortalAccess": true},
+  {"_id": "fm11", "residentId": "RES-9999", "name": "Orphan Record", "relation": "Son", "type": "Family", "phone": "555-0999"}
+]

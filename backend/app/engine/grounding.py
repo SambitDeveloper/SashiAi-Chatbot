@@ -20,6 +20,13 @@ from datetime import date as date_type
 from rapidfuzz import fuzz
 
 from app.data import text_match
+from app.data.relations import (
+    FAMILY_ATTRIBUTES,
+    FAMILY_PLAN_FIELDS,
+    FAMILY_SELECTORS,
+    family_relation,
+    plan_uses_family,
+)
 from app.data.repository import FIELD_MAP
 from app.data.schema_config import output_fields, single_record_only
 from app.models.plan import TEXT_MATCH_FIELDS, AgeRange, DateRange, QueryPlan
@@ -156,6 +163,11 @@ SORT_CUES: list[tuple[tuple[str, ...], tuple[str, str]]] = [
     (("most recently", "most recent", "latest", "newest", "last admitted", "recently admitted"), ("admission_date", "desc")),
     (("earliest", "first admitted", "longest staying", "longest-staying"), ("admission_date", "asc")),
     (("alphabetical", "alphabetically", "by name", "by last name"), ("last_name", "asc")),
+    # appended (positions 2 and 3 above are read by index as the recency cues)
+    (("most family members", "most relatives", "most family contacts", "largest family", "biggest family"),
+     ("family_count", "desc")),
+    (("fewest family members", "fewest relatives", "least family members", "fewest family contacts", "smallest family"),
+     ("family_count", "asc")),
 ]
 AGG_CUES = {"avg": ("average", "mean", "avg"), "min": ("minimum", "min", "lowest"), "max": ("maximum", "max", "highest")}
 COUNT_CUES = ("how many", "count", "number of", "total", "census", "headcount", "tally")
@@ -344,6 +356,26 @@ def _text_covers(sf, view_field: str, values: list[str]) -> bool:
     )
 
 
+_FAMILY_COUNT_AFTER = re.compile(r"\s*(?:family members?|relatives?|family contacts?|family)\b")
+
+
+def _check_family(plan: QueryPlan, question: str, prev: dict, g: "Grounding", masked: str | None = None) -> str | None:
+    """A question about family must use a family field; a family condition needs a family word in the question (or
+    the previous question, for a follow-up). Returns the family word found (or None)."""
+    rel = family_relation()
+    if rel is None:
+        return None
+    cue = rel.cue_in(question, masked)
+    uses = plan_uses_family(plan.filters, sort_field=plan.sort.field if plan.sort else None) or any(
+        a in FAMILY_ATTRIBUTES for a in plan.output_fields
+    )
+    if cue and not uses:
+        g.missing.append(f'the family members the question asks about ("{cue}")')
+    if not cue and plan_uses_family(plan.filters) and not any(k in FAMILY_PLAN_FIELDS for k in prev):
+        g.invented.append("a family condition")
+    return cue
+
+
 def check_plan(
     plan: QueryPlan,
     question: str,
@@ -486,10 +518,31 @@ def check_plan(
     # Words that are part of a recognised resident's name are that resident, not a caregiver or wing: a resident
     # "Allison Akilah" must not read as staff member "… Allison" (the deterministic planner already skips them).
     resident_names = [o.lower() for o in mask.originals.values()]
+    # where the masked resident names sit in the question: a mention inside one of these spans IS the resident, however
+    # it is inflected ("Merry Johnson's family" must not read as staff member "… Johnson")
+    resident_spans = [
+        m.span() for o in mask.originals.values() if o.strip() for m in re.finditer(re.escape(o.strip()), question, re.I)
+    ]
 
     def in_resident_name(text: str) -> bool:
-        pattern = r"(?<![a-z])" + re.escape(text.lower()) + r"(?![a-z])"
-        return any(re.search(pattern, name) for name in resident_names)
+        base = re.sub(r"(?:'s|’s|'|’)$", "", text.strip(), flags=re.I)  # "Johnson's" → "Johnson"
+        if not base:
+            return False
+        hits = [m.span() for m in re.finditer(r"(?<![A-Za-z])" + re.escape(base) + r"(?![A-Za-z])", question, re.I)]
+        if hits and all(any(s <= a and b <= e for s, e in resident_spans) for a, b in hits):
+            return True
+        pattern = r"(?<![a-z])" + re.escape(base.lower()) + r"(?![a-z])"
+        return any(re.search(pattern, name) for name in resident_names) or in_family_span(base)
+
+    # names the masking classified as family members (family_N / person_N): never demanded as a caregiver or a
+    # facility here; how the plan uses them is checked by the resolver (family_member, or person_N as a caregiver)
+    entity_spans = list(getattr(mask, "entity_spans", []) or [])
+
+    def in_family_span(text: str) -> bool:
+        if not entity_spans:
+            return False
+        hits = [m.span() for m in re.finditer(r"(?<![A-Za-z])" + re.escape(text) + r"(?![A-Za-z])", question, re.I)]
+        return bool(hits) and all(any(s <= a and b <= e for s, e in entity_spans) for a, b in hits)
 
     if "primary_caregiver" not in groups and "primary_caregiver" not in attrs:
         used = set((f.primary_caregiver.include or []) + (f.primary_caregiver.exclude or [])) if f.primary_caregiver else set()
@@ -506,20 +559,24 @@ def check_plan(
 
     # ---------------------------------------------------------------- text matches ("starts with A")
     _check_text_matches(f, question, prev, g)
+    # ---------------------------------------------------------------- family relation (familymembers)
+    _check_family(plan, question, prev, g, mask.text)
 
     # ---------------------------------------------------------------- age
     # an age range needs an age expression the grammar parsed ("over 80", "between 70 and 80"); any other number in
-    # the question ("the 5 oldest", "room 101") is not evidence for one
-    if f.age and f.age.has_range and not scan.numbers and not _AGE_WORDS.search(low) and not prev.get("age"):
+    # the question ("the 5 oldest", "room 101") is not evidence for one. A number that counts family members
+    # ("at least 3 family members") is not an age either.
+    numbers = [n for n in scan.numbers if not _FAMILY_COUNT_AFTER.match(low, n.end)]
+    if f.age and f.age.has_range and not numbers and not _AGE_WORDS.search(low) and not prev.get("age"):
         g.invented.append("age range")
-    elif f.age and f.age.has_range and len(scan.numbers) == 1:
-        b = scan.numbers[0].bounds
+    elif f.age and f.age.has_range and len(numbers) == 1:
+        b = numbers[0].bounds
         if (f.age.min, f.age.max) != (b.get("min"), b.get("max")):
             f.age = AgeRange(**b, missing=f.age.missing)
-            g.fixes.append(f"age bounds set from '{question[scan.numbers[0].start : scan.numbers[0].end]}'")
-    elif not (f.age and f.age.has_range) and len(scan.numbers) == 1 and "age" not in groups | attrs and not (plan.sort and plan.sort.field == "age"):
+            g.fixes.append(f"age bounds set from '{question[numbers[0].start : numbers[0].end]}'")
+    elif not (f.age and f.age.has_range) and len(numbers) == 1 and "age" not in groups | attrs and not (plan.sort and plan.sort.field == "age"):
         if not plan.limit:  # "the 3 oldest" is a limit, not an age range
-            g.missing.append(f"age \"{question[scan.numbers[0].start : scan.numbers[0].end]}\"")
+            g.missing.append(f"age \"{question[numbers[0].start : numbers[0].end]}\"")
 
     # ---------------------------------------------------------------- lookups
     if plan.lookup:
@@ -722,11 +779,16 @@ def _check_projection(plan, question, low, mask, index, scan, missing_detector, 
             if attribute is not None and pattern.search(masked_low)
         }
     shown = set(plan.output_fields)
+    rel = family_relation()
+    if rel is not None and rel.cue_in(question, mask.text):  # "Eleanor's son's phone": family details answer it
+        shown -= set(FAMILY_ATTRIBUTES) - requested
     conditions = {
         field_name
         for field_name in type(plan.filters).model_fields
         if getattr(plan.filters, field_name) is not None
     } if plan.action == "lookup" else set()
+    if plan.action == "lookup" and any(getattr(plan.filters, n) is not None for n in FAMILY_SELECTORS):
+        conditions |= {"family_members"}  # "is X a family member of R?": the words name the condition, not a display
     for attr in sorted(requested - (shown | conditions)):
         g.missing.append(f"show {attr.replace('_', ' ')}")
     for attr in sorted(shown - requested - conditions):

@@ -31,22 +31,27 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
+import yaml
 
-from app.engine.grounding import SYNONYMS, DateScan, date_fields_mentioned
+from app.engine.grounding import NAMED, SYNONYMS, DateScan, date_fields_mentioned
+from app.nlu import placeholders as ph
 
 log = logging.getLogger(__name__)
 
-TEMPLATE_DOC_VERSION = 1  # bump when the document/slot format changes: older documents are then incompatible
+TEMPLATE_DOC_VERSION = 2  # bump when the document/slot format changes: older documents are then incompatible
+# v2 (2026-11-20): a synonym that only modifies an attribute ("current status") is no longer a {status} slot
 WRITE_TIMEOUT_S = 45.0  # background template writes: after the answer, may include a cold Atlas connect
 DATA_ACTIONS = {"count", "list", "breakdown", "aggregate", "lookup"}
 VOCAB_FIELDS = ("status", "care_type", "gender")
 NAME_FIELDS = ("facility", "primary_caregiver")
 DATE_FIELDS = ("admission_date", "created_date", "discharge_date")
 _PLACEHOLDER = re.compile(r"^resident_\d+$")
-_PLACEHOLDER_IN_TEXT = re.compile(r"\bresident_\d+\b")
+_PLACEHOLDER_IN_TEXT = ph.ANY_IN_TEXT  # any typed placeholder (app/nlu/placeholders.py)
 _INT = re.compile(r"(?<![\w.])\d+(?![\w.])")
 
 # Logic words: two questions whose slot-replaced texts differ in these are different requests, however close their
@@ -84,6 +89,37 @@ class Mention:
     value: Any
 
 
+_ROUTES_FILE = Path(__file__).resolve().parents[1] / "data" / "intent_routes.yaml"  # = intent_router.DEFAULT_ROUTES_FILE
+
+
+@lru_cache
+def _attribute_phrases() -> re.Pattern | None:
+    """The configured words that NAME an attribute (intent_routes.yaml `direct.lookup_attributes`: status, care type,
+    room, caregiver, discharge date ...), as one word-bounded pattern (plural -s / -es allowed)."""
+    cfg = yaml.safe_load(_ROUTES_FILE.read_text(encoding="utf-8")) or {}
+    attrs = ((cfg.get("direct") or {}).get("lookup_attributes")) or {}
+    words = sorted({" ".join(str(w).lower().split()) for ws in attrs.values() for w in ws or []}, key=len, reverse=True)
+    if not words:
+        return None
+    alts = "|".join(r"\s+".join(map(re.escape, w.split())) for w in words)
+    return re.compile(r"(?<![a-z])(?:" + alts + r")(?:e?s)?(?![a-z])")
+
+
+def _modifies_attribute(text: str, start: int, end: int) -> bool:
+    """The words at [start, end) only describe an attribute: they are directly followed by an attribute phrase
+    ("current status", "former caregiver", "left wing") or are part of a LONGER attribute phrase ("discharge date")."""
+    pattern = _attribute_phrases()
+    if pattern is None:
+        return False
+    for m in pattern.finditer(text):
+        s, e = m.span()
+        if s <= start and end <= e and (e - s) > (end - start):  # strictly inside a longer attribute phrase
+            return True
+        if s >= end and not text[end:s].strip():  # the very next word(s) name an attribute
+            return True
+    return False
+
+
 def _vocab_mentions(view: QuestionView, name: str) -> list[Mention]:
     """Values of a fixed-vocabulary field the question names, by position (the forms grounding.check_plan uses)."""
     low = view.masked_text.lower()
@@ -101,8 +137,14 @@ def _vocab_mentions(view: QuestionView, name: str) -> list[Mention]:
     out: list[Mention] = []
     taken: list[tuple[int, int]] = []
     for form, value in forms:
+        canonical = form in NAMED.get(name, {}).get(value, ())
         pattern = r"(?<![a-z])" + r"\s+".join(map(re.escape, form.split())) + r"(?![a-z])"
         for m in re.finditer(pattern, text):
+            # a non-canonical synonym that only modifies an attribute is not a value: "current status" asks for the
+            # status, it does not name "active". Canonical words ("discharged status") and synonyms used as values
+            # ("how many current residents") stay values; grounding's own rules are unchanged.
+            if not canonical and _modifies_attribute(text, m.start(), m.end()):
+                continue
             if not any(m.start() < e and s < m.end() for s, e in taken):
                 taken.append((m.start(), m.end()))
                 out.append(Mention(m.start(), m.end(), name, value))

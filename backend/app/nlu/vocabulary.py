@@ -79,10 +79,47 @@ class _IndexedCaregiver:
 
 
 @dataclass
+class _IndexedFamily:
+    """One family member of a live resident (familymembers): names and relation only, never contact details."""
+
+    member_id: str
+    resident_id: str  # upper case, like every resident id in this index
+    facility_id: str | None  # the RESIDENT's facility (the member's own facilityId is often missing)
+    name: str
+    tokens: list[str]
+    person: str  # normalised name, e.g. "jiyapatel"
+    rel: str  # normalised relation ("daughter")
+    relation: str  # as recorded ("Daughter")
+
+
+# Words that make the following name a staff member's ("Dr. Jiya Patel", "Nurse Kim"): never a family reading.
+_STAFF_TITLES = {"dr", "doctor", "nurse", "rn", "lpn", "cna", "aide", "coordinator"}
+
+
+def _has_family_word(words: list[str]) -> bool:
+    """Family vocabulary (resident_schema.yaml cue words: family, daughter, kin, ...) is the question's wording: a window
+    containing one is never a family member's name, whatever a record happens to be called ("Family Member")."""
+    from app.data.relations import family_relation  # local: vocabulary is imported by the data layer's users
+
+    rel = family_relation()
+    return rel is not None and any(rel.is_family_word(w) for w in words)
+
+
+@dataclass
 class MaskResult:
     text: str
     placeholders: dict[str, list[str]] = field(default_factory=dict)  # resident_1 → [resident ids]
     originals: dict[str, str] = field(default_factory=dict)  # resident_1 → text the user typed
+    # family-member names (feature flag): family_1 → candidate family members; person_1 → every candidate of each kind.
+    # Candidates stay on the server; the model only ever sees the placeholder.
+    family: dict[str, list[dict]] = field(default_factory=dict)
+    persons: dict[str, dict[str, list]] = field(default_factory=dict)  # {"staff": [...], "family": [...], "residents": [...]}
+    entity_originals: dict[str, str] = field(default_factory=dict)  # family_1 / person_1 → text the user typed
+    entity_spans: list[tuple[int, int]] = field(default_factory=list)  # their positions in the ORIGINAL question
+
+    @property
+    def all_originals(self) -> dict[str, str]:
+        return {**self.originals, **self.entity_originals}
 
 
 @dataclass
@@ -122,13 +159,60 @@ class EntityIndex:
         # statuses / care types that exist in the database; all known ones when the database did not say
         self.statuses = [s for s in STATUSES if not vocab.statuses or s in vocab.statuses]
         self.care_types = [c for c in CARE_TYPES if not vocab.care_types or c in vocab.care_types]
+        # family members (familymembers.name): a third kind of person, matched only when family names are enabled
+        self._family: list[_IndexedFamily] = []
+        for m in getattr(vocab, "family_members", []) or []:
+            tokens = [t for t in _name_parts(str(m.get("name") or "")) if t]
+            if not tokens:
+                continue
+            self._family.append(_IndexedFamily(
+                str(m.get("id")), str(m.get("residentId", "")).upper(), m.get("facilityId"), str(m.get("name") or "").strip(),
+                tokens, "".join(tokens), str(m.get("rel") or ""), str(m.get("relation") or ""),
+            ))  # fmt: skip
+        self.family_relations = list(getattr(vocab, "family_relations", []) or [])
         self._rooms = {re.sub(r"[^a-z0-9]", "", r.lower()): r for r in vocab.rooms if not is_missing(r, "roomNumber")}
 
     # ------------------------------------------------------------------ masking
-    def mask(self, question: str) -> MaskResult:
+    def mask(self, question: str, family: bool = False) -> MaskResult:
+        """Resident names → resident_N (always). With `family` (Settings.family_name_resolution_enabled), family-member
+        names → family_N, or person_N when the name also belongs to staff or to another resident named in the question.
+        Without family names in the question the result is exactly what it was before family names existed."""
+        if not (family and self._family):
+            return self._mask_residents(question)
+        # A family member's FULL name ("Margaret Vance") is not a resident's surname ("Vance" → Eleanor Vance): it is
+        # kept away from the resident matching, unless the same words are a resident's full name (then the resident
+        # wins and the resident/family collision rule below applies).
+        result = self._mask_residents(question, protected=self._family_full_spans(question))
+        self._mask_family(question, result)
+        return result
+
+    def _family_full_spans(self, question: str) -> list[tuple[int, int]]:
+        tokens = [(m.group(0), m.start(), m.end()) for m in _TOKEN_RE.finditer(question)]
+        spans: list[tuple[int, int]] = []
+        used: set[int] = set()
+        for size in (4, 3, 2):
+            for i in range(len(tokens) - size + 1):
+                idx = range(i, i + size)
+                if any(j in used for j in idx) or (i > 0 and _norm(tokens[i - 1][0]) in _STAFF_TITLES):
+                    continue
+                words = [_norm(tokens[j][0]) for j in idx]
+                concat = "".join(words)
+                if len(concat) < 6 or any(len(w) < 2 for w in words) or _has_family_word(words):
+                    continue
+                if not any(len(m.tokens) > 1 and self._window_is_name(words, m.tokens)
+                           and fuzz.ratio(concat, m.person) >= FULL_NAME_THRESHOLD for m in self._family):  # fmt: skip
+                    continue
+                if self._best_full_match(concat, words):
+                    continue  # a resident's full name: resident masking decides
+                spans.append((tokens[i][1], tokens[i + size - 1][2]))
+                used.update(idx)
+        return spans
+
+    def _mask_residents(self, question: str, protected: list[tuple[int, int]] | None = None) -> MaskResult:
         tokens = [(m.group(0), m.start(), m.end()) for m in _TOKEN_RE.finditer(question)]
         spans: list[tuple[int, int, list[str]]] = []
-        used: set[int] = set()
+        # tokens inside a family member's full name are not resident words (empty without family names: unchanged)
+        used: set[int] = {j for j, (_, s, _) in enumerate(tokens) if any(a <= s < b for a, b in protected or [])}
 
         # Multi-token windows: full resident names (typo tolerant), longest first. Every word in the window
         # must belong to the name, so filler such as "of" or "about" is never swallowed. Caregivers stay in place.
@@ -189,6 +273,116 @@ class EntityIndex:
             text = text[:start] + f"resident_{k + 1}" + text[end:]
         result.text = text
         return result
+
+    # ------------------------------------------------------------------ family members
+    def _family_view(self, m: _IndexedFamily) -> dict:
+        return {"id": m.member_id, "residentId": m.resident_id, "facilityId": m.facility_id, "name": m.name,
+                "rel": m.rel, "relation": m.relation}  # fmt: skip
+
+    def _staff_for(self, words: list[str]) -> list[str]:
+        concat = "".join(words)
+        return [c.value for c in self._caregivers if len(c.tokens) > 1 and self._window_is_name(words, c.tokens)
+                and fuzz.ratio(concat, c.person) >= FULL_NAME_THRESHOLD]  # fmt: skip
+
+    def _mask_family(self, question: str, result: MaskResult) -> None:
+        """Family-member spans OUTSIDE the resident spans, then a combined, typed rewrite of the masked text."""
+        # resident spans in the original question, recovered from the resident masking (same order as resident_N)
+        res_spans: list[tuple[int, int, str]] = []
+        pos = 0
+        for key in sorted(result.originals, key=lambda k: int(k.split("_")[1])):
+            start = question.find(result.originals[key], pos)
+            if start < 0:
+                return  # cannot place the resident spans reliably: leave the resident-only result untouched
+            res_spans.append((start, start + len(result.originals[key]), key))
+            pos = start + len(result.originals[key])
+        named_residents = {i.upper() for ids in result.placeholders.values() for i in ids}
+        tokens = [(m.group(0), m.start(), m.end()) for m in _TOKEN_RE.finditer(question)]
+        free = [not any(a <= s < b for a, b, _ in res_spans) for _, s, _ in tokens]
+        used: set[int] = set()
+        found: list[tuple[int, int, str, dict]] = []  # start, end, kind, candidates
+
+        def titled(i: int) -> bool:
+            return i > 0 and _norm(tokens[i - 1][0]) in _STAFF_TITLES
+
+        # 1. full names (two or more words), typo tolerant like resident names; a titled name is staff only
+        for size in (4, 3, 2):
+            for i in range(len(tokens) - size + 1):
+                idx = range(i, i + size)
+                if any(j in used or not free[j] for j in idx) or titled(i):
+                    continue
+                words = [_norm(tokens[j][0]) for j in idx]
+                concat = "".join(words)
+                if len(concat) < 6 or any(len(w) < 2 for w in words) or _has_family_word(words):
+                    continue
+                fam = [m for m in self._family if len(m.tokens) > 1 and self._window_is_name(words, m.tokens)
+                       and fuzz.ratio(concat, m.person) >= FULL_NAME_THRESHOLD]  # fmt: skip
+                if not fam:
+                    continue
+                staff = self._staff_for(words)
+                kind = "person" if staff else "family"
+                found.append((tokens[i][1], tokens[i + size - 1][2], kind,
+                              {"family": [self._family_view(m) for m in fam], "staff": staff, "residents": []}))  # fmt: skip
+                used.update(idx)
+        # 2. one word (67 family names are one word): only a member of a resident named in this question
+        for j, (tok, start, end) in enumerate(tokens):
+            if j in used or not free[j] or not tok[0].isupper() or titled(j):
+                continue
+            n = _norm(tok)
+            if len(n) < 3 or _has_family_word([n]):
+                continue
+            fam = [m for m in self._family if m.resident_id in named_residents and (n == m.tokens[0] or [n] == m.tokens)]
+            if not fam:
+                continue
+            staff = [c.value for c in self._caregivers if n in c.tokens]
+            found.append((start, end, "person" if staff else "family",
+                          {"family": [self._family_view(m) for m in fam], "staff": staff, "residents": []}))  # fmt: skip
+            used.add(j)
+        # 3. a resident's name that is also a family member of ANOTHER resident named here (spouses, siblings)
+        collisions: dict[str, dict] = {}
+        for start, end, key in res_spans:
+            words = [_norm(t) for t in _TOKEN_RE.findall(question[start:end])]
+            concat = "".join(words)
+            mine = {i.upper() for i in result.placeholders[key]}
+            fam = [m for m in self._family if m.resident_id in named_residents - mine and len(m.tokens) > 1
+                   and self._window_is_name(words, m.tokens) and fuzz.ratio(concat, m.person) >= FULL_NAME_THRESHOLD]  # fmt: skip
+            if fam:
+                collisions[key] = {"family": [self._family_view(m) for m in fam], "staff": [],
+                                   "residents": list(result.placeholders[key])}  # fmt: skip
+        if not found and not collisions:
+            return
+
+        # rewrite: residents keep their numbers; family_N / person_N numbered by position
+        spans: list[tuple[int, int, str, dict | None]] = []
+        for start, end, key in res_spans:
+            spans.append((start, end, "person" if key in collisions else key, collisions.get(key)))
+        spans += [(s, e, k, c) for s, e, k, c in found]
+        spans.sort(key=lambda x: x[0])
+        counters = {"family": 0, "person": 0}
+        last, pieces = 0, []
+        for start, end, kind, cand in spans:
+            if end >= 2 and question[end - 2 : end].lower() in ("'s", "\u2019s") and kind in ("family", "person"):
+                end -= 2  # keep a possessive outside the placeholder, as resident masking does
+            if kind in ("family", "person"):
+                counters[kind] += 1
+                name = f"{kind}_{counters[kind]}"
+                if kind == "family":
+                    result.family[name] = cand["family"]
+                else:
+                    result.persons[name] = cand
+                result.entity_originals[name] = question[start:end]
+                result.entity_spans.append((start, end))
+            else:
+                name = kind  # resident_N, unchanged
+            pieces.append(question[last:start] + name)
+            last = end
+        for key in collisions:  # a resident span that became person_N is no longer a resident placeholder
+            result.placeholders.pop(key, None)
+            result.originals.pop(key, None)
+        result.text = "".join(pieces) + question[last:]
+
+    def family_member(self, member_id: str) -> dict | None:
+        m = next((f for f in self._family if f.member_id == member_id), None)
+        return self._family_view(m) if m else None
 
     def _initials(self, resident_id: str) -> set[str]:
         r = self._by_id.get(resident_id.upper())

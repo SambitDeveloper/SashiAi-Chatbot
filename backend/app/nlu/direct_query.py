@@ -15,6 +15,7 @@ from datetime import date
 
 from rapidfuzz import fuzz
 
+from app.nlu import placeholders as ph
 from app.nlu.grammar import parse_dates, parse_number_ranges
 from app.nlu.intent_router import IntentScore
 from app.nlu.missing_values import MissingValueDetector
@@ -22,7 +23,7 @@ from app.nlu.projection import ProjectionDetector, value_starts
 from app.nlu.references import ReferenceResolver
 from app.nlu.vocabulary import EntityIndex, MaskResult
 
-_TOKEN_RE = re.compile(r"resident_\d+|[a-z]+|\d+")
+_TOKEN_RE = re.compile(ph.TOKEN + r"|[a-z]+|\d+")
 _WH_QUESTION = re.compile(r"^\s*(?:when|what|which|who|whom|whose|where|how|tell|show|give|list|find)\b")
 _RESIDENT_ID_RE = re.compile(r"\bres[-_ ]?\d{3,6}\b")
 _GENDERS = {"female": "Female", "male": "Male"}
@@ -525,7 +526,7 @@ class DirectQueryBuilder:
             | {w for words in self.number_fields.values() for p in words for w in p.split()}
         )  # fmt: skip
         for word, s, e in tokens:
-            if word.startswith("resident_") or word.isdigit() or any(explained[s:e]) or word in known:
+            if ph.is_placeholder(word) or word.isdigit() or any(explained[s:e]) or word in known:
                 continue
             if word not in brief.unknown_words:
                 brief.unknown_words.append(word)

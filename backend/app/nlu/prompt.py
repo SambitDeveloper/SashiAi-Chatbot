@@ -43,6 +43,32 @@ GRAMMAR_KEY_ORDER = _IR_REQUIRED + [k for k in _IR_SCHEMA["properties"] if k not
 ATTRIBUTES = list(ATTRIBUTES_IR)
 
 
+def _family_rules(ctx: SchemaContext) -> str:
+    """The family relation (familymembers), for models without an output grammar. Field names come from the compiler;
+    the relation words are the live database's labels (son, daughter, ...), never a person's data."""
+    relations = " | ".join(ctx.family_relations) if ctx.family_relations else "son | daughter | spouse | ..."
+    return (
+        "\n- Family (the resident's family members; a condition holds when ANY of them matches):"
+        f"\n  family_relation: {relations}. eq/in = has such a family member; ne/not_in = has none;"
+        " a word like spouse, children or parents may be used as written."
+        "\n  family_type: family | emergency · family_flags: portal_access | app_access | health_access | guarantor."
+        ' "a family member with portal access" is family_flags eq "portal_access" (never missing/present with a value).'
+        "\n  family_count: number of family members (0 = none recorded); sort by family_count for most / fewest."
+        "\n  To SHOW family: projection family_members (names + relations; for ONE named resident also phone and"
+        " email) or family_count. A family question about one named resident is a lookup with attribute"
+        " family_members. Never filter by a family member's own name."
+        + (
+            "\n- People: resident_N = a resident; family_N = a family member; person_N = a name that may be a staff member"
+            " or a family member (the backend decides). Use family_N / person_N ONLY as a family_member value (eq/in),"
+            " or person_N as a primary_caregiver value when the question is about a caregiver; never in lookup.residents."
+            "\n  How family_N is related to resident_N: lookup resident_N, attributes [\"family_relationship\"], where"
+            " family_member eq family_N. Which resident family_N is related to: list where family_member eq family_N."
+            " \"resident_N's daughters\": lookup resident_N, attributes [\"family_members\"], where family_relation eq daughter."
+            if ctx.family_names else ""
+        )
+    )
+
+
 def _operator_rules(full: bool) -> str:
     """Predicate operators, generated from the compiler's definitions (request_ir.operators_for).
 
@@ -99,7 +125,7 @@ RequestIR fields:
 - action/action_status/action_evidence: operation, its status, and exact supporting quote.
 - where: predicate/and/or/not/relationship AST. Every node has status (supported, ambiguous, unsupported, unresolved)
   and exact evidence. Predicates use field/operator/value. Relationship nodes use relation/target and are rejected.
-{_operator_rules(operator_table)}
+{_operator_rules(operator_table)}{_family_rules(ctx) if operator_table else ''}
 - group_by and projection: arrays of {{field, status, evidence}}; grouping is not filtering. Projection is what to SHOW,
   separate from where (for example "show room numbers" is projection, not a room filter).
 - aggregate, sort, limit, lookup: each has status and exact evidence.

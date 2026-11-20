@@ -23,7 +23,10 @@ from typing import Any
 import yaml
 
 from app.config import Settings
+from app.data.relations import plan_uses_family
 from app.data.repository import ResidentRepository
+from app.data.scope import facility_scope
+from app.engine.caller import CallerContext, use_caller
 from app.engine.describe import describe_plan
 from app.engine.executor import execute
 from app.engine.grounding import DateScan, check_plan, out_of_scope_terms, scan_question
@@ -34,6 +37,7 @@ from app.engine.semantic_cache import Compatibility, QuestionView, SemanticPlanC
 from app.engine.steps import StepTrace, reason_code
 from app.engine.stores import TTLCache
 from app.models.plan import QueryPlan, canonical_field
+from app.nlu import placeholders as ph
 from app.nlu.direct_query import DirectQueryBuilder
 from app.nlu.grammar import skeleton as grammar_skeleton
 from app.nlu.intent_router import DEFAULT_ROUTES_FILE, SemanticIntentRouter
@@ -159,8 +163,7 @@ def _compile_failure_message(failure: dict | None, mask: Any) -> str:
         return MODEL_DECLINED_MESSAGE
 
     def unmask(text: str) -> str:
-        originals = getattr(mask, "originals", {}) or {}
-        return re.sub(r"resident_\d+", lambda m: originals.get(m.group(0).lower(), m.group(0)), text)
+        return ph.unmask(text, getattr(mask, "all_originals", None) or getattr(mask, "originals", {}) or {})
 
     quotes = [unmask(q) for q in failure.get("quotes") or []][:2]
     shown = " and ".join(f'"{q}"' for q in quotes)
@@ -379,8 +382,16 @@ class QueryService:
         return self.index is not None
 
     # ------------------------------------------------------------------ main entry
-    async def handle(self, question: str, session_id: str | None = None) -> dict[str, Any]:
-        """Answer one question. Every pipeline step is logged as step-01 … step-19 (app/engine/steps.py)."""
+    async def handle(
+        self, question: str, session_id: str | None = None, caller: CallerContext | None = None
+    ) -> dict[str, Any]:
+        """Answer one question. Every pipeline step is logged as step-01 … step-19 (app/engine/steps.py).
+        `caller`: facility scope and family permissions (default: from Settings, today's unrestricted behaviour)."""
+        caller = caller or CallerContext.from_settings(self.settings)
+        with facility_scope(caller.facilities), use_caller(caller):
+            return await self._handle_scoped(question, session_id)
+
+    async def _handle_scoped(self, question: str, session_id: str | None) -> dict[str, Any]:
         query_id = f"q_{secrets.token_hex(6)}"
         received = time.perf_counter()
         trace = StepTrace(query_id, log)
@@ -432,7 +443,7 @@ class QueryService:
         today = self.settings.today()
         today_d = date.fromisoformat(today)
         trace.start("mask_names")
-        mask = self.index.mask(question)
+        mask = self.index.mask(question, family=self.settings.family_name_resolution_enabled)
         trace.record("mask_names", "ok", residents_masked=len(mask.placeholders),
                      ambiguous_names=sum(1 for ids in mask.placeholders.values() if len(ids) > 1))  # fmt: skip
         scan = scan_question(mask.text, today_d)
@@ -800,8 +811,10 @@ class QueryService:
         outcome = self._resolve(t)
         # A resident used as a caregiver/facility/room is a planning error a model can correct (the resident exists;
         # "couldn't find" would be wrong): one retry with that feedback.
-        if outcome.problem and outcome.problem.startswith(("role:", "invented:")) and t.tier == "llm" and outcome.hint:
-            trigger = "wrong_role" if outcome.problem.startswith("role:") else "invented_reference"
+        if outcome.problem and outcome.problem.startswith(("role:", "invented:", "unused:")) and t.tier == "llm" and outcome.hint:
+            trigger = {"role:": "wrong_role", "invented:": "invented_reference", "unused:": "unused_person"}[
+                outcome.problem.split(":")[0] + ":"
+            ]
             if await self._retry_once(t, outcome.hint, [outcome.problem], trigger=trigger):
                 outcome = self._resolve(t)
         plan = outcome.plan
@@ -881,6 +894,10 @@ class QueryService:
             # a text match ("starts with A") is not a slot the template cache can refill: storing it would keep "A"
             # literally and could serve it for "starts with B". Such plans are never stored as templates.
             and not plan.filters.has_text_match
+            # family CONDITIONS are not template slots (a relation "son" or a count "at least 3" would be kept literally
+            # and served for "daughter" / "at least 5"). Showing family members is fine: the resident is a slot and
+            # the attribute is fixed, like "what is X's room?"
+            and not plan_uses_family(plan.filters, sort_field=plan.sort.field if plan.sort else None)
             and not outcome.problem
             and not grounding_problems
             and g is not None
@@ -892,7 +909,7 @@ class QueryService:
         # Model-written text (a clarifying question or "not available" reason) may contain the resident_N placeholders
         # the model saw; show the user the names they actually typed instead.
         if plan.message and t.mask.originals:
-            plan.message = _unmask(plan.message, t.mask.originals)
+            plan.message = _unmask(plan.message, t.mask.all_originals)
 
         trace.start("execute_query")
         exec_started = time.perf_counter()
@@ -1044,7 +1061,9 @@ class QueryService:
         idx = self.index
         example_wing = sorted(idx.wings)[0] if idx.wings else None
         return SchemaContext(
-            idx.statuses, idx.care_types, list(relevant_wings or []), idx.caregiver_values(), example_wing
+            idx.statuses, idx.care_types, list(relevant_wings or []), idx.caregiver_values(), example_wing,
+            family_relations=list(idx.family_relations),
+            family_names=self.settings.family_name_resolution_enabled,
         )
 
     def _relevant_wings(self, masked: str, previous_json: str | None) -> list[str]:
@@ -1272,10 +1291,5 @@ def _redact_for_log(raw: Any) -> Any:
 
 
 def _unmask(text: str, originals: dict[str, str]) -> str:
-    """resident_1 / Resident_1 → the name the user typed for that placeholder."""
-    return re.sub(
-        r"\bresident_(\d+)\b",
-        lambda m: originals.get(f"resident_{m.group(1)}", m.group(0)),
-        text,
-        flags=re.IGNORECASE,
-    )
+    """resident_1 / family_1 / person_1 → the name the user typed for that placeholder."""
+    return ph.unmask(text, originals)

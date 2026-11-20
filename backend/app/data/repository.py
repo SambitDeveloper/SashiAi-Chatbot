@@ -6,6 +6,7 @@ from itertools import product
 from typing import Any, Protocol
 
 from app.data import text_match
+from app.data.relations import FAMILY_VIEW_FIELDS
 from app.data.schema_config import identity_fields, is_missing, list_fields
 from app.models.plan import Filters, GroupField, Sort
 
@@ -22,7 +23,17 @@ FIELD_MAP: dict[str, str] = {
     "created_date": "createdDate",
     "discharge_date": "dischargeDate",
     "last_name": "lastName",
+    # derived from the `family` relation (app/data/relations.py), present when a query uses them
+    "family_relation": "familyRelations",
+    "family_type": "familyTypes",
+    "family_flags": "familyFlags",
+    "family_count": "familyCount",
+    "family_members": "familyMembers",
+    "family_member": "familyIds",  # specific family members, by record id (resolved server side, never by name)
 }
+# the plan's set-valued fields, in the order both filter engines (matches / to_mongo_filter) apply them
+SET_FILTER_FIELDS = ("status", "care_type", "facility", "gender", "primary_caregiver", "room_number",
+                     "family_relation", "family_type", "family_flags", "family_member")  # fmt: skip
 
 Resident = dict[str, Any]
 
@@ -37,6 +48,9 @@ class Vocabulary:
     rooms: list[str] = field(default_factory=list)
     statuses: list[str] = field(default_factory=list)  # values present in the database (empty = unknown)
     care_types: list[str] = field(default_factory=list)
+    family_relations: list[str] = field(default_factory=list)  # normalised relation values (familymembers)
+    # family members of live residents for the entity index: {id, name, rel, relation, residentId, facilityId}
+    family_members: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -104,7 +118,7 @@ class ResidentRepository(Protocol):
     async def find(
         self, filters: Filters, sort: Sort | None = None, limit: int | None = None, fields: list[str] | None = None
     ) -> list[Resident]: ...
-    async def find_by_ids(self, resident_ids: list[str]) -> list[Resident]: ...
+    async def find_by_ids(self, resident_ids: list[str], contacts: bool = True) -> list[Resident]: ...
     async def group_count(self, filters: Filters, fields: list[GroupField]) -> list[GroupRow]: ...
     async def aggregate(self, filters: Filters, op: str, field_name: str) -> float | None: ...
     async def group_aggregate(
@@ -120,7 +134,7 @@ def matches(record: Resident, filters: Filters) -> bool:
     Within one field, `include` OR `missing: true`; `exclude` and `missing: false` are AND-ed. What counts as missing
     comes from resident_schema.yaml (schema_config.is_missing), the same source the MongoDB filter uses.
     """
-    for plan_field in ("status", "care_type", "facility", "gender", "primary_caregiver", "room_number"):
+    for plan_field in SET_FILTER_FIELDS:
         f = getattr(filters, plan_field)
         if f is None:
             continue
@@ -142,6 +156,8 @@ def matches(record: Resident, filters: Filters) -> bool:
     checks: list[tuple[str, Any, Any, Any]] = []
     if filters.age:
         checks.append(("age", filters.age, filters.age.min, filters.age.max))
+    if filters.family_count:
+        checks.append(("familyCount", filters.family_count, filters.family_count.min, filters.family_count.max))
     for plan_field in ("admission_date", "created_date", "discharge_date"):
         r = getattr(filters, plan_field)
         if r is not None:
@@ -202,4 +218,7 @@ def list_view(record: Resident) -> Resident:
     """Bulk results never include emergency contact details; those are only returned for one resident."""
     out = dict(record)
     out["emergencyContact"] = {"name": "", "relationship": "", "phone": ""}
+    for key in FAMILY_VIEW_FIELDS:  # family details only when asked for (projection) or for one resident
+        if key != "familyCount":  # the number of family members is not personal data (shown when it was joined)
+            out.pop(key, None)
     return out

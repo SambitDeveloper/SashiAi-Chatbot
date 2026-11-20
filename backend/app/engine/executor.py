@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from itertools import product
 
+from app.data.relations import FAMILY_SELECTORS
 from app.data.repository import (
     FIELD_MAP,
     MISSING_GROUP,
@@ -17,6 +18,7 @@ from app.data.repository import (
     project,
 )
 from app.data.schema_config import output_fields
+from app.engine.caller import current_caller
 from app.models.plan import QueryPlan
 
 SAMPLE_SIZE = 25
@@ -52,9 +54,20 @@ async def execute(plan: QueryPlan, repo: ResidentRepository) -> ExecutionData:
 
     if plan.action == "lookup":
         ids = plan.lookup.residents
-        found = await repo.find_by_ids(ids)
+        caller = current_caller()
+        shown = set(plan.output_fields)
+        # family phone / email are read only when the answer shows them AND the caller may see them
+        contacts = caller.can_read_family_contacts and bool(shown & {"family_members", "emergency_contact"})
+        found = await repo.find_by_ids(ids, contacts=contacts)
         order = {rid.upper(): i for i, rid in enumerate(ids)}
         found.sort(key=lambda r: order.get(r["residentId"].upper(), 0))
+        # family filters on a lookup that SHOWS family select which members are shown; every other filter (and family
+        # filters when no family detail is asked: "is X a family member of R?") stays the yes/no check
+        select = {n: getattr(f, n) for n in FAMILY_SELECTORS if getattr(f, n) is not None}
+        if select and shown & {"family_members", "family_relationship"}:
+            found = [{**r, "familyContacts": [c for c in r.get("familyContacts") or [] if _member_selected(c, select)]}
+                     for r in found]  # fmt: skip
+            f = f.model_copy(update=dict.fromkeys(select))
         checks = [matches(r, f) for r in found] if not f.is_empty() else None
         return ExecutionData(total=total, matched=len(found), rows=found, looked_up=found, checks=checks)
 
@@ -108,6 +121,17 @@ async def execute(plan: QueryPlan, repo: ResidentRepository) -> ExecutionData:
         return ExecutionData(total=total, matched=matched, rows=rows)
 
     return ExecutionData(total=total)
+
+
+def _member_selected(contact: dict, select: dict) -> bool:
+    """One family member against the lookup's family selectors (same normalised values as the filters)."""
+    for name, cond in select.items():
+        value = {"family_member": contact.get("id"), "family_relation": contact.get("rel"), "family_type": contact.get("type")}[name]
+        if cond.include and value not in cond.include:
+            return False
+        if cond.exclude and value in cond.exclude:
+            return False
+    return True
 
 
 def _include_empty_groups(groups: list[GroupRow], plan: QueryPlan) -> list[GroupRow]:

@@ -3,6 +3,7 @@ comes from the database results, never from the language model."""
 
 from typing import Any
 
+from app.data.relations import FAMILY_VIEW_FIELDS
 from app.data.repository import Resident
 from app.data.schema_config import output_fields
 from app.engine.describe import (
@@ -61,6 +62,26 @@ def _readable(r: Resident) -> Resident:
     return out
 
 
+def _public(r: Resident) -> Resident:
+    """A resident row as it may appear in a response: family details only through the answer text (and only what was
+    asked), never record ids or contact lists in the raw row. The number of family members is not personal data."""
+    return {k: v for k, v in r.items() if k not in FAMILY_VIEW_FIELDS or k == "familyCount"}
+
+
+def _contacts(r: Resident) -> list[dict]:
+    value = r.get("familyContacts")
+    return [m for m in value if isinstance(m, dict)] if isinstance(value, list) else []
+
+
+def _contact_text(m: dict) -> str:
+    """One family member for ONE resident's answer: name (relation), phone, email — whatever is recorded."""
+    parts = [f"{m.get('name') or NOT_RECORDED}" + (f" ({m['relation']})" if m.get("relation") else "")]
+    parts += [m[k] for k in ("phone", "email") if m.get(k)]
+    if m.get("type") == "emergency":
+        parts.append("emergency contact")
+    return " · ".join(parts)
+
+
 def spotlight(r: Resident, attribute: str) -> dict[str, Any]:
     """One asked-for fact about one resident. The answer states ONLY that fact (data minimisation, 2026-11-19: a
     caregiver question used to also show the room and facility); the supporting line just says whose fact it is."""
@@ -90,7 +111,32 @@ def spotlight(r: Resident, attribute: str) -> dict[str, Any]:
             c = r["emergencyContact"]
             relation = f" ({c['relationship']})" if c.get("relationship") else ""
             phone = f"Phone: {c['phone']}." if c.get("phone") else None  # part of the contact that was asked for
+            # both sources, labelled: the resident record's own contact AND family members recorded as emergency
+            family = [m for m in _contacts(r) if m.get("type") == "emergency"]
+            if family:
+                extra = "Family emergency contacts: " + "; ".join(_contact_text(m) for m in family) + "."
+                phone = f"{phone} {extra}" if phone else extra
             return fact("Emergency Contact", f"{c.get('name') or NOT_RECORDED}{relation}", phone)
+        case "family_members":
+            people = _contacts(r)
+            if not people:
+                return fact("Family Members", "No family members recorded")
+            return fact("Family Members", "; ".join(_contact_text(m) for m in people),
+                        f"{len(people)} family member{'s' if len(people) != 1 else ''} of {name}.")  # fmt: skip
+        case "family_count":
+            return fact("Number of Family Members", r.get("familyCount", 0))
+        case "family_relationship":
+            people = _contacts(r)  # already narrowed to the selected family member(s) by the executor
+            if not people:
+                return fact("Relationship", f"No matching family member is recorded for {name}")
+            sentences = []
+            for m in people:
+                relation = (m.get("relation") or "").strip()
+                if not relation or relation.lower() == "other":
+                    sentences.append(f"{m.get('name')} is listed as a family contact of {name}" + (f" ({relation})" if relation else "") + ".")
+                else:
+                    sentences.append(f"{m.get('name')} is {name}'s {relation.lower()}.")
+            return fact("Relationship", " ".join(sentences), " ".join(sentences))
         case "status":
             return fact("Status", status_label(r.get("status")))
         case "care_type":
@@ -172,8 +218,8 @@ def build_response(plan: QueryPlan, data: ExecutionData) -> dict[str, Any]:
                 "summaryText": f"{_name(r)} ({r['residentId']}) {'matches' if ok else 'does not match'} {filter_text}. "
                 f"Current record: {status_label(r.get('status'))}, {care_label(r.get('careType'))}, room {_readable(r)['roomNumber']} ({_readable(r)['wing']}).",
                 "count": 1,
-                "matchedResident": r,
-                "residentsSample": [r],
+                "matchedResident": _public(r),
+                "residentsSample": [_public(r)],
             }
         if len(people) > 1:
             shown = attrs or ["status", "care_type", "room_number", "primary_caregiver"]
@@ -189,7 +235,7 @@ def build_response(plan: QueryPlan, data: ExecutionData) -> dict[str, Any]:
                 "multiSpotlight": multi,
             }
             if not attrs:  # a general comparison shows the profiles; asked-for facts send only those facts
-                out |= {"matchedResidents": people, "residentsSample": people}
+                out |= {"matchedResidents": [_public(p) for p in people], "residentsSample": [_public(p) for p in people]}
             return out
         r = people[0]
         if not attrs:
@@ -199,8 +245,8 @@ def build_response(plan: QueryPlan, data: ExecutionData) -> dict[str, Any]:
                 "summaryText": f"{_name(d)} ({d['residentId']}), age {d['age']}, room {d['roomNumber']} ({d['wing']}). "
                 f"Caregivers: {d['primaryCaregiver']}. Admitted: {d['admissionDate']}.",
                 "count": 1,
-                "matchedResident": r,
-                "residentsSample": [r],
+                "matchedResident": _public(r),
+                "residentsSample": [_public(r)],
             }
         # Specific facts were asked for: answer with exactly those, not the resident's whole record (data minimisation).
         spots = [spotlight(r, a) for a in attrs]

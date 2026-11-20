@@ -115,6 +115,8 @@ direct:
   # also match with a small typo ("staus" → status).
   lookup_attributes:
     room_number: [room, room number, unit, unit number, bed]
+    family_members: [family members, family member, family contacts, family contact, relatives]
+    family_count: [number of family members, family member count, family count, how many family members]
     primary_caregiver: [primary caregiver, primary caregivers, caregiver, caregivers, caretaker, caretakers, carer, nurse, aide, assigned staff, looks after, look after, cares for]
     admission_date: [admitted, admission, admission date, joined, moved in]
     discharge_date: [discharged, discharge, discharge date]

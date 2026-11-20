@@ -17,7 +17,9 @@ Rules, applied to the masked question (resident names already replaced by reside
 import re
 from dataclasses import dataclass, field
 
-_WORD = re.compile(r"resident_\d+|res[-_ ]?\d{3,6}|[a-z]+(?:'[a-z]+)?")
+from app.nlu import placeholders as ph
+
+_WORD = re.compile(ph.TOKEN + r"|res[-_ ]?\d{3,6}|[a-z]+(?:'[a-z]+)?")
 _PLACEHOLDER = re.compile(r"^(?:resident_\d+|res[-_ ]?\d{3,6})$")
 
 

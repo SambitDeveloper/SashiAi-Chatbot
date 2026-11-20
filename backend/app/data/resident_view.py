@@ -14,8 +14,17 @@ from typing import Any
 
 import yaml
 
-from app.data import text_match
-from app.data.repository import FIELD_MAP, MISSING_GROUP, GroupAggregateRow, GroupRow, Resident, Vocabulary
+from app.data import scope, text_match
+from app.data.relations import FAMILY_VIEW_FIELDS, family_relation, plan_uses_family
+from app.data.repository import (
+    FIELD_MAP,
+    MISSING_GROUP,
+    SET_FILTER_FIELDS,
+    GroupAggregateRow,
+    GroupRow,
+    Resident,
+    Vocabulary,
+)
 from app.data.schema_config import identity_fields, list_fields, missing_markers
 from app.models.plan import Filters, GroupField, Sort
 
@@ -45,7 +54,7 @@ def to_mongo_filter(filters: Filters) -> dict[str, Any]:
     """
     q: dict[str, Any] = {}
     extra: list[dict[str, Any]] = []  # clauses that need $or / a second condition on the same field
-    for plan_field in ("status", "care_type", "facility", "gender", "primary_caregiver", "room_number"):
+    for plan_field in SET_FILTER_FIELDS:
         f = getattr(filters, plan_field)
         if f is None:
             continue
@@ -74,6 +83,8 @@ def to_mongo_filter(filters: Filters) -> dict[str, Any]:
     ranges: list[tuple[str, Any, Any, Any]] = []
     if filters.age:
         ranges.append(("age", filters.age, filters.age.min, filters.age.max))
+    if filters.family_count:
+        ranges.append(("familyCount", filters.family_count, filters.family_count.min, filters.family_count.max))
     for plan_field in ("admission_date", "created_date", "discharge_date"):
         r = getattr(filters, plan_field)
         if r is not None:
@@ -82,7 +93,8 @@ def to_mongo_filter(filters: Filters) -> dict[str, Any]:
             ranges.append((FIELD_MAP[plan_field], r, lo, hi))
     for field, r, lo, hi in ranges:
         if r.has_range:
-            cond = {"$exists": True, "$ne": None} if field == "age" else {"$exists": True, "$nin": [None, ""]}
+            numeric = field in ("age", "familyCount")
+            cond = {"$exists": True, "$ne": None} if numeric else {"$exists": True, "$nin": [None, ""]}
             if lo is not None:
                 cond["$gte"] = lo
             if hi is not None:
@@ -111,6 +123,31 @@ class ResidentView:
 
     @cached_property
     def stages(self) -> list[dict]:
+        """The view without related collections (every query that does not use them)."""
+        return self._stages(False)
+
+    @cached_property
+    def stages_with_family(self) -> list[dict]:
+        """The view plus the `family` relation's join and derived fields (app/data/relations.py), no contact details."""
+        return self._stages(True, contacts=False)
+
+    @cached_property
+    def stages_with_family_contacts(self) -> list[dict]:
+        """As stages_with_family, plus each family member's phone and email (one resident's answer that shows them)."""
+        return self._stages(True, contacts=True)
+
+    def stages_for(self, family: bool, contacts: bool = False) -> list[dict]:
+        """The view stages for one query, with the request's facility scope (app/data/scope.py) right after the base
+        match, so every count, list and lookup of the request is limited alike."""
+        if family and family_relation() is not None:
+            stages = self.stages_with_family_contacts if contacts else self.stages_with_family
+        else:
+            stages = self.stages
+        scoped = scope.mongo_match()
+        return [stages[0], scoped, *stages[1:]] if scoped else stages
+
+    def _stages(self, family: bool, contacts: bool = False) -> list[dict]:
+        rel = family_relation() if family else None
         stages: list[dict] = [{"$match": dict(self.config.get("match") or {})}]
         for join in self.config.get("joins") or []:
             stages.append(
@@ -124,20 +161,29 @@ class ResidentView:
                     }
                 }
             )
+        if rel is not None:
+            stages.append(rel.lookup_stage)
         # $project both computes the app fields and drops every other field (whitelist)
-        stages.append({"$project": {"_id": 0, **self.fields}})
+        stages.append({"$project": {"_id": 0, **self.fields, **(rel.fields(contacts) if rel is not None else {})}})
         return stages
 
-    def pipeline(self, filters: Filters | None, *tail: dict) -> list[dict]:
+    def pipeline(self, filters: Filters | None, *tail: dict, family: bool = False) -> list[dict]:
+        """`family`: also join the family relation (added automatically when the filters use it)."""
         match = to_mongo_filter(filters) if filters is not None else {}
-        return [*self.stages, *([{"$match": match}] if match else []), *tail]
+        family = family or plan_uses_family(filters)
+        return [*self.stages_for(family), *([{"$match": match}] if match else []), *tail]
+
+    def base_stages(self) -> list[dict]:
+        """The resident base match plus the request's facility scope (no joins, no mapping)."""
+        scoped = scope.mongo_match()
+        return [self.base_match, *([scoped] if scoped else [])]
 
     @property
     def base_match(self) -> dict:
         """Which documents are residents at all (e.g. not soft-deleted): the first stage of every query."""
         return {"$match": dict(self.config.get("match") or {})}
 
-    def id_pipeline(self, resident_ids: list[str], *tail: dict) -> list[dict]:
+    def id_pipeline(self, resident_ids: list[str], *tail: dict, family: bool = True, contacts: bool = True) -> list[dict]:
         """Only the requested residents, narrowed BEFORE the joins and field mapping.
 
         Matching after them (as `pipeline` does for filters on computed fields) joins and maps every resident just to
@@ -147,12 +193,14 @@ class ResidentView:
         wanted = sorted({i.upper() for i in resident_ids})
         id_expr = self.fields["residentId"]
         early = {"$match": {"$expr": {"$in": [{"$toUpper": id_expr}, wanted]}}}
-        return [self.stages[0], early, *self.stages[1:], *tail]
+        stages = self.stages_for(family, contacts)  # one resident's answer may show their family: these few only
+        return [stages[0], early, *stages[1:], *tail]
 
     def display_stage(self, only: list[str] | None = None) -> dict | None:
         """List fields are joined into one text for display ("Nurse A, Aide B") after filtering. With a projection
-        (`only`), just the projected list fields (a $set would otherwise add fields the projection left out)."""
-        fields = [f for f in self.list_fields if only is None or f in only]
+        (`only`), just the projected list fields (a $set would otherwise add fields the projection left out). The
+        family lists are shown only when projected (the default result shape never carries family details)."""
+        fields = [f for f in self.list_fields if (f in only if only is not None else f not in FAMILY_VIEW_FIELDS)]
         if not fields:
             return None
         return {
@@ -192,7 +240,7 @@ class ViewRepository:
 
     async def total(self) -> int:
         # The census needs no joins or computed fields: count the resident documents directly.
-        rows = await self._aggregate([self.view.base_match, {"$count": "n"}])
+        rows = await self._aggregate([*self.view.base_stages(), {"$count": "n"}])
         return int(rows[0]["n"]) if rows else 0
 
     async def count(self, filters: Filters) -> int:
@@ -213,17 +261,21 @@ class ViewRepository:
                 {"$unset": "_missing"},
             ]
         tail.append({"$limit": min(limit or self._max_rows, self._max_rows)})
+        family = plan_uses_family(filters, fields, sort.field if sort else None)
         if fields is not None:  # projection after filtering/sorting/limiting; mirrors repository.project
             tail.append({"$project": {k: 1 for k in dict.fromkeys([*identity_fields(), *fields])}})
-            return await self._aggregate(self.view.pipeline(filters, *tail, *self._out(only=fields)))
-        return await self._aggregate(self.view.pipeline(filters, *tail, *self._out()))
+            return await self._aggregate(self.view.pipeline(filters, *tail, *self._out(only=fields), family=family))
+        return await self._aggregate(self.view.pipeline(filters, *tail, *self._out(), family=family))
 
-    async def find_by_ids(self, resident_ids: list[str]) -> list[Resident]:
+    async def find_by_ids(self, resident_ids: list[str], contacts: bool = True) -> list[Resident]:
+        """`contacts`: also read family members' phone and email (only when the answer may show them)."""
         if not resident_ids:
             return []
         # ids are compared without case: the name index keeps them upper-case, MongoDB ObjectIds are lower-case hex.
         # The id match runs before the joins, so only the requested residents are joined and mapped.
-        return await self._aggregate(self.view.id_pipeline(resident_ids, {"$limit": len(resident_ids)}, *self._out()))
+        return await self._aggregate(
+            self.view.id_pipeline(resident_ids, {"$limit": len(resident_ids)}, *self._out(), contacts=contacts)
+        )
 
     def _grouping(self, fields: list[GroupField]) -> tuple[list[dict], dict]:
         """$unwind stages for list fields + the group _id, with the missing-value rule of repository.MISSING_GROUP:
@@ -308,9 +360,10 @@ class ViewRepository:
                 "rooms": distinct("roomNumber"),
                 "statuses": distinct("status"),
                 "care_types": distinct("careType"),
+                "family_relations": distinct("familyRelations"),
             }
         }
-        rows = await self._aggregate(self.view.pipeline(None, facet))
+        rows = await self._aggregate(self.view.pipeline(None, facet, family=True))
         data = rows[0] if rows else {}
 
         def values(key: str) -> list[str]:
@@ -326,4 +379,16 @@ class ViewRepository:
             rooms=values("rooms"),
             statuses=values("statuses"),
             care_types=values("care_types"),
+            family_relations=values("family_relations"),
+            family_members=await self.family_vocabulary(),
         )
+
+    async def family_vocabulary(self) -> list[dict]:
+        """Every live resident's family members for the entity index: names and relations only, never contacts.
+        Not facility-scoped here: candidates are filtered by the request's scope when a name is resolved."""
+        rel = family_relation()
+        if rel is None:
+            return []
+        rows = await self._aggregate([self.view.base_match, *rel.vocabulary_pipeline_tail])
+        return [{**m, "residentId": r["residentId"], "facilityId": r.get("facilityId")}
+                for r in rows for m in r.get("members") or []]  # fmt: skip

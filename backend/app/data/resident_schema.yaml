@@ -122,7 +122,68 @@ fields:
     phone: {$literal: ""}
 
 # 4. Fields that are lists in the database (a resident has several staff). Grouping by them counts each value.
-list_fields: [primaryCaregiver]
+#    The family* lists are derived from the `family` relation below (any family member has that value).
+list_fields: [primaryCaregiver, familyRelations, familyTypes, familyFlags, familyMembers, familyIds]
+
+# 4b. Related collections (one-to-many, joined on the resident's record id). A relation is joined ONLY when a question
+#     uses one of its fields, and contributes resident-level fields derived from all of the resident's records, so a
+#     resident is still exactly one row. Semantics (normalisation, flags, display) live in app/data/relations.py, which
+#     builds both the MongoDB stages and the identical in-memory derivation.
+relations:
+  family:
+    collection: familymembers
+    local_field: _id                  # residents._id (ObjectId); the app's residentId is its string form
+    foreign_field: residentId         # familymembers.residentId is an ObjectId (all 385 staging records, indexed)
+    max_per_resident: 20              # staging max is 10
+    # contacts recorded as the resident themself are not family members
+    exclude_relations: [self]
+    # recorded spellings → one value (no data is changed; matching uses the normalised value)
+    relation_aliases:
+      granddaugter: granddaughter
+      daughter in law: daughter-in-law
+      daughter-in-law: daughter-in-law
+      son in law: son-in-law
+      sister in law: sister-in-law
+      brother in law: brother-in-law
+      ex wife: ex-wife
+      emergency: other
+      family: other
+    # what a question's word means: "spouse" matches spouse, wife or husband; "children" matches son, daughter, child
+    relation_terms:
+      spouse: [spouse, wife, husband]
+      partner: [spouse, wife, husband]
+      wife: [wife, spouse]
+      husband: [husband, spouse]
+      child: [son, daughter, child]
+      children: [son, daughter, child]
+      kid: [son, daughter, child]
+      kids: [son, daughter, child]
+      parent: [mother, father]
+      parents: [mother, father]
+      mom: [mother]
+      mum: [mother]
+      dad: [father]
+      sibling: [brother, sister]
+      siblings: [brother, sister]
+      grandchild: [grandson, granddaughter]
+      grandchildren: [grandson, granddaughter]
+      in-law: [daughter-in-law, son-in-law, sister-in-law, brother-in-law]
+    # words that mean the question is about family (grounding: such a question must use a family field, and a
+    # family field needs one of these words)
+    cue_words: [family, families, relative, relatives, son, sons, daughter, daughters, spouse, spouses, wife, husband,
+                partner, brother, brothers, sister, sisters, sibling, siblings, mother, mom, mum, father, dad, parent,
+                parents, child, children, kids, grandson, granddaughter, grandchild, grandchildren, niece, nephew,
+                aunt, uncle, cousin, guardian, guardians, in-law, in-laws, guarantor, guarantors, portal access,
+                app access, health access, next of kin, family contact, family contacts]
+    # weaker words: family wording ONLY when the question also names a family member (family_N / person_N), so
+    # "status-related questions" stays a non-family question
+    weak_cue_words: [relationship, relationships, related, relation, relations, kin, kinship]
+    # access flags: true on ANY family member of the resident
+    flags:
+      portal_access: hasPortalAccess
+      app_access: isAuthorizedAppAccess
+      health_access: healthAccess
+      guarantor: pcc_is_guarantor
 
 # 5. Values the mapping above uses to mean "not recorded" for a field, besides null, an absent field, "" and an empty
 #    list (which always count as missing). Used by `missing: true/false` filters, identically in MongoDB and in the
@@ -150,8 +211,12 @@ output_fields:
   discharge_date: dischargeDate
   resident_id: residentId
   emergency_contact: emergencyContact
+  family_members: familyMembers       # names + relations; for ONE resident the answer also shows phone and email
+  family_count: familyCount
+  family_relationship: familyContacts  # how the selected family member is related: one resident's answer only
 identity_fields: [residentId, id, firstName, lastName]
-single_record_only: [emergencyContact]
+# familyContacts (phone, email per family member) never appears in a multi-resident result
+single_record_only: [emergencyContact, familyContacts]
 
 # 7. Identities, kept distinct (they must not be used interchangeably):
 #    record   — MongoDB `_id`: the stable identity of a stored record (references, duplicate detection).

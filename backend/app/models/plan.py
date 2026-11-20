@@ -14,7 +14,10 @@ Status = Literal["active", "away", "inactive", "pending", "admitted", "discharge
 CareType = Literal["assisted_living", "memory_care", "independent_living", "skilled_nursing", "respite_care"]
 Gender = Literal["Female", "Male", "Other"]
 GroupField = Literal["status", "care_type", "facility", "gender", "primary_caregiver"]
-SortField = Literal["admission_date", "created_date", "discharge_date", "age", "last_name"]
+SortField = Literal["admission_date", "created_date", "discharge_date", "age", "last_name", "family_count"]
+# Family relation (familymembers; app/data/relations.py): the kinds of contact and the access flags of ANY member.
+FamilyType = Literal["family", "emergency"]
+FamilyFlag = Literal["portal_access", "app_access", "health_access", "guarantor"]
 Attribute = Literal[
     "primary_caregiver",
     "room_number",
@@ -28,6 +31,9 @@ Attribute = Literal[
     "care_type",
     "age",
     "gender",
+    "family_members",  # names + relations; one resident's answer also shows phone and email
+    "family_count",
+    "family_relationship",  # how the selected family member(s) are related to ONE looked-up resident
 ]
 Action = Literal["count", "list", "breakdown", "aggregate", "lookup", "clarify", "unsupported", "help"]
 
@@ -105,6 +111,29 @@ class SetFilter[T](_Strict):
         return bool(self.starts_with or self.contains)
 
 
+class CountRange(_Strict):
+    """A number of related records per resident (always known: 0 when none is recorded). min/max are inclusive."""
+
+    min: int | None = Field(default=None, ge=0, le=100)
+    max: int | None = Field(default=None, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def _order(self):
+        if self.min is None and self.max is None:
+            raise ValueError("count range needs min or max")
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ValueError("count min is greater than max")
+        return self
+
+    @property
+    def has_range(self) -> bool:
+        return True
+
+    @property
+    def missing(self) -> None:  # a count is never "not recorded" (shared range code reads .missing)
+        return None
+
+
 class AgeRange(_Strict):
     """min/max bound the age; `missing: true` adds "or no age recorded"; `missing: false` alone means "age recorded"."""
 
@@ -174,10 +203,18 @@ class Filters(_Strict):
     admission_date: DateRange | None = None
     created_date: DateRange | None = None
     discharge_date: DateRange | None = None
+    # family relation (familymembers): relations / kinds / access flags of ANY member, and the number of members
+    family_relation: SetFilter[str] | None = None
+    family_type: SetFilter[FamilyType] | None = None
+    family_flags: SetFilter[FamilyFlag] | None = None
+    family_count: CountRange | None = None
+    # specific family members, as familymembers record ids (resolved by the backend from family_N / person_N
+    # placeholders; a model never writes an id or a name here)
+    family_member: SetFilter[str] | None = None
 
     @model_validator(mode="after")
     def _text_match_fields(self):
-        for name in ("status", "care_type", "gender"):
+        for name in ("status", "care_type", "gender", "family_relation", "family_type", "family_flags", "family_member"):
             sf = getattr(self, name)
             if sf is not None and sf.has_text_match:
                 raise ValueError(f"starts_with/contains apply only to {', '.join(TEXT_MATCH_FIELDS)}, not {name}")

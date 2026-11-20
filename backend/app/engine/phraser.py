@@ -23,6 +23,7 @@ from typing import Any
 
 from app.engine.describe import describe_filters
 from app.models.plan import QueryPlan
+from app.nlu import placeholders as ph
 from app.nlu.translator import TranslatorUnavailable
 
 log = logging.getLogger(__name__)
@@ -132,7 +133,7 @@ def check(text: str, facts: str, question: str, response: dict[str, Any]) -> str
         return "length"
     if len(text.split()) < 4:  # a bare value repeats the headline and drops what it refers to
         return "too_short"
-    if re.search(r"[*#`|_]|\bresident_\d", text) or "<think>" in text:
+    if re.search(r"[*#`|_]", text) or ph.ANY_IN_TEXT.search(text) or "<think>" in text:
         return "format"
     allowed_numbers = _numbers(facts)
     if any(n not in allowed_numbers for n in _numbers(text)):
