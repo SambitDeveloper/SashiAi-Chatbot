@@ -244,6 +244,23 @@ def build_response(plan: QueryPlan, data: ExecutionData) -> dict[str, Any]:
         if data.checks is not None and len(people) == 1:
             r, ok = people[0], data.checks[0]
             actual = _checked_values(plan, r)
+            f = plan.filters
+            if f.staff_name is not None and f.staff_name.include and f.model_dump(exclude_none=True).keys() == {"staff_name"}:
+                # "Is Jone part of Sagar Dodia's care team?": said as membership, not "matches Staff member: Jone"
+                wanted = set(f.staff_name.include)
+                on_team = [m for m in r.get("careTeamMembers") or [] if m.get("name") in wanted]
+                if ok and on_team:  # name who was found, with the designation: "Jone (Transport Driver)"
+                    who = ", ".join(dict.fromkeys(m["name"] + (f" ({m['designation']})" if m.get("designation") else "")
+                                                  for m in on_team))  # fmt: skip
+                else:
+                    who = " or ".join(dict.fromkeys({n.lower(): n for n in f.staff_name.include}.values()))
+                return {
+                    "headline": f"{'Yes' if ok else 'No'} — {who}",
+                    "summaryText": f"{who} {'is' if ok else 'is not'} on {_name(r)}'s care team ({r['residentId']}).",
+                    "count": 1,
+                    "matchedResident": _public(r),
+                    "residentsSample": [_public(r)],
+                }
             return {
                 "headline": f"{'Yes' if ok else 'No'} — {_name(r)}" + (f" · {actual}" if actual else ""),
                 "summaryText": f"{_name(r)} ({r['residentId']}) {'matches' if ok else 'does not match'} {filter_text}. "

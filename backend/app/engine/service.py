@@ -38,7 +38,7 @@ from app.engine.responder import HELP_OPTIONS, build_response
 from app.engine.semantic_cache import Compatibility, QuestionView, SemanticPlanCache
 from app.engine.steps import StepTrace, reason_code
 from app.engine.stores import TTLCache
-from app.models.plan import STAFF_RELATION_FIELDS, STAFF_SINGLE_RECORD, QueryPlan, canonical_field
+from app.models.plan import STAFF_RELATION_FIELDS, QueryPlan, canonical_field
 from app.nlu import placeholders as ph
 from app.nlu.direct_query import DirectQueryBuilder
 from app.nlu.grammar import skeleton as grammar_skeleton
@@ -651,6 +651,10 @@ class QueryService:
                 out = resolve_plan(candidate, self.index, t.mask, t.question)
                 if out.problem:
                     return f"resolve:{reason_code(out.problem)}"
+                if t.mask.placeholders and not (out.plan.lookup and out.plan.lookup.residents):
+                    # the question names a resident the template never looks up ("Is Hogan Jone on Sagar Dodia's care
+                    # team?" is not "residents of Hogan Jone"): another question's plan, never this one's
+                    return "grounding:resident_unused"
                 checked = self._ground(out.plan, t.question, t.mask, t.scan, None, False, t.structure)
                 if not checked.ok:  # counts only: the problem texts can quote names or values
                     return (f"grounding:missing={len(checked.missing)},invented={len(checked.invented)},"
@@ -1303,10 +1307,22 @@ class QueryService:
         trace.skip_until("fast_path", "question about one named person")
         # one person's details only (phone, email, assigned residents): several matching staff → ask which one, never
         # an answer listing blanks ("Jone: | Jone:")
-        one_record = any(a in STAFF_SINGLE_RECORD for a, _ in asked.attributes)
+        one_record = bool(asked.sections) or any(a in people.ONE_PERSON_ATTRIBUTES for a, _ in asked.attributes)
         single = len(kinds) == 1 and (kinds[0] == "staff" and not one_record and len({s["name"] for s in found["staff"]}) <= 5
                                       or len(found[kinds[0]]) == 1)  # fmt: skip
-        if single:
+        access = None
+        if single and asked.sections:  # app permissions of ONE staff member (yes / no per section asked)
+            person = found["staff"][0]
+            records = await self.repo.staff_access(person["name"], person["designation"])
+            if len(records) == 1:
+                access = people.access_answer(asked, person, records[0])
+            else:
+                single = False  # two records with the same name AND designation: never guess whose permissions
+        if access is not None:
+            plan = QueryPlan(action="lookup", entity="staff", lookup={"staff": [found["staff"][0]["name"]]})
+            trace.record("fast_path", "answered", method="person name", kind="staff", sections=len(asked.sections))
+            response, matched, total, subject = access, 1, 1, "staff"
+        elif single:
             kind = kinds[0]
             plan = people.plan_for(asked, kind, found[kind])
             trace.record("fast_path", "answered", method="person name", kind=kind)

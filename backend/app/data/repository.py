@@ -35,11 +35,12 @@ FIELD_MAP: dict[str, str] = {
     "staff_role": "staffRoles",
     "staff_designation": "staffDesignations",
     "staff_count": "staffCount",
+    "staff_name": "staffNames",  # any assigned staff member (recorded names, resolved by the backend)
 }
 # the plan's set-valued fields, in the order both filter engines (matches / to_mongo_filter) apply them
 SET_FILTER_FIELDS = ("status", "care_type", "facility", "gender", "primary_caregiver", "room_number",
                      "family_relation", "family_type", "family_flags", "family_member", "staff_role",
-                     "staff_designation")  # fmt: skip
+                     "staff_designation", "staff_name")  # fmt: skip
 
 Resident = dict[str, Any]
 

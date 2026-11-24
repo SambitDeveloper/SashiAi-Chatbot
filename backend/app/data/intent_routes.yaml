@@ -118,7 +118,9 @@ direct:
     fillers: [who, "who's", whom, whose, what, "what's", which, is, are, was, were, does, do, did, the, a, an, of, for,
               to, at, in, on, with, me, my, us, tell, about, show, give, get, find, look, up, lookup, details, detail,
               info, information, profile, please, currently, current, his, her, their, s, belong, belongs, works, work,
-              working, "'s", there, any, all, list, or, staying, stay, stays, live, lives, living, located, kept, placed]
+              working, "'s", there, any, all, list, or, staying, stay, stays, live, lives, living, located, kept, placed,
+              and, can, could, you, please, assigned, associated, receive, receives, receiving, he, she, him, they,
+              them, has, have, having, i, see]
     # a word naming the kind of person narrows the search ("staff member Jone")
     kinds:
       resident: [resident, patient]
@@ -135,12 +137,56 @@ direct:
       staff_phone: [phone, phones, phone number, phone numbers, mobile, contact number, country code,
                     phone country code, dial code, dialing code, calling code, phone code]
       staff_email: [email, emails, email address, email addresses, mail]
+      # both of the above, for one staff member
+      staff_contact: [contact details, contact detail, contact info, contact information, contacts, contact]
     # attributes both residents and staff have: the person decides which one is meant
     shared_attributes:
       facility: [facility, facilities, wing, building]
       status: [status]
     family_attributes:
       family_relationship: [relationship, related, relation]
+    # "Can Jone access the transport calendar?": yes / no per section of ONE staff member's app permissions
+    # (accessPermissions: allowed and readable; a child section also needs its parent). Only asked sections are
+    # answered, never the whole permission set or write access. A question is about permissions only when it has one
+    # of these words; section words then take precedence over other attribute words ("residents" is the section).
+    permissions:
+      cues: [access, accessible, permission, permissions, allowed, permitted, rights, authorised, authorized]
+      fillers: [section, sections, module, modules, page, pages, tab, tabs, area, areas, screen, screens, feature,
+                features, menu, app, application, use, open, view, see, management, manage]
+      # app permission name (as recorded) → the words that name it
+      sections:
+        Residents: [residents, resident, residents list, resident list]
+        residents-list: [residents list page, resident list page]
+        resident-details: [resident details, resident detail, resident profile]
+        resident-documents: [resident documents, resident document, documents]
+        Transport: [transport, transportation, rides]
+        transport-requests: [transport requests, transport request, ride requests]
+        transport-calendar: [transport calendar, transportation calendar]
+        complimentary: [complimentary transport, complimentary rides, complimentary]
+        Staff: [staff, staff management, staff directory, staff members]
+        Dashboard: [dashboard]
+        KPI Dashboard: [kpi dashboard, kpi]
+        Messages: [messages, messaging, chat]
+        visitors: [visitors, visitor]
+        check-in: [check in, check-in, visitor check in]
+        out-on-pass: [out on pass, out-on-pass]
+        schedule-care-conference: [care conference, care conferences, schedule care conference]
+        care-conference-calendar: [care conference calendar]
+        care-conference-reports: [care conference reports, care conference report]
+        idt-report: [idt report, idt reports, idt]
+        Referrals: [referrals, referral]
+        discharge-planning: [discharge planning]
+        Contact Management: [contact management, contacts management]
+        Access Management: [access management, permissions management]
+        facility-settings: [facility settings]
+        Settings: [settings]
+        Weather Forecast: [weather forecast, weather]
+        Dining: [dining]
+        Housekeeping: [housekeeping]
+        Maintenance: [maintenance]
+        Activities: [activities]
+        Salon: [salon]
+        Rehab: [rehab]
     max_options: 6
   # Lookups answer only what was asked: these words pick the resident attributes to show ("what is the room number of
   # resident_1" → room_number). No match → the full profile ("tell me about resident_1"). Single words of 5+ letters
@@ -149,7 +195,9 @@ direct:
     room_number: [room, room number, unit, unit number, bed]
     family_members: [family members, family member, family contacts, family contact, relatives]
     family_count: [number of family members, family member count, family count, how many family members]
-    care_team: [care team, care teams, care team members, care staff, team members]
+    care_team: [care team, care teams, care team members, care staff, team members, staff members assigned,
+                staff member assigned, staff assigned, assigned staff members, how many staff members,
+                how many staff, number of staff members, number of staff]
     primary_physician: [primary physician, primary physicians, primary doctor, primary care physician, attending physician]
     primary_caregiver: [primary caregiver, primary caregivers, caregiver, caregivers, caretaker, caretakers, carer, nurse, aide, assigned staff, looks after, look after, cares for]
     admission_date: [admitted, admission, admission date, joined, moved in]

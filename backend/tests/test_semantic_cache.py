@@ -536,3 +536,17 @@ async def test_real_bge_false_hits_and_missed_paraphrases(repo, settings):
 def service_mask(repo, question):
     """The masked form the fake model is keyed by (each question names at most one resident → resident_1)."""
     return question.replace("Eleanor Vance", "resident_1").replace("Arthur Pendleton", "resident_1")
+
+
+async def test_a_template_that_never_looks_up_the_named_resident_is_not_reused(repo, settings):
+    """Staging: "Is Hogan Jone part of Sagar Dodia's care team?" was answered by the stored template of "Which
+    residents does <caregiver> look after?" (7 residents) — the resident the question names was never looked up."""
+    plan = {"action": "list", "filters": {"primary_caregiver": {"include": ["person_1"]}}}
+    q = "Which residents does Sarah Jenkins look after?"
+    member = {"action": "lookup", "lookup": {"residents": ["resident_1"], "attributes": ["care_team"]},
+              "filters": {"staff_name": {"include": ["person_1"]}}}  # fmt: skip
+    service, fake, store = await build(repo, settings, {q.replace("Sarah Jenkins", "person_1"): plan,
+                                                         "Is person_1 part of resident_1's care team?": member})  # fmt: skip
+    await seed(service, store, q)
+    r = await ask(service, "Is Sarah Jenkins part of Eleanor Vance's care team?")
+    assert r["tier"] == "llm" and r["response"]["headline"].startswith("Yes")  # the model's own plan, not the template

@@ -138,6 +138,12 @@ class MemoryResidentRepository:
         rows = [r for r in self._staff_rows(contacts) if r["name"] in names]
         return sorted(self._staff_filtered(Filters(), residents=True, rows=rows), key=lambda r: (r["name"], r["staffId"]))[:20]
 
+    async def staff_access(self, name: str, designation: str) -> list[list]:
+        cfg = staff_config()
+        return [s.get("accessPermissions") or [] for s in self._staff_raw
+                if not cfg.is_hidden(s.get("designation")) and str(s.get("name") or "").strip() == name
+                and cfg.member(s)["designation"] == designation][:2]  # fmt: skip
+
     async def staff_vocabulary(self) -> list[dict]:
         return [{k: r[k] for k in ("name", "designation", "role", "status")} for r in self._staff_rows() if r["name"]]
 

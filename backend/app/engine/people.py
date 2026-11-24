@@ -9,6 +9,10 @@ from app.nlu.vocabulary import EntityIndex
 KIND_LABELS = {"residents": "resident", "staff": "staff member", "family": "family member"}
 _KIND_OF = {"residents": "resident", "staff": "staff", "family": "family"}
 _STAFF_SHARED = {"facility": "staff_facility", "status": "staff_status"}
+# one question word, several plan attributes ("contact details" = phone and email)
+_STAFF_EXPAND = {"staff_contact": ["staff_phone", "staff_email"]}
+# attributes of ONE person only: several matching staff members → ask which one
+ONE_PERSON_ATTRIBUTES = ("staff_email", "staff_phone", "staff_residents", "staff_contact")
 
 
 def family_detail(m: dict, index: EntityIndex) -> str:
@@ -40,6 +44,7 @@ def plan_for(asked: PersonQuestion, kind: str, people: list[dict]) -> QueryPlan:
                                          **({"fields": fields} if fields else {})})  # fmt: skip
     if kind == "staff":
         shown = [_STAFF_SHARED.get(a, a) for a, scope in asked.attributes if scope in ("staff", SHARED)]
+        shown = list(dict.fromkeys(x for a in shown for x in _STAFF_EXPAND.get(a, [a])))
         if asked.check:
             shown = list(dict.fromkeys([*shown, "staff_status"]))
         names = list(dict.fromkeys(p["name"] for p in people))[:5]
@@ -52,6 +57,31 @@ def plan_for(asked: PersonQuestion, kind: str, people: list[dict]) -> QueryPlan:
     return QueryPlan.model_validate({"action": "lookup", "fields": ["family_relationship"],
                                      "lookup": {"residents": [member["residentId"]]},
                                      "filters": {"family_member": {"include": [member["id"]]}}})  # fmt: skip
+
+
+def access_answer(asked: PersonQuestion, person: dict, permissions: list | None) -> dict:
+    """"Can Jone access the transport calendar?": yes / no per section asked, for ONE staff member. Only the asked
+    sections are answered (never the whole permission set, never write access)."""
+    from app.data.staff import can_access
+
+    label = person["name"] + (f" ({person['designation']})" if person.get("designation") else "")
+    facts = []
+    for section in asked.sections:
+        ok = can_access(permissions, section)
+        words = section.replace("-", " ")
+        words = words[:1].upper() + words[1:]
+        verdict = "not recorded" if ok is None else ("Yes" if ok else "No")
+        facts.append({"label": words, "value": verdict,
+                      "sentence": f"{label} {'can' if ok else 'cannot'} access {words}." if ok is not None
+                      else f"{label}'s permissions don't include {words}."})  # fmt: skip
+    one = facts[0] if len(facts) == 1 else None
+    return {
+        "headline": f"{one['value']} — {person['name']}" if one else f"Access — {person['name']}",
+        "summaryText": " ".join(f["sentence"] for f in facts),
+        "count": 1,
+        **({"attributeSpotlight": {"label": f"Access: {one['label']}", "value": one["value"]}} if one else
+           {"multiSpotlight": [{"label": f"Access: {f['label']}", "value": f["value"]} for f in facts]}),
+    }  # fmt: skip
 
 
 def message(asked: PersonQuestion, people: dict[str, list[dict]]) -> str:

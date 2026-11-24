@@ -419,3 +419,20 @@ def _repo_with(staff):
     repo._records = records
     repo._attach_staff()
     return repo
+
+
+@pytest.mark.parametrize(
+    ("question", "verdict"),
+    [
+        ("Is Priya Raman part of Eleanor Vance's care team?", "Priya Raman (Physician) is on Eleanor Vance's care team"),
+        ("Is Priya Raman part of Martha Stewart-Wells's care team?", "Priya Raman is not on Martha Stewart-Wells's care team"),
+    ],
+)
+async def test_is_a_staff_member_on_a_residents_care_team(make_service, question, verdict):
+    """Staging q_a880861b3c22: staff_name in a resident plan was rejected ("staff fields need entity staff"), then a
+    useless retry — 7,271 tokens. It is a condition on the resident's assigned staff, like staff_role."""
+    plan = {"action": "lookup", "lookup": {"residents": ["resident_1"], "attributes": ["care_team"]},
+            "filters": {"staff_name": {"include": ["person_1"]}}}  # fmt: skip
+    fake = FakeTranslator({"Is person_1 part of resident_1's care team?": plan})
+    r = await (await make_service(fake)).handle(question)
+    assert len(fake.calls) == 1 and verdict in r["response"]["summaryText"]

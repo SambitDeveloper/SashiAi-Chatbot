@@ -692,6 +692,8 @@ def check_plan(
     )
     if "primary_caregiver" not in groups and "primary_caregiver" not in attrs:
         used = set((f.primary_caregiver.include or []) + (f.primary_caregiver.exclude or [])) if f.primary_caregiver else set()
+        # "is Jone on X's care team?": the staff member is a staff_name condition on the assigned staff
+        used |= set((f.staff_name.include or []) + (f.staff_name.exclude or [])) if f.staff_name else set()
         for text, values in index.mentioned_caregivers(question).items():
             covered = _text_covers(f.primary_caregiver, FIELD_MAP["primary_caregiver"], list(values))
             if not used & set(values) and not covered and not in_resident_name(text) and not (

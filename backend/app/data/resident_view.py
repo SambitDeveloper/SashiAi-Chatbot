@@ -501,6 +501,13 @@ class ViewRepository:
         pipeline.insert(cut, {"$match": {"name": {"$in": list(names)}}})
         return await self._aggregate(pipeline, staff_config().collection)
 
+    async def staff_access(self, name: str, designation: str) -> list[list]:
+        """The app permissions of the staff record(s) with exactly this name and designation (one per record)."""
+        cfg = staff_config()
+        if cfg is None:
+            return []
+        return [r.get("access") or [] for r in await self._aggregate(cfg.access_stages(name, designation), cfg.collection)]
+
     async def staff_vocabulary(self) -> list[dict]:
         """Every staff member who is a person, any status: names, designation, role and status (no contact details)."""
         cfg = staff_config()

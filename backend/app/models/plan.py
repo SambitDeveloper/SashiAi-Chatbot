@@ -68,10 +68,12 @@ def canonical_field(name):
 
 RESIDENT_GROUP_FIELDS: tuple[str, ...] = ResidentGroupField.__args__  # type: ignore[attr-defined]
 STAFF_GROUP_FIELDS: tuple[str, ...] = StaffGroupField.__args__  # type: ignore[attr-defined]
-# staff-member conditions; in a resident plan only staff_role / staff_designation / staff_count (ANY active assigned staff)
+# staff-member conditions; in a resident plan only staff_role / staff_designation / staff_count (ANY active assigned
+# staff) and staff_name (ANY assigned staff member)
 STAFF_ENTITY_SET_FIELDS = ("staff_role", "staff_designation", "staff_status", "staff_facility", "staff_type", "staff_name")
-STAFF_ONLY_FIELDS = ("staff_status", "staff_facility", "staff_type", "staff_name", "staff_resident_count")  # staff plans
-STAFF_RELATION_FIELDS = ("staff_role", "staff_designation", "staff_count")  # resident plans: the assigned staff
+STAFF_ONLY_FIELDS = ("staff_status", "staff_facility", "staff_type", "staff_resident_count")  # staff plans
+# resident plans: the assigned staff ("residents without a case manager", "is Jone on X's care team?")
+STAFF_RELATION_FIELDS = ("staff_role", "staff_designation", "staff_count", "staff_name")
 STAFF_SORT_FIELDS = ("staff_name", "staff_resident_count")
 STAFF_ATTRIBUTES = ("staff_designation", "staff_role", "staff_status", "staff_facility", "staff_type",
                     "staff_resident_count", "staff_email", "staff_phone", "staff_residents")  # fmt: skip

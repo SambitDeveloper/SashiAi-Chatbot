@@ -611,6 +611,10 @@ class EntityIndex:
                 best, ids = score, [r.resident_id]
             elif abs(score - best) <= 0.01 and score > 0:
                 ids.append(r.resident_id)
+        if len(ids) > 1:
+            in_order = [r.resident_id for r in self._residents if r.resident_id in ids and "".join(r.first + r.last) == concat]
+            if len(in_order) == 1:
+                ids = in_order
         return ids if best >= FULL_NAME_THRESHOLD else []
 
     def caregiver_values(self) -> list[str]:
@@ -667,11 +671,14 @@ class EntityIndex:
         for j, (raw, n) in enumerate(tokens):
             if j in used:
                 continue
-            hits = [c.value for c in self._caregivers if len(c.tokens) > 1 and n == c.tokens[-1]] if len(n) >= 4 else []
             # A caregiver recorded under a single word is named in full by that word. It must be written as a name
             # (capitalised, not the sentence's first word) so ordinary words never match a one-word staff record.
-            if not hits and j > 0 and raw[:1].isupper() and len(n) >= 3:
-                hits = list(self._single_word_caregivers.get(n, []))
+            # Such an exact name wins over a surname: "Jone" is the staff member recorded as "Jone", not "Hogan Jone".
+            hits = list(self._single_word_caregivers.get(n, [])) if j > 0 and raw[:1].isupper() and len(n) >= 3 else []
+            # a surname written in lower case must not be one of the assistant's own words ("staff members" is not
+            # the surname of a caregiver recorded as "RM staff")
+            if not hits and len(n) >= 4 and (raw[:1].isupper() or n not in _app_words()):
+                hits = [c.value for c in self._caregivers if len(c.tokens) > 1 and n == c.tokens[-1]]
             if hits:
                 found[raw] = hits
         # the text written, without trailing punctuation ("Nursing." at the end of the sentence is "Nursing")
@@ -758,6 +765,11 @@ class EntityIndex:
         if kind in (None, "resident"):
             out["residents"] = [{"id": r.resident_id, "name": r.display} for r in self._residents
                                 if all(w in [*r.first, *r.last] for w in words)]  # fmt: skip
+            if len(out["residents"]) > 1 and len(words) > 1:  # "Sagar Dodia" written in order is not "Dodia Sagar"
+                in_order = [p for p, r in ((p, next(r for r in self._residents if r.resident_id == p["id"])) for p in out["residents"])
+                            if "".join(r.first + r.last) == "".join(words)]  # fmt: skip
+                if len(in_order) == 1:
+                    out["residents"] = in_order
         if kind in (None, "staff"):
             seen: set[tuple[str, str]] = set()
             # a name written exactly as recorded ("Care Coordinator Maya Patel") is that record, not every Maya Patel
@@ -797,6 +809,9 @@ class EntityIndex:
             return Resolution([])
         joined = "".join(tokens)
         hits = [c for c in pool if all(t in c.tokens for t in tokens)]
+        exact = [c for c in hits if c.person == joined]  # written exactly as recorded: that person, not every namesake
+        if exact:
+            hits = exact
         if not hits:
             hits = [c for c in pool if fuzz.ratio(joined, c.person) >= FULL_NAME_THRESHOLD]
         if not hits and len(tokens) == 1:

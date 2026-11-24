@@ -322,8 +322,11 @@ def _staff_people(text: str, index: EntityIndex, mask: MaskResult) -> tuple[Reso
     """A staff member as the planner wrote them: a name, or person_N (a name that is also a family member's)."""
     key = str(text).lower()
     if ph.kind_of(key) == ph.PERSON:
-        staff = _person(mask, key).get("staff") or []
-        return Resolution(list(staff)), mask.entity_originals.get(key, str(text))
+        staff = list(_person(mask, key).get("staff") or [])
+        written = mask.entity_originals.get(key, str(text))
+        # a name written exactly as recorded ("Jone") is that person, not every name containing it ("Hogan Jone")
+        exact = [s for s in staff if " ".join(str(s).split()).lower() == " ".join(written.split()).lower()]
+        return Resolution(exact or staff), written
     if ph.kind_of(key) is not None:  # resident_N / family_N are never staff
         return Resolution([]), mask.all_originals.get(key, str(text))
     return index.resolve_staff(str(text)), str(text)

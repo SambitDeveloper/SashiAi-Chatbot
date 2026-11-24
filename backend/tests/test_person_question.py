@@ -65,7 +65,6 @@ def test_kind_word_and_detail():
     [
         "How many residents are active?",  # no name
         "Who is in room 101?",  # a number
-        "Who is Jone's caregiver and room?",  # more than one thing asked
         "Which resident is Margaret Vance related to?",  # asks for residents, not about the person
         "What are the designations of Owen Hart and Priya Raman?",  # two people
     ],
@@ -369,3 +368,145 @@ async def test_residents_with_the_same_words_in_their_names_are_told_apart(setti
     assert [o["label"] for o in options] == ["Resident · Dodia Sagar (ID RES-7001)", "Resident · Sagar Dodia (ID RES-7002)"]
     rooms = [(await service.handle(o["query"]))["response"]["attributeSpotlight"]["value"] for o in options]
     assert rooms == ["T-101", "A-504"] and fake.calls == []
+
+
+# ======================================================================== 7. staging question set (2026-11-24)
+# Each of these went to the model (3.3k–7.3k tokens) and most failed. Now: the fast path, 0 model calls.
+
+ACCESS = [
+    {"name": "Residents", "allowed": True, "isRead": True, "isWrite": True, "children": []},
+    {"name": "Transport", "allowed": True, "isRead": True, "isWrite": True, "children": [
+        {"name": "transport-calendar", "allowed": False, "isRead": False, "isWrite": False},
+        {"name": "transport-requests", "allowed": True, "isRead": True, "isWrite": True}]},
+    {"name": "Staff", "allowed": False, "isRead": False, "isWrite": False, "children": []},
+]  # fmt: skip
+JONES = [{"_id": "j1", "cName": "c-j1", "name": "Jone", "designation": "Transport Driver", "active": True,
+          "phone": "5550100", "countryCode": "+1", "email": "jone.driver@example.com", "accessPermissions": ACCESS},
+         {"_id": "j2", "cName": "c-j2", "name": "Jone", "designation": "Social Worker", "active": False,
+          "accessPermissions": []},
+         {"_id": "j3", "cName": "c-j3", "name": "Hogan Jone", "designation": "Case Manager", "active": True}]  # fmt: skip
+
+
+def _staging_repo():
+    from tests.test_staff import STAFF, _repo_with
+
+    repo = _repo_with([*STAFF, *JONES])
+    base = repo._records[0]
+    repo._records = [*repo._records,
+                     {**base, "residentId": "RES-7001", "id": "r7001", "firstName": "Dodia", "lastName": "Sagar", "roomNumber": "T-101"},
+                     {**base, "residentId": "RES-7002", "id": "r7002", "firstName": "Sagar", "lastName": "Dodia", "roomNumber": "A-504"}]  # fmt: skip
+    repo._records[1]["primaryCaregiver"] = "Jone"  # the caregiver recorded as just "Jone"
+    repo._records[2]["primaryCaregiver"] = "Hogan Jone"  # and one whose SURNAME is Jone
+    repo._records[3]["primaryCaregiver"] = "RM staff"  # staging: a caregiver whose "surname" is an ordinary word
+    repo._attach_staff()
+    return repo
+
+
+async def _staging_service(settings):
+    from app.engine.service import QueryService
+
+    fake = FakeTranslator({})  # any model call fails the test
+    service = QueryService(_staging_repo(), fake, settings)
+    await service.refresh_vocabulary()
+    return service, fake
+
+
+@pytest.mark.parametrize(
+    ("question", "attributes", "sections"),
+    [
+        ("Which residents are assigned to Jone?", ["staff_residents"], []),
+        ("Can you show me all the staff members assigned to Sagar?", ["care_team"], []),
+        ("How many staff members are assigned to Sagar?", ["care_team"], []),
+        ("What are Jone's contact details and job designation?", ["staff_contact", "staff_designation"], []),
+        ("Which facility is Sagar associated with, and what type of care does he receive?", ["facility", "care_type"], []),
+        ("Is Jone allowed to access the Residents section?", [], ["Residents"]),
+        ("Does Jone have permission to access the Transport section?", [], ["Transport"]),
+        ("Can Jone access the transport calendar?", [], ["transport-calendar"]),
+        ("Does Jone have access to staff management?", [], ["Staff"]),
+    ],
+)
+def test_staging_questions_are_simple_person_questions(question, attributes, sections):
+    asked = PARSER.parse(question)
+    assert asked is not None and [a for a, _ in asked.attributes] == attributes and asked.sections == sections
+
+
+def test_portal_access_is_not_an_app_section():
+    assert PARSER.parse("Does Jone have portal access?") is None  # a family flag word, not an app section
+
+
+@pytest.mark.parametrize(
+    ("question", "verdict"),
+    [
+        ("Is staff member Jone (Transport Driver) allowed to access the Residents section?", "Yes"),
+        ("Does staff member Jone (Transport Driver) have permission to access the Transport section?", "Yes"),
+        ("Can staff member Jone (Transport Driver) access the transport calendar?", "No"),  # the child is switched off
+        ("Does staff member Jone (Transport Driver) have access to staff management?", "No"),
+        ("Can staff member Jone (Transport Driver) access dining?", "not recorded"),  # not in the permission list
+    ],
+)
+async def test_app_permissions_yes_or_no_for_one_staff_member(settings, question, verdict):
+    service, fake = await _staging_service(settings)
+    r = await service.handle(question)
+    assert fake.calls == [] and r["tokensConsumed"] == 0
+    assert r["response"]["attributeSpotlight"]["value"] == verdict
+    assert "isWrite" not in text(r) and "Write" not in text(r)  # never write access, never the whole set
+
+
+async def test_app_permissions_of_a_shared_name_ask_which_person(settings):
+    service, fake = await _staging_service(settings)
+    r = await service.handle("Can Jone access the transport calendar?")
+    assert fake.calls == [] and r["response"]["needsClarification"]
+    queries = [o["query"] for o in r["response"]["clarificationOptions"]]
+    assert any("Transport Driver" in q for q in queries) and any("Social Worker" in q for q in queries)
+    picked = await service.handle(next(q for q in queries if "Transport Driver" in q))
+    assert picked["response"]["attributeSpotlight"]["value"] == "No" and fake.calls == []
+
+
+async def test_contact_details_and_designation(settings):
+    service, fake = await _staging_service(settings)
+    both = await service.handle("What are Jone's contact details and job designation?")
+    assert both["response"]["needsClarification"] and "555" not in text(both)  # two people named exactly Jone
+    one = await service.handle("What are staff member Jone (Transport Driver)'s contact details and job designation?")
+    assert "+1 5550100" in text(one) and "jone.driver@example.com" in text(one) and "Transport Driver" in text(one)
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Can you show me all the staff members assigned to Sagar?",
+        "How many staff members are assigned to Sagar?",
+        "Which facility is Sagar associated with, and what type of care does he receive?",
+    ],
+)
+async def test_a_shared_resident_name_is_asked_before_any_model_call(settings, question):
+    service, fake = await _staging_service(settings)
+    r = await service.handle(question)
+    assert fake.calls == [] and r["tokensConsumed"] == 0 and r["response"]["needsClarification"]
+    queries = [o["query"] for o in r["response"]["clarificationOptions"]]
+    assert len(queries) == 2 and all("Sagar" in q for q in queries)  # the question itself is kept
+    picked = await service.handle(queries[0])
+    assert not picked["response"].get("needsClarification") and fake.calls == []
+
+
+async def test_a_full_name_written_in_order_is_that_resident():
+    index = EntityIndex(await _staging_repo().vocabulary())
+    assert index.resolve_resident("Sagar Dodia", {}).values == ["RES-7002"]
+    assert index.resolve_resident("Dodia Sagar", {}).values == ["RES-7001"]
+    assert [p["id"] for p in index.people_named("Sagar Dodia")["residents"]] == ["RES-7002"]
+    assert len(index.people_named("Sagar")["residents"]) == 2  # one word: both
+
+
+async def test_a_name_recorded_exactly_wins_over_a_surname():
+    """Staging: "Which residents are assigned to Jone?" answered Hogan Jone's residents, not those of the staff member
+    recorded exactly as "Jone"."""
+    index = EntityIndex(await _staging_repo().vocabulary())
+    assert index.mentioned_caregivers("Which residents are assigned to Jone?") == {"Jone": ["Jone"]}
+    assert index.resolve_caregiver("Jone").values == ["Jone"]
+
+
+async def test_an_ordinary_word_is_not_a_caregivers_surname():
+    """Staging: "How many staff members are assigned to Sagar Dodia?" was checked against caregiver "RM staff"."""
+    index = EntityIndex(await _staging_repo().vocabulary())
+    assert index.mentioned_caregivers("How many staff members are assigned to Sagar Dodia?") == {}
+    assert index.mentioned_caregivers("Which residents does Staff look after?") != {}  # written as a name: still one

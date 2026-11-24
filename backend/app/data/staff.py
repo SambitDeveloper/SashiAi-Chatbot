@@ -29,7 +29,8 @@ from app.data.schema_config import schema_config
 from app.models.plan import STAFF_ENTITY_SET_FIELDS, STAFF_FIELD_MAP, Filters
 
 # resident view fields the staff relation derives
-STAFF_RESIDENT_FIELDS = ("staffRoles", "staffDesignations", "staffCount", "careTeam", "careTeamMembers", "primaryPhysician")
+STAFF_RESIDENT_FIELDS = ("staffRoles", "staffDesignations", "staffCount", "staffNames", "careTeam", "careTeamMembers",
+                         "primaryPhysician")
 STAFF_STATUSES = ("active", "inactive")
 
 
@@ -47,6 +48,32 @@ def _plural(word: str) -> str:
     if word.endswith("y") and not word.endswith(("ay", "ey", "oy")):
         return word[:-1] + "ies"
     return word + "s"
+
+
+MEMBERSHIP_COLLECTION = "stafffacilitymemberships"  # per-facility app permissions of a staff member
+
+
+def _norm_section(name) -> str:
+    return " ".join(str(name or "").replace("-", " ").replace("_", " ").lower().split())
+
+
+def can_access(permissions: list | None, section: str) -> bool | None:
+    """Can this staff member open `section` (an app permission name, top level or child)? Allowed AND readable; a
+    child section also needs its parent. None = the section is not in their permissions at all."""
+    want = _norm_section(section)
+
+    def ok(p: dict) -> bool:
+        return p.get("allowed") is True and p.get("isRead") is True
+
+    for top in permissions or []:
+        if not isinstance(top, dict):
+            continue
+        if _norm_section(top.get("name")) == want:
+            return ok(top)
+        for child in top.get("children") or []:
+            if isinstance(child, dict) and _norm_section(child.get("name")) == want:
+                return ok(top) and ok(child)
+    return None
 
 
 def _phone_expr() -> dict:
@@ -214,6 +241,8 @@ class StaffConfig:
             "staffRoles": {"$setDifference": [{"$setUnion": [{"$map": {"input": active, "as": "m", "in": "$$m.role"}}, []]}, [None, ""]]},
             "staffDesignations": {"$setDifference": [{"$setUnion": [{"$map": {"input": active, "as": "m", "in": "$$m.designation"}}, []]}, [""]]},
             "staffCount": {"$size": active},
+            # every assigned staff member's recorded name (active or not): "is Jone part of X's care team?"
+            "staffNames": {"$setDifference": [{"$setUnion": [{"$map": {"input": "$_team", "as": "m", "in": "$$m.name"}}, []]}, [""]]},
             "careTeam": {"$map": {"input": "$_team", "as": "m", "in": self._label_expr("$$m")}},
             "careTeamMembers": {"$map": {"input": "$_team", "as": "m", "in": {
                 "name": "$$m.name", "designation": "$$m.designation", "role": "$$m.role", "status": "$$m.status"}}},
@@ -236,6 +265,22 @@ class StaffConfig:
             {"$lookup": {"from": "facilities", "localField": "facilityId", "foreignField": "facilityId",
                          "pipeline": [{"$project": {"_id": 0, "facilityName": 1}}], "as": "_facility"}},
             {"$project": project},
+        ]  # fmt: skip
+
+    def access_stages(self, name: str, designation: str) -> list[dict]:
+        """ONE staff member's app permissions (accessPermissions): the membership of their own facility
+        (stafffacilitymemberships, per facility), else the copy on the staff record. Matched by recorded name and
+        designation, exactly as the staff view shows them; at most 2 rows so a duplicate is noticed, never guessed."""
+        return [
+            self.visible_match,
+            {"$match": {"$expr": {"$and": [{"$eq": [{"$trim": {"input": _text("$name")}}, name]},
+                                           {"$eq": [self._designation_expr(), designation]}]}}},
+            {"$limit": 2},
+            {"$lookup": {"from": MEMBERSHIP_COLLECTION, "let": {"sid": "$_id", "f": "$facilityId"},
+                         "pipeline": [{"$match": {"$expr": {"$and": [{"$eq": ["$staffId", "$$sid"]}, {"$eq": ["$facilityId", "$$f"]}]}}},
+                                      {"$project": {"_id": 0, "accessPermissions": 1}}, {"$limit": 1}],
+                         "as": "_m"}},
+            {"$project": {"_id": 0, "access": {"$ifNull": [{"$first": "$_m.accessPermissions"}, "$accessPermissions"]}}},
         ]  # fmt: skip
 
     # ------------------------------------------------------------------ in memory (mirrors the stages above)
@@ -272,6 +317,7 @@ class StaffConfig:
             "staffRoles": sorted({m["role"] for m in active if m["role"]}),
             "staffDesignations": sorted({m["designation"] for m in active if m["designation"]}),
             "staffCount": len(active),
+            "staffNames": sorted({m["name"] for m in team if m["name"]}),
             "careTeam": [self._label(m) for m in team],
             "careTeamMembers": [{k: m[k] for k in ("name", "designation", "role", "status")} for m in team],
             "primaryPhysician": self._label(physician) if physician else "",

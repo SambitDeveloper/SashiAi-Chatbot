@@ -31,6 +31,7 @@ class PersonQuestion:
     detail: str | None = None  # "(Transport Driver)": picks one of several same-named people
     attributes: list[tuple[str, str]] = field(default_factory=list)  # (attribute, scope) in question order
     check: str | None = None  # "active" / "inactive": a yes/no question
+    sections: list[str] = field(default_factory=list)  # app permission names asked about ("Can Jone access Transport?")
     name_span: tuple[int, int] = (0, 0)  # in `text`
     kind_span: tuple[int, int] | None = None  # the kind words just before the name, in `text`
     text: str = ""  # the question without the detail
@@ -39,6 +40,8 @@ class PersonQuestion:
     def kinds(self) -> set[str]:
         """The kinds of person the question can be about, from its attributes and check (all when it has none)."""
         allowed = {"resident", "staff", "family"}
+        if self.sections:  # app permissions belong to staff members
+            allowed &= {"staff"}
         for _, scope in self.attributes:
             allowed &= {RESIDENT_ONLY: {"resident"}, STAFF_ONLY: {"staff"}, FAMILY_ONLY: {"family"},
                         SHARED: {"resident", "staff"}}[scope]  # fmt: skip
@@ -85,6 +88,21 @@ class PersonQuestionParser:
                 add(w, f"attr:{scope}", attr)
         self.phrases = sorted(phrases, key=lambda p: -len(p[0]))
         self.openers = {tuple(_norm(w) for w in _WORD.findall(str(o))) for o in cfg.get("openers") or []}
+        # permission questions: the same grammar with section words instead of attribute words
+        perm = cfg.get("permissions") or {}
+        self.permission_cues = {_norm(w) for w in perm.get("cues") or []}
+        perm_phrases = [p for p in phrases if p[1] in ("filler", "kind")]
+        for w in [*(perm.get("cues") or []), *(perm.get("fillers") or [])]:
+            words = tuple(_norm(x) for x in _WORD.findall(str(w)))
+            if words:
+                perm_phrases.append((words, "filler", ""))
+        for section, words in (perm.get("sections") or {}).items():
+            for w in [*(words or []), section.replace("-", " ")]:
+                ws = tuple(_norm(x) for x in _WORD.findall(str(w)))
+                if ws:
+                    perm_phrases.append((ws, "section", str(section)))
+        # longest first; a section phrase before a filler of the same length ("staff management" is the section)
+        self.permission_phrases = sorted(perm_phrases, key=lambda p: (-len(p[0]), p[1] != "section"))
 
     def parse(self, question: str) -> PersonQuestion | None:
         m = _DETAIL.search(question)
@@ -94,10 +112,12 @@ class PersonQuestionParser:
         if not tokens:
             return None
         norms = [_norm(t[0]) for t in tokens]
+        permission = bool(self.permission_cues & set(norms))
+        table = self.permission_phrases if permission else self.phrases
         roles: list[tuple[str, str] | None] = [None] * len(tokens)
         i = 0
         while i < len(tokens):
-            for words, role, value in self.phrases:
+            for words, role, value in table:
                 if tuple(norms[i : i + len(words)]) == words:
                     for j in range(i, i + len(words)):
                         roles[j] = (role, value)
@@ -128,7 +148,11 @@ class PersonQuestionParser:
             return None
         attributes = [(r[1], r[0].split(":")[1]) for r in roles if r and r[0].startswith("attr:")]
         checks = [r[1] for r in roles if r and r[0] == "check"]
+        sections = list(dict.fromkeys(r[1] for r in roles if r and r[0] == "section"))
+        if permission and not sections:
+            return None  # "does Jone have portal access?": not an app section; the normal pipeline decides
         return PersonQuestion(
             name=name, kind=kind, detail=detail, attributes=list(dict.fromkeys(attributes)),
             check=checks[0] if checks else None, name_span=(start, end), kind_span=kind_span, text=text,
+            sections=sections,
         )  # fmt: skip
