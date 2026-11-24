@@ -4,15 +4,16 @@ import json
 
 from tests.conftest import TODAY, FakeTranslator
 
+# the model reads recognised staff names as person_N (vocabulary.MaskResult.model_text), and writes person_N back
 JENKINS_ACTIVE = {
     "action": "count",
-    "filters": {"status": {"include": ["active"]}, "primary_caregiver": {"include": ["Sarah Jenkins"]}},
+    "filters": {"status": {"include": ["active"]}, "primary_caregiver": {"include": ["person_1"]}},
 }
 
 
 async def test_question_that_failed_before_now_answers_9(make_service):
     q = "Tell me the count of active residents whose care taker is Nurse Sarah Jenkins?"
-    fake = FakeTranslator({q: JENKINS_ACTIVE})
+    fake = FakeTranslator({q.replace("Sarah Jenkins", "person_1"): JENKINS_ACTIVE})
     service = await make_service(fake)
     result = await service.handle(q)
     assert result["response"]["count"] == 9
@@ -60,7 +61,7 @@ async def test_follow_up_uses_previous_plan(make_service):
     q2 = "And how many of them are in memory care?"
     fake = FakeTranslator(
         {
-            "How many active residents does Sarah Jenkins look after?": JENKINS_ACTIVE,
+            "How many active residents does person_1 look after?": JENKINS_ACTIVE,
             q2: {
                 "action": "count",
                 "filters": {
@@ -75,7 +76,9 @@ async def test_follow_up_uses_previous_plan(make_service):
     service = await make_service(fake)
     await service.handle("How many active residents does Sarah Jenkins look after?", session_id="s1")
     result = await service.handle(q2, session_id="s1")
-    assert fake.calls[1]["previous"] is not None and "Sarah Jenkins" in fake.calls[1]["previous"]
+    # the previous plan the model reads refers to the caregiver as person_1, never by name
+    assert fake.calls[1]["previous"] is not None and "person_1" in fake.calls[1]["previous"]
+    assert "Sarah Jenkins" not in fake.calls[1]["previous"]
     assert result["response"]["count"] == 9
 
     # A follow-up answer is tied to its conversation: the same words in a fresh chat must not reuse it.
@@ -221,6 +224,7 @@ async def test_local_model_usage_reported(make_service):
 ELENA_Q = (
     "How many active residents are available who joined october month and undergoes Care Aide Elena Rostova care taker?"
 )
+ELENA_MODEL_Q = ELENA_Q.replace("Elena Rostova", "person_1")  # what the model reads
 ACTIVE_OCTOBER = {
     "action": "count",
     "filters": {"status": {"include": ["active"]}, "admission_date": {"start": "2026-10-01", "end": "2026-10-31"}},
@@ -230,19 +234,20 @@ ACTIVE_OCTOBER_ELENA = {
     "filters": {
         "status": {"include": ["active"]},
         "admission_date": {"start": "2026-10-01", "end": "2026-10-31"},
-        "primary_caregiver": {"include": ["Elena Rostova"]},
+        "primary_caregiver": {"include": ["person_1"]},
     },
 }
 
 
 async def test_dropped_caregiver_is_caught_and_retried(make_service):
     # A real model answer for this question once left out the caregiver (answer 12 instead of 2).
-    fake = FakeTranslator({ELENA_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER_ELENA]})
+    fake = FakeTranslator({ELENA_MODEL_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER_ELENA]})
     service = await make_service(fake)
     result = await service.handle(ELENA_Q)
     assert result["response"]["count"] == 2  # Emily Dickinson, Cecilia Payne-Gaposchkin
     assert "Caregiver: Care Aide Elena Rostova" in result["interpretation"]
-    assert len(fake.calls) == 2 and "Elena Rostova" in fake.calls[1]["hint"]
+    # the retry hint names the dropped caregiver as the model knows them: person_1, never the name
+    assert len(fake.calls) == 2 and "person_1" in fake.calls[1]["hint"] and "Elena" not in fake.calls[1]["hint"]
     assert result["tokensConsumed"] == 2 * 740 and result["modelCalls"] == 2  # both calls are counted
     # no successful-plan cache any more (2026-11-18): asking again is planned again and still answered correctly
     again = await service.handle(ELENA_Q)
@@ -250,7 +255,7 @@ async def test_dropped_caregiver_is_caught_and_retried(make_service):
 
 
 async def test_still_incomplete_after_retry_asks_the_user(make_service):
-    fake = FakeTranslator({ELENA_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER]})
+    fake = FakeTranslator({ELENA_MODEL_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER]})
     service = await make_service(fake)
     result = await service.handle(ELENA_Q)
     assert result["response"]["needsClarification"] and "Elena Rostova" in result["response"]["summaryText"]
@@ -285,14 +290,15 @@ async def test_no_retry_when_plan_is_complete(make_service):
         "How many residents per caregiver?": {"action": "breakdown", "group_by": ["primary_caregiver"]},
         "Which residents does Maya Patel look after?": {
             "action": "list",
-            "filters": {"primary_caregiver": {"include": ["Maya Patel"]}},
+            "filters": {"primary_caregiver": {"include": ["person_1"]}},
         },
         "Who is the caretaker of resident_1?": {
             "action": "lookup",
             "lookup": {"residents": ["resident_1"], "attributes": ["primary_caregiver"]},
         },
     }
-    fake = FakeTranslator(cases)
+    names = {"Sarah Jenkins": "person_1", "Maya Patel": "person_1"}  # the model reads staff names as person_N
+    fake = FakeTranslator({next((k.replace(n, p) for n, p in names.items() if n in k), k): v for k, v in cases.items()})
     service = await make_service(fake)
     for q in [*list(cases)[:3], "Who is the caretaker of Eleanor Vance?"]:
         await service.handle(q)
@@ -303,12 +309,12 @@ async def test_no_retry_when_plan_is_complete(make_service):
 async def test_model_conditions_format_end_to_end(make_service):
     fake = FakeTranslator(
         {
-            ELENA_Q: {
+            ELENA_MODEL_Q: {
                 "action": "count",
                 "conditions": [
                     {"field": "status", "include": ["active"]},
                     {"field": "admission_date", "start": "2026-10-01", "end": "2026-10-31"},
-                    {"field": "primary_caregiver", "include": ["Elena Rostova"]},
+                    {"field": "primary_caregiver", "include": ["person_1"]},
                 ],
             }
         }
@@ -367,7 +373,7 @@ async def test_model_plans_are_reported_and_logged_without_names(make_service, c
     import logging
 
     fake = FakeTranslator(
-        {ELENA_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER_ELENA]}  # first attempt drops the caregiver, the retry fixes it
+        {ELENA_MODEL_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER_ELENA]}  # first attempt drops the caregiver, the retry fixes it
     )
     service = await make_service(fake)
     with caplog.at_level(logging.INFO, logger="app.engine.service"):
@@ -375,7 +381,8 @@ async def test_model_plans_are_reported_and_logged_without_names(make_service, c
     plans = result["modelPlans"]
     assert [p["attempt"] for p in plans] == [1, 2]
     assert plans[0]["plan"] == ACTIVE_OCTOBER and "primary_caregiver" not in json.dumps(plans[0])
-    assert any("Elena Rostova" in f for f in plans[1]["feedback"])  # what the retry was told to fix
+    # what the retry was told to fix: the named person it dropped (caught by the resolver as an unused person_1)
+    assert any("unused:person" in f for f in plans[1]["feedback"])
     assert result["fallbackReason"] == "no_deterministic_plan"  # this test service has no semantic router
     logged = [r for r in caplog.records if r.getMessage() == "local model RequestIR generated"]
     assert [r.attempt for r in logged] == [1, 2]

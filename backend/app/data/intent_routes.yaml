@@ -110,6 +110,36 @@ direct:
     # Words right AFTER an attribute that make it a condition, not something to show ("with room numbers starting
     # with A"), like a value does ("room 101"). The text-match verbs of grounding's text-match check.
     condition_cues: [start, starts, starting, begin, begins, beginning, contain, contains, containing]
+  # Simple questions about ONE named person ("Who is Jone?", "What is Jone's designation?", "Is Jone active?"),
+  # answered by the fast path from the people the app knows (residents, staff, family members) with no model call.
+  # Every word must be one of these words/phrases except one name (app/nlu/person_question.py). One person → their
+  # record; several → the user picks; nobody → the normal pipeline. Resident attributes come from lookup_attributes.
+  person_questions:
+    fillers: [who, "who's", whom, whose, what, "what's", which, is, are, was, were, does, do, did, the, a, an, of, for,
+              to, at, in, on, with, me, my, us, tell, about, show, give, get, find, look, up, lookup, details, detail,
+              info, information, profile, please, currently, current, his, her, their, s, belong, belongs, works, work,
+              working, "'s", there, any, all, list, or, staying, stay, stays, live, lives, living, located, kept, placed]
+    # a word naming the kind of person narrows the search ("staff member Jone")
+    kinds:
+      resident: [resident, patient]
+      staff: [staff member, staff, employee]
+      family: [family member, family contact, relative]
+    # yes/no questions: "Is Jone active?" (the staff member's / resident's status)
+    checks: {active: active, inactive: inactive}
+    staff_attributes:
+      staff_designation: [designation, designations, job title, title, position, job]
+      staff_role: [role, roles]
+      staff_residents: [assigned residents, residents assigned, residents, patients, caseload, who does look after]
+      staff_resident_count: [how many residents, number of residents, resident count, number of assigned residents]
+      staff_phone: [phone, phones, phone number, phone numbers, mobile, contact number]
+      staff_email: [email, emails, email address, email addresses, mail]
+    # attributes both residents and staff have: the person decides which one is meant
+    shared_attributes:
+      facility: [facility, facilities, wing, building]
+      status: [status]
+    family_attributes:
+      family_relationship: [relationship, related, relation]
+    max_options: 6
   # Lookups answer only what was asked: these words pick the resident attributes to show ("what is the room number of
   # resident_1" → room_number). No match → the full profile ("tell me about resident_1"). Single words of 5+ letters
   # also match with a small typo ("staus" → status).
@@ -189,7 +219,7 @@ direct:
     available, overall, altogether, entire, whole, complete, full, as, it, that, this, its, so, far, presently,
     currently, at, moment, exist, exists, existing, registered, record, records, system, database, data, let, know,
     during, within, recently, recent, ago, period, were, who, where, still, listed, belong, belongs,
-    belonging
+    belonging, staying, stay, stays, stayed, live, lives, living, located
   ]
 
 routes:

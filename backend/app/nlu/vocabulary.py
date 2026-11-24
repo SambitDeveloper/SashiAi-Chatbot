@@ -9,7 +9,10 @@ Everything here is driven by values loaded from the database:
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 
+import yaml
 from rapidfuzz import fuzz
 
 from app.data.repository import Vocabulary
@@ -96,6 +99,35 @@ class _IndexedFamily:
 _STAFF_TITLES = {"dr", "doctor", "nurse", "rn", "lpn", "cna", "aide", "coordinator"}
 
 
+@lru_cache
+def _app_words() -> frozenset[str]:
+    """Every word of the assistant's own wording (app/data/intent_routes.yaml: route utterances, filler, field and
+    attribute words — generic language only, never a person's name) plus statuses and care types. A lowercase word
+    from this set is the question's wording, never a staff name ("will", "active", "status")."""
+    path = Path(__file__).resolve().parents[1] / "data" / "intent_routes.yaml"
+    words: set[str] = set()
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(k)
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+        elif isinstance(node, str):
+            words.update(re.findall(r"[a-z]+", node.lower()))
+
+    walk(yaml.safe_load(path.read_text(encoding="utf-8")) or {})
+    words |= {w for v in (*STATUSES, *CARE_TYPES) for w in v.split("_")}
+    return frozenset(words)
+
+
+# Words right before a lowercase single name that make it a NAME position ("who is jone", "does jone look after",
+# "named jone", "nurse jone"): with no such word (or a possessive "jone's"), a lowercase word is never masked.
+_NAME_SLOT_BEFORE = {"is", "was", "about", "does", "did", "named", "called", "by", "and"}
+
+
 def _has_family_word(words: list[str]) -> bool:
     """Family vocabulary (resident_schema.yaml cue words: family, daughter, kin, ...) is the question's wording: a window
     containing one is never a family member's name, whatever a record happens to be called ("Family Member")."""
@@ -116,6 +148,55 @@ class MaskResult:
     persons: dict[str, dict[str, list]] = field(default_factory=dict)  # {"staff": [...], "family": [...], "residents": [...]}
     entity_originals: dict[str, str] = field(default_factory=dict)  # family_1 / person_1 → text the user typed
     entity_spans: list[tuple[int, int]] = field(default_factory=list)  # their positions in the ORIGINAL question
+    # What the MODEL reads: `text` with the remaining recognised people (staff names, a name several kinds of person
+    # share) also replaced by person_N. `text` itself is unchanged, so the deterministic stages read staff names exactly
+    # as before. None = same as `text`. Candidates of these person_N: `model_persons` (server side only).
+    model_text: str | None = None
+    model_persons: dict[str, dict[str, list]] = field(default_factory=dict)
+    # person_N of the PREVIOUS turn (conversation memory), for a follow-up whose model plan reuses them: used to resolve
+    # values only, never required to appear in this question's plan
+    inherited_persons: dict[str, dict[str, list]] = field(default_factory=dict)
+
+    def renumber_model_persons(self, after: int) -> None:
+        """Number this question's model-only person_N after `after` (the previous turn's), so a follow-up never has
+        two meanings for one placeholder."""
+        if not self.model_persons:
+            return
+        order = sorted(self.model_persons, key=lambda k: int(k.split("_")[1]))
+        mapping = {old: f"person_{after + i + 1}" for i, old in enumerate(order)}
+        text = self.for_model
+        text = re.sub(r"\bperson_\d+\b", lambda m: mapping.get(m.group(0), m.group(0)), text)
+        self.model_text = text
+        self.model_persons = {mapping[k]: v for k, v in self.model_persons.items()}
+        self.entity_originals = {mapping.get(k, k): v for k, v in self.entity_originals.items()}
+
+    def hide_names_in(self, value):
+        """A plan / RequestIR for conversation memory: any text value containing a recognised staff name becomes that
+        person_N (the next model call reads the previous plan; it must not carry the name)."""
+        if isinstance(value, dict):
+            return {k: self.hide_names_in(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self.hide_names_in(v) for v in value]
+        if isinstance(value, str) and self.model_persons:
+            for key in self.model_persons:
+                original = self.entity_originals.get(key)
+                if original and re.search(rf"(?<![A-Za-z]){re.escape(original)}(?![A-Za-z])", value, re.I):
+                    return key
+        return value
+
+    @property
+    def for_model(self) -> str:
+        return self.model_text if self.model_text is not None else self.text
+
+    def hide_names(self, text: str | None) -> str | None:
+        """Any text bound for the model (brief, retry hints) with the names behind model_persons replaced too."""
+        if not text or not self.model_persons:
+            return text
+        for key in sorted(self.model_persons, key=lambda k: -len(self.entity_originals.get(k, ""))):
+            original = self.entity_originals.get(key)
+            if original:
+                text = re.sub(rf"(?<![A-Za-z]){re.escape(original)}(?![A-Za-z])", key, text, flags=re.I)
+        return text
 
     @property
     def all_originals(self) -> dict[str, str]:
@@ -173,11 +254,13 @@ class EntityIndex:
         # every staff member who is a person (staffs; app/data/staff.py), assigned or not, any status: staff questions
         # ("Priya Raman's residents", "Dr. Hart's phone") name staff the caregiver list may not have
         self._staff: list[_IndexedCaregiver] = []
+        self._staff_rows: list[dict] = []  # parallel to _staff: designation and status, for "who is <name>" answers
         for row in getattr(vocab, "staff", []) or []:
             value = str(row.get("name") or "").strip()
             tokens = [t for t in _name_parts(value.split(",")[0]) if t not in _TITLE_WORDS]
             if value and tokens:
                 self._staff.append(_IndexedCaregiver(value, "".join(tokens), tokens))
+                self._staff_rows.append({"name": value, "designation": row.get("designation") or "", "status": row.get("status") or ""})
         self.staff_designations = sorted({str(r.get("designation")).strip() for r in getattr(vocab, "staff", []) or []
                                           if isinstance(r.get("designation"), str) and r.get("designation").strip()})  # fmt: skip
         self._rooms = {re.sub(r"[^a-z0-9]", "", r.lower()): r for r in vocab.rooms if not is_missing(r, "roomNumber")}
@@ -188,13 +271,120 @@ class EntityIndex:
         names → family_N, or person_N when the name also belongs to staff or to another resident named in the question.
         Without family names in the question the result is exactly what it was before family names existed."""
         if not (family and self._family):
-            return self._mask_residents(question)
+            result = self._mask_residents(question)
+            self._mask_people_for_model(result)
+            return result
         # A family member's FULL name ("Margaret Vance") is not a resident's surname ("Vance" → Eleanor Vance): it is
         # kept away from the resident matching, unless the same words are a resident's full name (then the resident
         # wins and the resident/family collision rule below applies).
         result = self._mask_residents(question, protected=self._family_full_spans(question))
         self._mask_family(question, result)
+        self._mask_people_for_model(result)
         return result
+
+    def _mask_people_for_model(self, result: MaskResult) -> None:
+        """Names still in the masked text that belong to known people → person_N, in `model_text` only.
+
+        Full names (2-4 words, typo tolerant like resident names) of staff members, and single capitalised words that
+        are a staff member's first or last name ("What is Jone's designation?"). A single word is never the first word
+        of the question unless it is possessive ("Jone's …"), and never a staff word ("Nurse", "Physician"), a family
+        word or a title. Candidates of every kind are kept (staff, residents, family members), so the backend — not
+        the model — decides who is meant."""
+        if not self._staff:
+            return
+        from app.data.staff import staff_config  # local: the data layer imports this module
+
+        cfg = staff_config()
+        text = result.text
+        tokens = [(m.group(0), m.start(), m.end()) for m in _TOKEN_RE.finditer(text)]
+
+        def placeholder(j: int) -> bool:
+            return text[tokens[j][2] : tokens[j][2] + 1] == "_"  # resident_1 / family_2 / person_3
+
+        def vocabulary_word(tok: str) -> bool:
+            n = _norm(tok)
+            return (n in _TITLE_WORDS or n in _STAFF_TITLES or _has_family_word([n])
+                    or (cfg is not None and cfg.cue_in(tok.rstrip(".")) is not None and cfg.cue_in(tok.rstrip(".")).lower() == tok.lower().rstrip(".")))  # fmt: skip
+
+        used: set[int] = set()
+        found: list[tuple[int, int, dict]] = []
+        for size in (4, 3, 2):
+            for i in range(len(tokens) - size + 1):
+                idx = range(i, i + size)
+                if any(j in used or placeholder(j) or vocabulary_word(tokens[j][0]) for j in idx):
+                    continue
+                words = [_norm(tokens[j][0]) for j in idx]
+                concat = "".join(words)
+                if len(concat) < 5 or any(len(w) < 2 for w in words):
+                    continue
+                staff = [c.value for c in self._staff if len(c.tokens) > 1 and self._window_is_name(words, c.tokens)
+                         and fuzz.ratio(concat, c.person) >= FULL_NAME_THRESHOLD]  # fmt: skip
+                if staff:
+                    found.append((tokens[i][1], tokens[i + size - 1][2], self._candidates(words, staff)))
+                    used.update(idx)
+        for j, (tok, start, end) in enumerate(tokens):
+            if j in used or placeholder(j) or vocabulary_word(tok):
+                continue
+            possessive = tok.lower().replace("’", "'").endswith("'s")
+            if j == 0 and not possessive:
+                continue  # "Will you …", "May I …": a first word is not evidence of a name
+            n = _norm(tok)
+            if not tok[0].isupper():
+                # lowercase ("what is jone's designation"): only a word the assistant's own wording never uses, in a
+                # name position (possessive, after "is / does / named …", or after a title / staff word)
+                prev = _norm(tokens[j - 1][0]) if j > 0 else ""
+                titled = prev in _TITLE_WORDS or prev in _STAFF_TITLES or (cfg is not None and cfg.cue_in(prev) is not None)
+                if n in _app_words() or not (possessive or prev in _NAME_SLOT_BEFORE or titled):
+                    continue
+            staff = [c.value for c in self._staff if n in c.tokens] if len(n) >= 3 else []
+            if staff:
+                found.append((start, end, self._candidates([n], staff)))
+        # a resident placeholder from ONE word that is also a staff member's name ("Who is Jane?": resident Jane Austen
+        # or staff member Jane Okafor) is a person_N for the model too; the deterministic stages keep resident_N
+        for key, original in result.originals.items():
+            words = _name_parts(original)
+            staff = [c.value for c in self._staff if len(words) == 1 and words[0] in c.tokens]
+            for m in re.finditer(rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![0-9])", text) if staff else []:
+                cand = self._candidates(words, staff)
+                cand["residents"] = list(dict.fromkeys([*result.placeholders.get(key, []), *cand["residents"]]))
+                found.append((m.start(), m.end(), {**cand, "_original": original}))
+        if not found:
+            return
+        taken = [int(k.split("_")[1]) for k in result.persons]
+        number = max(taken, default=0)
+        pieces, last = [], 0
+        for start, end, cand in sorted(found, key=lambda x: x[0]):
+            while end > start and text[end - 1] in ".-":  # "Sarah Jenkins." — the full stop is not part of the name
+                end -= 1
+            if text[end - 2 : end].lower() in ("'s", "\u2019s"):
+                end -= 2  # the possessive stays outside the placeholder
+            number += 1
+            key = f"person_{number}"
+            original = cand.pop("_original", None)
+            result.model_persons[key] = cand
+            result.entity_originals[key] = original or text[start:end]
+            pieces.append(text[last:start] + key)
+            last = end
+        result.model_text = "".join(pieces) + text[last:]
+
+    def _candidates(self, words: list[str], staff: list[str]) -> dict[str, list]:
+        """Everyone a recognised name may be: the matched staff, plus residents and family members with that name."""
+        residents = [r.resident_id for r in self._residents if all(w in [*r.first, *r.last] for w in words)]
+        family = [self._family_view(m) for m in self._family if all(w in m.tokens for w in words)]
+        return {"staff": list(dict.fromkeys(staff)), "residents": residents, "family": family}
+
+    def people_hint(self, mask: "MaskResult") -> str | None:
+        """For the model: what kind of person each person_N is — kinds and counts only, never a name."""
+        persons = {**getattr(mask, "persons", {}), **getattr(mask, "model_persons", {})}
+        lines = []
+        for key in sorted(persons, key=lambda k: int(k.split("_")[1])):
+            c = persons[key]
+            kinds = [f"{label} ({len(c.get(k) or [])} record{'s' if len(c.get(k) or []) != 1 else ''})"
+                     for k, label in (("staff", "staff member"), ("residents", "resident"), ("family", "family member"))
+                     if c.get(k)]  # fmt: skip
+            if kinds:
+                lines.append(f"{key} = {' or '.join(kinds)}")
+        return "- people named (the backend resolves them): " + "; ".join(lines) if lines else None
 
     def _family_full_spans(self, question: str) -> list[tuple[int, int]]:
         tokens = [(m.group(0), m.start(), m.end()) for m in _TOKEN_RE.finditer(question)]
@@ -556,6 +746,33 @@ class EntityIndex:
 
     def resolve_caregiver(self, text: str) -> Resolution:
         return self._resolve_person(text, self._caregivers)
+
+    def people_named(self, name: str, kind: str | None = None) -> dict[str, list[dict]]:
+        """Every known person whose name contains ALL words of `name` (exact words, any order; staff titles ignored):
+        {"residents": [{id, name}], "staff": [{name, designation, status}], "family": [{id, name, relation, residentId}]}.
+        `kind` (resident / staff / family) limits the search. Exact words only: a typo is not a person here."""
+        words = [t for t in _name_parts(name) if t not in _TITLE_WORDS]
+        out: dict[str, list[dict]] = {"residents": [], "staff": [], "family": []}
+        if not words:
+            return out
+        if kind in (None, "resident"):
+            out["residents"] = [{"id": r.resident_id, "name": r.display} for r in self._residents
+                                if all(w in [*r.first, *r.last] for w in words)]  # fmt: skip
+        if kind in (None, "staff"):
+            seen: set[tuple[str, str]] = set()
+            # a name written exactly as recorded ("Care Coordinator Maya Patel") is that record, not every Maya Patel
+            exact = " ".join(name.split()).lower()
+            whole = any(c.value.lower() == exact for c in self._staff)
+            for c, row in zip(self._staff, self._staff_rows, strict=True):
+                key = (c.value, row["designation"])
+                hit = c.value.lower() == exact if whole else all(w in c.tokens for w in words)
+                if hit and key not in seen:
+                    seen.add(key)
+                    out["staff"].append(dict(row))
+        if kind in (None, "family"):
+            out["family"] = [{"id": m.member_id, "name": m.name, "relation": m.relation, "residentId": m.resident_id}
+                             for m in self._family if all(w in m.tokens for w in words)]  # fmt: skip
+        return out
 
     def staff_name_tokens(self) -> set[str]:
         """Every word of a staff or caregiver name (titles excluded): "Dr. Raman" is a title + a name, not a role."""

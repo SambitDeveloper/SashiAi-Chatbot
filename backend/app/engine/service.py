@@ -23,9 +23,11 @@ from typing import Any
 import yaml
 
 from app.config import Settings
-from app.data.relations import plan_uses_family
+from app.data.relations import family_relation, plan_uses_family
 from app.data.repository import ResidentRepository
 from app.data.scope import facility_scope
+from app.data.staff import staff_config
+from app.engine import people
 from app.engine.caller import CallerContext, use_caller
 from app.engine.describe import describe_plan
 from app.engine.executor import execute
@@ -42,6 +44,7 @@ from app.nlu.direct_query import DirectQueryBuilder
 from app.nlu.grammar import skeleton as grammar_skeleton
 from app.nlu.intent_router import DEFAULT_ROUTES_FILE, SemanticIntentRouter
 from app.nlu.missing_values import MissingValueDetector
+from app.nlu.person_question import PersonQuestionParser
 from app.nlu.projection import ProjectionDetector
 from app.nlu.references import ReferenceResolver
 from app.nlu.request_ir import IRCompilationError, compile_request_ir, normalize_request_ir, request_ir_from_plan
@@ -81,6 +84,8 @@ _CATEGORY = {
     "clarify": "AMBIGUOUS_QUERY",
     "unsupported": "OUT_OF_POLICY",
 }
+# staff plans (plan.entity == "staff") are labelled as staff questions
+_STAFF_CATEGORY = {"count": "STAFF_COUNT", "list": "STAFF_LIST", "breakdown": "STAFF_BREAKDOWN", "lookup": "STAFF_LOOKUP"}
 
 
 @dataclass
@@ -157,10 +162,12 @@ def _compile_hint(exc: IRCompilationError) -> str:
     return "\n".join(lines)
 
 
-def _compile_failure_message(failure: dict | None, mask: Any) -> str:
-    """What the user reads when no executable plan is left. Written by the backend; quotes are the user's own words."""
+def _compile_failure_message(failure: dict | None, mask: Any, subject: str = "resident") -> str:
+    """What the user reads when no executable plan is left. Written by the backend; quotes are the user's own words.
+    `subject`: who the question is about (resident / staff / family), so the example fits the question."""
+    declined = DECLINED_MESSAGES.get(subject, MODEL_DECLINED_MESSAGE)
     if not failure:
-        return MODEL_DECLINED_MESSAGE
+        return declined
 
     def unmask(text: str) -> str:
         return ph.unmask(text, getattr(mask, "all_originals", None) or getattr(mask, "originals", {}) or {})
@@ -173,15 +180,26 @@ def _compile_failure_message(failure: dict | None, mask: Any) -> str:
     if failure.get("code") == "declared_ambiguous" and shown:
         return f"Could you clarify what you mean by {shown}? I want to be sure I answer the right question."
     if failure.get("code") == "declared_unsupported" and shown:
-        return (f"The resident records can't answer {shown}. You can ask the question without that part, or "
-                "rephrase it.")  # fmt: skip
-    return MODEL_DECLINED_MESSAGE
+        return (f"The {subject if subject in ('staff', 'family') else 'resident'} records can't answer {shown}. You can "
+                "ask the question without that part, or rephrase it.")  # fmt: skip
+    return declined
 
 
 def _cache_key(today: str, masked_question: str, previous_json: str | None, context: str = "") -> str:
     """`context`: vocabulary/schema version, data scope and model identity — when any changes, nothing is reused."""
     normalised = " ".join(masked_question.lower().split())
     return hashlib.sha256(f"{today}\n{normalised}\n{previous_json or ''}\n{context}".encode()).hexdigest()
+
+
+def _bindings(mask: Any) -> str:
+    """Who every placeholder of a masked question stands for (a hash, no names). "What room is resident_1 in?" reads
+    the same for every resident: a failure remembered for one must never be replayed for another (failure cache)."""
+    people = {
+        "residents": {k: sorted(v) for k, v in (getattr(mask, "placeholders", {}) or {}).items()},
+        **{kind: {k: json.dumps(v, sort_keys=True, default=str) for k, v in (getattr(mask, kind, {}) or {}).items()}
+           for kind in ("family", "persons", "model_persons", "inherited_persons")},
+    }  # fmt: skip
+    return hashlib.sha256(json.dumps(people, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def _session_cache_key(session_id: str, context: str) -> str:
@@ -213,6 +231,13 @@ MODEL_DECLINED_MESSAGE = (
     "I couldn't work out a safe way to answer that from the resident records. Please rephrase it, for example: "
     "'active residents in memory care admitted last month' or 'what is <resident name>'s room?'."
 )
+DECLINED_MESSAGES = {
+    "resident": MODEL_DECLINED_MESSAGE,
+    "staff": "I couldn't work out a safe way to answer that from the staff records. Please rephrase it, for example: "
+    "'what is <staff name>'s designation?' or 'how many active physicians are there?'.",
+    "family": "I couldn't work out a safe way to answer that from the family records. Please rephrase it, for example: "
+    "'who are <resident name>'s family members?'.",
+}
 
 
 def _clarify_message(g) -> str:
@@ -302,6 +327,8 @@ class QueryService:
         )
         routes = intent_router.config if intent_router is not None else _load_routes(settings)
         self.routes = routes
+        direct = routes.get("direct") or {}
+        self.person_questions = PersonQuestionParser(direct.get("person_questions"), direct.get("lookup_attributes"))
         # Question structure (subjects, references, comparisons): shared by the pre-check below and the validator.
         self.structure = StructureAnalyzer(routes)
         # Stage 1: comparisons with another resident (or among residents) are not supported yet. They are answered
@@ -426,6 +453,9 @@ class QueryService:
         stopped = await self._screen(t)  # 05 topic · 06 policy
         if stopped is not None:
             return stopped
+        stopped = await self._answer_person(t)  # "Who is Jone?": the people we know, no model (logged as 09 fast path)
+        if stopped is not None:
+            return stopped
         await self._plan_deterministic(t)  # 07 comparison · 08 intent · 09 fast path
         await self._plan_from_template(t)  # 10 semantic cache
         self._plan_from_failure_cache(t)  # 11 failure cache
@@ -462,6 +492,10 @@ class QueryService:
         previous_plan = previous_entry.get("plan") if previous_entry else None
         previous_filters = dict((previous_plan or {}).get("filters") or {}) if previous_plan else {}
         previous_json = json.dumps(previous, sort_keys=True, separators=(",", ":")) if previous else None
+        inherited = dict((previous_entry or {}).get("persons") or {})
+        if inherited:  # a follow-up may reuse the previous turn's person_N: keep their candidates, number new ones after
+            mask.inherited_persons = inherited
+            mask.renumber_model_persons(max((int(k.split("_")[1]) for k in inherited), default=0))
         trace.record("conversation_memory", "previous_plan" if previous else "none",
                      previous_action=(previous or {}).get("action"))  # fmt: skip
         return _Turn(
@@ -469,7 +503,7 @@ class QueryService:
             budget_s=self.settings.llm_request_budget_seconds or self.settings.llm_timeout_seconds,
             today=today, today_d=today_d, mask=mask, scan=scan, structure=structure, session_key=session_key,
             previous=previous, previous_filters=previous_filters, previous_json=previous_json,
-            failure_key=_cache_key(today, mask.text, previous_json, self.cache_context),
+            failure_key=_cache_key(today, mask.text, previous_json, f"{self.cache_context}|{_bindings(mask)}"),
             refers_back=self.reference_resolver.resolve(mask.text, previous is not None).refers_to_previous,
             template_view=QuestionView(
                 mask.text, list(mask.placeholders), scan, self.index, self.date_anchors, dict(mask.placeholders)
@@ -687,11 +721,12 @@ class QueryService:
                 "questions still work, e.g. 'How many active residents are in memory care?'.",
                 request_ir_status=t.ir_status,
             )
-        t.brief = self._question_brief(t.question, t.mask, t.intent, t.today_d)
+        t.brief = self._model_brief(t)
         trace.start("local_model")
         try:
             translation = await self.translator.translate(
-                self._request(t.mask.text, t.today, t.previous_json, t.scan, brief=t.brief, timeout_s=t.budget_left())
+                self._request(t.mask.text, t.today, t.previous_json, t.scan, brief=t.brief, timeout_s=t.budget_left(),
+                              model_question=t.mask.for_model)
             )
         except TranslatorUnavailable as exc:
             self.stats.llm_errors += 1
@@ -735,7 +770,10 @@ class QueryService:
 
     def _resolve(self, t: _Turn):
         started = time.perf_counter()
-        out = resolve_plan(t.raw, self.index, t.mask, t.question)
+        mask = t.mask
+        if t.tier in ("llm", "cache") and mask.model_persons:  # the model wrote person_N for the names it was not shown
+            mask = dataclasses.replace(mask, persons={**mask.persons, **mask.model_persons})
+        out = resolve_plan(t.raw, self.index, mask, t.question)
         t.timing["resolve_ms"] += round((time.perf_counter() - started) * 1000)
         return out
 
@@ -774,8 +812,9 @@ class QueryService:
                     t.today,
                     t.previous_json,
                     t.scan,
-                    hint=hint,
+                    hint=t.mask.hide_names(hint),
                     brief=t.brief,
+                    model_question=t.mask.for_model,
                     retry_ir_json=retry_ir,
                     timeout_s=left,
                 )
@@ -817,6 +856,10 @@ class QueryService:
             ]
             if await self._retry_once(t, outcome.hint, [outcome.problem], trigger=trigger):
                 outcome = self._resolve(t)
+            if outcome.problem and outcome.problem.startswith(("role:", "invented:", "unused:")) and t.retried:
+                # the model failed again on its one retry: the same question in the same context must not cost model
+                # calls again (like a grounding failure below)
+                self.failures.set(t.failure_key, {"problems": [outcome.problem], "message": outcome.plan.message})
         plan = outcome.plan
         grounding_problems: list[str] = []
         g = None
@@ -860,7 +903,7 @@ class QueryService:
             and plan.action in ("clarify", "unsupported")
         ):
             t.model_trace.append({"model_message_replaced": True, "action": plan.action})
-            plan = QueryPlan(action="clarify", message=_compile_failure_message(t.compile_failure, t.mask))
+            plan = QueryPlan(action="clarify", message=_compile_failure_message(t.compile_failure, t.mask, self._subject(t)))
 
         trace.record("resolve_values", "ok" if not outcome.problem else "clarify", duration_ms=t.timing["resolve_ms"],
                      problem=reason_code(outcome.problem), action=plan.action)  # fmt: skip
@@ -944,7 +987,9 @@ class QueryService:
                 t.session_key,
                 {
                     "plan": plan.model_dump(mode="json", exclude_none=True),
-                    "request_ir": t.request_ir,
+                    # what the next model call reads as the previous plan: staff names as this turn's person_N
+                    "request_ir": t.mask.hide_names_in(t.request_ir),
+                    "persons": {**t.mask.inherited_persons, **t.mask.persons, **t.mask.model_persons},
                 },
             )
         trace.record("remember", "ok", template_recorded=template_recorded,
@@ -988,6 +1033,7 @@ class QueryService:
             request_ir_status=t.ir_status,
             validation_result="passed" if g and g.ok else "rejected" if g else "not_run",
             response_generation="phrased" if phrasing and phrasing.status == "phrased" else "template",
+            subject=None if plan.is_data_query else self._subject(t),  # a clarification: who the question is about
         )
 
     def _count_call(self, calls: ModelCalls, error: str | None) -> None:
@@ -1008,7 +1054,8 @@ class QueryService:
         """
         normalized, rewrites = normalize_request_ir(ir) if isinstance(ir, dict) else (ir, [])
         try:
-            _, plan = compile_request_ir(normalized, t.mask.text, self.index.statuses, self.index.care_types)
+            # evidence is quoted from what the model read (staff names there are person_N)
+            _, plan = compile_request_ir(normalized, t.mask.for_model, self.index.statuses, self.index.care_types)
         except IRCompilationError as exc:
             self._trace_model(t.query_id, t.model_trace, attempt, ir, t.mask, feedback=feedback,
                               error="unexecutable RequestIR")  # fmt: skip
@@ -1094,14 +1141,40 @@ class QueryService:
     def _request(
         self, masked: str, today: str, previous_json: str | None, scan: DateScan, hint: str | None = None,
         brief: str | None = None, retry_ir_json: str | None = None, timeout_s: float | None = None,
+        model_question: str | None = None,
     ) -> TranslationRequest:
+        """`masked`: the masked question the date/number scan ran on (its positions); `model_question`: what the model
+        reads (the same, with recognised staff names as person_N as well). None → `masked`."""
         context = self.schema_context(self._relevant_wings(masked, previous_json))
+        # only the relation sections this question can need (each costs hundreds of prompt tokens on every call)
+        context.family_rules, context.staff_rules = self._relations_needed(model_question or masked, previous_json, brief)
         hints = scan.hints() + [
             f"'{masked[n.start : n.end]}' = age {' '.join(f'{k} {v}' for k, v in n.bounds.items())}" for n in scan.numbers
         ]
         return TranslationRequest(
-            masked, today, context, previous_json, hints, hint, brief, retry_ir_json, timeout_s=timeout_s
+            model_question or masked, today, context, previous_json, hints, hint, brief, retry_ir_json, timeout_s=timeout_s
         )
+
+    @staticmethod
+    def _relations_needed(question: str, previous_json: str | None, brief: str | None) -> tuple[bool, bool]:
+        """(family, staff): does the model need the family / staff rules for this question? A relation word, a person
+        placeholder that may be that kind of person, or a previous plan that used the relation's fields."""
+        text = f"{question}\n{brief or ''}"
+        prev = previous_json or ""
+        rel, cfg = family_relation(), staff_config()
+        person = re.search(r"\bperson_\d+\b", question) is not None
+        family = (rel is not None and rel.cue_in(question, question) is not None) or person or "family_" in text or "family_" in prev
+        staff = (cfg is not None and cfg.cue_in(question) is not None) or person or "staff member" in text or '"staff' in prev
+        return family, staff
+
+    def _model_brief(self, t: _Turn) -> str | None:
+        """The analysis brief, with names the model must not see replaced, plus what kind each person_N is."""
+        brief = t.mask.hide_names(self._question_brief(t.question, t.mask, t.intent, t.today_d))
+        people_line = self.index.people_hint(t.mask)
+        if people_line:
+            head = "Analysis (automatic, may be wrong; the question decides):"
+            brief = f"{brief}\n{people_line}" if brief else f"{head}\n{people_line}"
+        return brief
 
     def _question_brief(self, question: str, mask, intent, today_d: date) -> str | None:
         """The analysis brief for the local model (nlu/brief.py); None when disabled or nothing was understood."""
@@ -1132,9 +1205,11 @@ class QueryService:
         self, query_id, question, plan: QueryPlan, matched, total, response, tier, usage: ModelUsage, latency,
         model_trace: list[dict] | None = None, fallback_reason: str | None = None, calls: ModelCalls | None = None,
         request_ir_status: str = "not_run", validation_result: str = "not_run",
-        response_generation: str = "template",
+        response_generation: str = "template", subject: str | None = None,
     ) -> dict[str, Any]:
+        """`subject`: who the question is about when the plan does not say (a clarification about staff / a person)."""
         calls = calls or ModelCalls()
+        staff = plan.entity == "staff" or subject == "staff"
         interpretation = describe_plan(plan, lambda i: self.index.display_by_id.get(i, i))
         plan_json = plan.model_dump(mode="json", exclude_none=True)
         is_data = plan.is_data_query
@@ -1169,11 +1244,11 @@ class QueryService:
             "pipelineLatencyMs": latency,
             "policy": {
                 "passed": plan.action != "unsupported",
-                "policyCategory": "OUT_OF_SCOPE" if plan.action == "unsupported" else "RESIDENT_INTENT",
+                "policyCategory": "OUT_OF_SCOPE" if plan.action == "unsupported" else "STAFF_INTENT" if staff else "RESIDENT_INTENT",
                 "violationReason": plan.message if plan.action == "unsupported" else None,
             },
             "intent": {
-                "category": _CATEGORY[plan.action],
+                "category": (_STAFF_CATEGORY.get(plan.action) if plan.entity == "staff" else None) or _CATEGORY[plan.action],
                 "confidence": 1.0 if tier in ("cache", "direct", "template") else 0.9,
                 "matchedPattern": " · ".join(interpretation) or plan.action,
                 "parameters": plan_json,
@@ -1185,7 +1260,8 @@ class QueryService:
                 "jsonrpc": "2.0",
                 "id": query_id,
                 "method": "tools/call",
-                "params": {"name": "care_app.query_residents", "arguments": plan_json},
+                "params": {"name": "care_app.query_staff" if plan.entity == "staff" else "care_app.query_residents",
+                           "arguments": plan_json},
             }
             if is_data
             else None,
@@ -1193,7 +1269,7 @@ class QueryService:
                 "jsonrpc": "2.0",
                 "id": query_id,
                 "result": {
-                    "tool": "care_app.query_residents",
+                    "tool": "care_app.query_staff" if plan.entity == "staff" else "care_app.query_residents",
                     "data": {"matched": matched, "total": total},
                     "totalMatched": matched,
                     "filtersApplied": plan_json.get("filters", {}),
@@ -1204,6 +1280,72 @@ class QueryService:
             else None,
             "response": {**response, "isLlmInterpreted": tier == "llm"},
         }
+
+    async def _answer_person(self, t: _Turn) -> dict[str, Any] | None:
+        """Fast path for simple questions about ONE named person ("Who is Jone?", "What is Jone's designation?",
+        "Is Jone active?"): the candidates the index knows, limited to the kinds the question can be about, then one
+        ordinary lookup plan executed and answered like any other, or a clarification listing exactly who matches.
+        No model call, so the name never leaves the server. A name that only residents have and that the masking
+        already recognised keeps the usual resident path; nobody with that name → the normal pipeline."""
+        if t.refers_back:
+            return None
+        asked = self.person_questions.parse(t.question)
+        if asked is None or not asked.kinds:
+            return None
+        found = people.candidates(asked, self.index)
+        kinds = [k for k, v in found.items() if v]
+        if not kinds:
+            return None
+        if (kinds == ["residents"] and t.mask.placeholders and asked.kind is None and not asked.detail
+                and len(found["residents"]) == 1):
+            return None  # ONE resident: the resident fast path answers it (and remembers the resident for follow-ups)
+        trace = t.trace
+        trace.skip_until("fast_path", "question about one named person")
+        single = len(kinds) == 1 and (kinds[0] == "staff" and len({s["name"] for s in found["staff"]}) <= 5
+                                      or len(found[kinds[0]]) == 1)  # fmt: skip
+        if single:
+            kind = kinds[0]
+            plan = people.plan_for(asked, kind, found[kind])
+            trace.record("fast_path", "answered", method="person name", kind=kind)
+            data = await execute(plan, self.repo)
+            if kind == "staff" and data.staff_rows and asked.detail:  # same name, another designation: another person
+                wanted = {s["designation"] for s in found["staff"]}
+                data.staff_rows = [r for r in data.staff_rows if r.get("designation") in wanted] or data.staff_rows
+                data.matched = len(data.staff_rows)
+            response, matched, total = build_response(plan, data), data.matched, data.total
+            subject = "staff" if kind == "staff" else "resident"
+        else:
+            plan = QueryPlan(action="clarify", message=people.message(asked, found))
+            trace.record("fast_path", "clarified", method="person name", candidates=sum(len(v) for v in found.values()))
+            response = {
+                "headline": "Which person do you mean?",
+                "summaryText": plan.message,
+                "count": 0,
+                "needsClarification": True,
+                "clarificationOptions": people.options(asked, found, self.index, self.person_questions.kind_words,
+                                                       self.person_questions.max_options),
+            }  # fmt: skip
+            matched = total = 0
+            subject = "staff" if kinds == ["staff"] else "person"
+        self.stats.queries += 1
+        self.stats.by_tier["direct"] += 1
+        latency = round((time.perf_counter() - t.started) * 1000)
+        trace.finish("clarified" if plan.action == "clarify" else "answered", tier="direct", model_calls=0)
+        return self._result(t.query_id, t.question, plan, matched, total, response, "direct", ModelUsage(), latency,
+                            validation_result="ok" if plan.is_data_query else "not_run", subject=subject)  # fmt: skip
+
+    def _subject(self, t: _Turn) -> str:
+        """Who a question is about, for the backend's own messages: staff (a staff word or a recognised staff name),
+        family (a family word or family member), otherwise residents."""
+        cfg = staff_config()
+        staff_named = any((c or {}).get("staff") for c in {**t.mask.persons, **t.mask.model_persons}.values())
+        about_residents = re.search(r"\b(?:residents?|patients?)\b", t.question, re.I) and not t.mask.model_persons
+        if (staff_named or (cfg is not None and cfg.cue_in(t.question))) and not about_residents:
+            return "staff"
+        rel = family_relation()
+        if t.mask.family or (rel is not None and rel.cue_in(t.question, t.mask.text)):
+            return "family"
+        return "resident"
 
     def _gated(self, query_id: str, question: str, started: float) -> dict[str, Any]:
         self.stats.queries += 1
@@ -1296,3 +1438,4 @@ def _redact_for_log(raw: Any) -> Any:
 def _unmask(text: str, originals: dict[str, str]) -> str:
     """resident_1 / family_1 / person_1 → the name the user typed for that placeholder."""
     return ph.unmask(text, originals)
+

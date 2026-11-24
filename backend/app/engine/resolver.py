@@ -57,6 +57,8 @@ def _reference_was_mentioned(ref: str, question: str, mask: MaskResult) -> bool:
     lowered = value.lower()
     if re.fullmatch(r"resident_\d+", lowered):
         return lowered in mask.placeholders
+    if ph.kind_of(lowered) == ph.PERSON:  # a recognised name: only when it can be a resident
+        return bool(_person(mask, lowered).get("residents"))
     mentioned_ids = {rid.upper() for ids in mask.placeholders.values() for rid in ids}
     if value.upper() in mentioned_ids:
         return True
@@ -89,16 +91,21 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
     if uses_family and not caller.can_read_family:
         return ResolveOutcome(_clarify("You don't have access to family information."), problem="forbidden:family")
     people = {**mask.family, **mask.persons} if hasattr(mask, "family") else {}
-    if people:
+    inherited = getattr(mask, "inherited_persons", {}) or {}  # person_N of the previous turn (a follow-up)
+    if people or inherited:
         written = _placeholders_written(plan)
-        unused = [p for p in people if p not in written]
+        # only THIS question's people must be used, and only by a plan that queries data (a declined or clarifying
+        # answer uses nobody: the backend's own message covers it)
+        data_plan = plan.get("action") in ("count", "list", "breakdown", "aggregate", "lookup")
+        unused = [p for p in people if p not in written] if data_plan else []
         if unused:  # a person the question names is never silently dropped
             who = mask.entity_originals.get(unused[0], unused[0])
             return ResolveOutcome(
                 _clarify(f'I couldn\'t tell how "{who}" relates to your question. Could you rephrase it?'),
                 problem="unused:person",
-                hint=" ".join(f"The question names {p}: use it (family_member eq {p}, or a person_N as a primary_caregiver"
-                              " value when the question is about a caregiver); never drop it." for p in unused),
+                hint=" ".join(f"The question names {p}: use it (a primary_caregiver value when the question is about a"
+                              f" caregiver, lookup.staff / staff_name for a staff member, family_member eq {p} for a family"
+                              " member); never drop it." for p in unused),
             )  # fmt: skip
         caregiver = plan["filters"].get("primary_caregiver")
         if isinstance(caregiver, dict):
@@ -114,7 +121,7 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
                             hint=f"{text} is a family member, not a caregiver: use family_member eq {text}.",
                         )
                     if kind == ph.PERSON:  # the staff reading of a name that is also a family member's
-                        staff = mask.persons.get(str(text).lower(), {}).get("staff") or []
+                        staff = _person(mask, str(text)).get("staff") or []
                         if not staff:
                             who = mask.entity_originals.get(str(text).lower(), str(text))
                             return ResolveOutcome(
@@ -199,7 +206,11 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
     if isinstance(lookup, dict):
         ids: list[str] = []
         for ref in lookup.get("residents", []) or []:
-            res = index.resolve_resident(str(ref), mask.placeholders)
+            if ph.kind_of(str(ref)) == ph.PERSON:  # a name several kinds of person share: its resident reading
+                ids_ = _person(mask, str(ref)).get("residents") or []
+                res = Resolution(list(ids_), ambiguous=len(ids_) > 1)
+            else:
+                res = index.resolve_resident(str(ref), mask.placeholders)
             if not res.values:
                 unknown.append(mask.originals.get(str(ref).lower(), str(ref)))
             elif res.ambiguous:
@@ -230,7 +241,7 @@ def resolve_plan(raw: dict, index: EntityIndex, mask: MaskResult, question: str)
         for text in fm.get("include", []) or []:
             key = str(text).lower()
             who = mask.entity_originals.get(key, str(text))
-            cands = (mask.family.get(key) or (mask.persons.get(key) or {}).get("family") or []) if people else []
+            cands = (mask.family.get(key) or _person(mask, key).get("family") or []) if people or inherited else []
             cands = [c for c in cands if caller.allows_facility(c.get("facilityId"))]  # authorised facilities only
             if scope_ids:
                 cands = [c for c in cands if str(c.get("residentId", "")).upper() in scope_ids]
@@ -296,16 +307,22 @@ def _placeholders_written(plan: dict) -> set[str]:
         if isinstance(f, dict):
             out |= {str(v).lower() for b in ("include", "exclude") for v in f.get(b, []) or [] if ph.is_placeholder(str(v))}
     lookup = plan.get("lookup")
-    if isinstance(lookup, dict):
-        out |= {str(v).lower() for v in lookup.get("staff") or [] if ph.is_placeholder(str(v))}
+    if isinstance(lookup, dict):  # a person looked up as a resident or as a staff member is used
+        out |= {str(v).lower() for k in ("staff", "residents") for v in lookup.get(k) or [] if ph.is_placeholder(str(v))}
     return out
+
+
+def _person(mask: MaskResult, key: str) -> dict:
+    """The candidates behind person_N: this question's, else the previous turn's (a follow-up reusing it)."""
+    key = str(key).lower()
+    return (getattr(mask, "persons", {}) or {}).get(key) or (getattr(mask, "inherited_persons", {}) or {}).get(key) or {}
 
 
 def _staff_people(text: str, index: EntityIndex, mask: MaskResult) -> tuple[Resolution, str]:
     """A staff member as the planner wrote them: a name, or person_N (a name that is also a family member's)."""
     key = str(text).lower()
     if ph.kind_of(key) == ph.PERSON:
-        staff = (getattr(mask, "persons", {}).get(key) or {}).get("staff") or []
+        staff = _person(mask, key).get("staff") or []
         return Resolution(list(staff)), mask.entity_originals.get(key, str(text))
     if ph.kind_of(key) is not None:  # resident_N / family_N are never staff
         return Resolution([]), mask.all_originals.get(key, str(text))

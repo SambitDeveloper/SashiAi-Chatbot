@@ -44,6 +44,9 @@ class SchemaContext:
     family_relations: list[str] = field(default_factory=list)
     # family-member names are masked as family_N / person_N (Settings.family_name_resolution_enabled)
     family_names: bool = False
+    # which relation sections the detailed (Bedrock) prompt carries: only what the question can need (prompt tokens)
+    family_rules: bool = True
+    staff_rules: bool = True
 
 
 @dataclass

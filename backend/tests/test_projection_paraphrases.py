@@ -87,8 +87,8 @@ async def test_q2_plan_that_adds_an_unrequested_field_is_caught(make_service):
 
 async def test_named_caregiver_is_a_condition_not_a_display_request(make_service):
     q = "List residents with caregiver Sarah Jenkins."
-    plan = {"action": "list", "filters": {"primary_caregiver": {"include": ["Nurse Sarah Jenkins, RN"]}}}
-    fake = FakeTranslator({q: plan})
+    plan = {"action": "list", "filters": {"primary_caregiver": {"include": ["person_1"]}}}  # the model reads person_N
+    fake = FakeTranslator({q.replace("Sarah Jenkins", "person_1"): plan})
     r = await (await make_service(fake)).handle(q)
     assert len(fake.calls) <= 1 and not r["response"].get("needsClarification")
 

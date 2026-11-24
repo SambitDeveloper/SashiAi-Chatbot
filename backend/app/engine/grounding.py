@@ -727,6 +727,9 @@ def check_plan(
     # ---------------------------------------------------------------- lookups
     if plan.lookup:
         allowed = {i.upper() for ids in mask.placeholders.values() for i in ids}
+        # a recognised name several kinds of person share (person_N) names its resident candidates too
+        persons = {**(getattr(mask, "persons", {}) or {}), **(getattr(mask, "model_persons", {}) or {})}
+        allowed |= {str(i).upper() for c in persons.values() for i in (c or {}).get("residents") or []}
         allowed |= {f"RES-{m}" for m in re.findall(r"\bres[-_ ]?(\d{3,6})\b", low)}
         for rid in plan.lookup.residents:
             display = index.display_by_id.get(rid.upper(), "")

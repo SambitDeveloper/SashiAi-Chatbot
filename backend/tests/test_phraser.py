@@ -113,7 +113,7 @@ async def test_clarifications_are_never_rephrased():
 Q = "Tell me the count of active residents whose care taker is Nurse Sarah Jenkins?"
 PLAN_JSON = {
     "action": "count",
-    "filters": {"status": {"include": ["active"]}, "primary_caregiver": {"include": ["Sarah Jenkins"]}},
+    "filters": {"status": {"include": ["active"]}, "primary_caregiver": {"include": ["person_1"]}},  # model: person_N
 }
 
 
@@ -135,7 +135,7 @@ async def _service(repo, reply, enabled=True):
         _env_file=None, environment="test", topic_gate_enabled=False, semantic_router_enabled=False,
         llm_response_phrasing=enabled,
     )  # fmt: skip
-    fake = PhrasingFake({Q: PLAN_JSON}, reply)
+    fake = PhrasingFake({Q.replace("Sarah Jenkins", "person_1"): PLAN_JSON}, reply)
     service = QueryService(repo, fake, settings)
     await service.refresh_vocabulary()
     return service, fake

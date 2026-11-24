@@ -42,6 +42,10 @@ export type QueryCategory =
   | 'RESIDENT_LIST'
   | 'RESIDENT_BREAKDOWN'
   | 'RESIDENT_AGGREGATE'
+  | 'STAFF_COUNT'
+  | 'STAFF_LIST'
+  | 'STAFF_BREAKDOWN'
+  | 'STAFF_LOOKUP'
   | 'HELP'
   | 'OUT_OF_POLICY'
   | 'AMBIGUOUS_QUERY';
@@ -101,7 +105,7 @@ export interface ExtractedParameters {
 export interface PolicyCheckResult {
   passed: boolean;
   violationReason?: string;
-  policyCategory?: 'RESIDENT_INTENT' | 'PROMPT_INJECTION' | 'OUT_OF_SCOPE' | 'SYSTEM_PROBING';
+  policyCategory?: 'RESIDENT_INTENT' | 'STAFF_INTENT' | 'PROMPT_INJECTION' | 'OUT_OF_SCOPE' | 'SYSTEM_PROBING';
   suggestedAction?: string;
 }
 

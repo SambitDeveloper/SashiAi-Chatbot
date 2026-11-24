@@ -4,7 +4,7 @@ pay twice for a failure in the same context."""
 import json
 
 from tests.conftest import FakeTranslator
-from tests.test_service import ACTIVE_OCTOBER, ELENA_Q
+from tests.test_service import ACTIVE_OCTOBER, ELENA_MODEL_Q, ELENA_Q
 
 
 async def test_non_correctable_failure_is_not_retried(make_service):
@@ -20,7 +20,7 @@ async def test_non_correctable_failure_is_not_retried(make_service):
 
 
 async def test_correctable_failure_is_retried_once(make_service):
-    fake = FakeTranslator({ELENA_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER]})
+    fake = FakeTranslator({ELENA_MODEL_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER]})
     service = await make_service(fake)
     r = await service.handle(ELENA_Q)
     assert len(fake.calls) == 2 and fake.calls[1]["hint"]  # the retry carried the problems as feedback
@@ -33,7 +33,7 @@ async def test_identical_retry_is_detected_after_normalisation(make_service):
         "filters": {"admission_date": {"end": "2026-10-31", "start": "2026-10-01"}, "status": {"include": ["active"]}},
         "action": "count",
     }
-    fake = FakeTranslator({ELENA_Q: [ACTIVE_OCTOBER, reordered]})
+    fake = FakeTranslator({ELENA_MODEL_Q: [ACTIVE_OCTOBER, reordered]})
     service = await make_service(fake)
     r = await service.handle(ELENA_Q)
     attempts = [t for t in r["modelPlans"] if "attempt" in t]
@@ -43,7 +43,7 @@ async def test_identical_retry_is_detected_after_normalisation(make_service):
 
 async def test_different_retry_is_not_flagged_identical(make_service):
     other = {"action": "count", "filters": {"status": {"include": ["active"]}}}
-    fake = FakeTranslator({ELENA_Q: [ACTIVE_OCTOBER, other]})
+    fake = FakeTranslator({ELENA_MODEL_Q: [ACTIVE_OCTOBER, other]})
     service = await make_service(fake)
     r = await service.handle(ELENA_Q)
     assert not any(t.get("identical_to_previous") for t in r["modelPlans"])
@@ -173,7 +173,7 @@ async def test_date_filtered_status_breakdown_returns_group_members_and_projecti
 
 async def test_failure_cache_is_scoped_to_conversation_context(make_service):
     active = {"action": "count", "filters": {"status": {"include": ["active"]}}}
-    fake = FakeTranslator({ELENA_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER], "How many residents are active?": active})
+    fake = FakeTranslator({ELENA_MODEL_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER], "How many residents are active?": active})
     service = await make_service(fake)
     await service.handle(ELENA_Q, session_id="a")
     again = await service.handle(ELENA_Q, session_id="b")  # also no previous turn: same context → cached failure
@@ -187,7 +187,7 @@ async def test_failure_cache_is_scoped_to_conversation_context(make_service):
 
 
 async def test_failure_cache_is_scoped_to_schema_version(make_service):
-    fake = FakeTranslator({ELENA_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER]})
+    fake = FakeTranslator({ELENA_MODEL_Q: [ACTIVE_OCTOBER, ACTIVE_OCTOBER]})
     service = await make_service(fake)
     await service.handle(ELENA_Q)
     service.vocab_version = "changed"  # vocabulary/schema changed: earlier interpretations no longer apply

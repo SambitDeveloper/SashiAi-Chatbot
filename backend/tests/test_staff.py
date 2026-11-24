@@ -364,8 +364,8 @@ async def test_invented_inactive_staff_and_resident_status_are_caught(make_servi
 
 async def test_caregiver_questions_are_unchanged(make_service):
     q = "Which residents does Nurse Sarah Jenkins look after?"
-    plan = {"action": "list", "filters": {"primary_caregiver": {"include": ["Nurse Sarah Jenkins, RN"]}}}
-    fake = FakeTranslator({q: plan})
+    plan = {"action": "list", "filters": {"primary_caregiver": {"include": ["person_1"]}}}  # the model reads person_N
+    fake = FakeTranslator({q.replace("Sarah Jenkins", "person_1"): plan})
     r = await (await make_service(fake)).handle(q)
     assert not r["response"].get("needsClarification") and r["response"]["count"] == sum(
         1 for x in RESIDENTS if x["primaryCaregiver"] == "Nurse Sarah Jenkins, RN")

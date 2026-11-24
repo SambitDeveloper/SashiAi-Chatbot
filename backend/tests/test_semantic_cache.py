@@ -148,10 +148,10 @@ async def test_status_and_care_level_values_come_from_the_new_question(repo, set
 
 
 async def test_caregiver_and_facility_values_come_from_the_new_question(repo, settings):
-    plan = {"action": "count", "filters": {"primary_caregiver": {"include": ["Nurse Sarah Jenkins, RN"]},
+    plan = {"action": "count", "filters": {"primary_caregiver": {"include": ["person_1"]},  # the model reads person_N
                                            "facility": {"include": ["North Wing"]}}}  # fmt: skip
     q = "How many residents in North Wing does Sarah Jenkins look after?"
-    service, fake, store = await build(repo, settings, {q: plan})
+    service, fake, store = await build(repo, settings, {q.replace("Sarah Jenkins", "person_1"): plan})
     await seed(service, store, q)
     r = await ask(service, "How many residents in East Wing does Marcus Chen look after?")
     assert r["tier"] == "template"

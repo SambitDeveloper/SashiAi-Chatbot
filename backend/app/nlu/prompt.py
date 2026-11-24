@@ -83,7 +83,10 @@ def _staff_rules() -> str:
         ops.setdefault(operators_for(name), []).append(name)
     shown = [a for a in STAFF_ATTRIBUTES if a not in STAFF_SINGLE_RECORD]
     return (
-        "\n- Staff members (care team, physicians, case managers, nurses, therapists, drivers, ...):"
+        "\n- Staff members (care team, physicians, case managers, nurses, therapists, drivers, ...). Staff questions are"
+        " in scope: never answer unsupported because no resident_N is named. person_N is a named person (the Analysis"
+        ' says which kinds it can be): a staff member → "lookup": {"staff": ["person_N"], ...} with entity staff (or'
+        " staff_name / primary_caregiver person_N); a resident → lookup.residents [\"person_N\"]; never drop it."
         "\n  staff_role: the role word as written (physician, doctor, case manager, nurse practitioner, social worker,"
         " dietitian, therapist, ...); staff_designation: a designation exactly as written. In a RESIDENT question they"
         " mean ANY of the resident's active assigned staff: \"residents without a case manager\" is staff_role ne"
@@ -165,7 +168,7 @@ RequestIR fields:
 - action/action_status/action_evidence: operation, its status, and exact supporting quote.
 - where: predicate/and/or/not/relationship AST. Every node has status (supported, ambiguous, unsupported, unresolved)
   and exact evidence. Predicates use field/operator/value. Relationship nodes use relation/target and are rejected.
-{_operator_rules(operator_table)}{_family_rules(ctx) if operator_table else ''}{_staff_rules() if operator_table else ''}
+{_operator_rules(operator_table)}{_family_rules(ctx) if operator_table and ctx.family_rules else ''}{_staff_rules() if operator_table and ctx.staff_rules else ''}
 - group_by and projection: arrays of {{field, status, evidence}}; grouping is not filtering. Projection is what to SHOW,
   separate from where (for example "show room numbers" is projection, not a room filter).
 - aggregate, sort, limit, lookup: each has status and exact evidence.

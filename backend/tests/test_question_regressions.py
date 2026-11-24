@@ -114,7 +114,7 @@ async def test_model_placeholder_for_an_unnamed_resident_is_rejected(make_servic
     """No resident is named, yet the model looked up "resident_1": never executed."""
     q = "Find residents who have Nurse Sarah Jenkins listed as their caregiver"
     bad = {"action": "lookup", "lookup": {"residents": ["resident_1"], "attributes": ["primary_caregiver"]}}
-    fake = FakeTranslator({q: [bad, bad]})
+    fake = FakeTranslator({q.replace("Sarah Jenkins", "person_1"): [bad, bad]})  # the model reads person_N
     service = await make_service(fake)
     r = await service.handle(q)
     assert r["response"].get("needsClarification") and r["mcpCall"] is None

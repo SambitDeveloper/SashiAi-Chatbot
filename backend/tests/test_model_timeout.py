@@ -139,7 +139,8 @@ async def test_cancellation_releases_the_inference_slot_promptly():
 # ---- telemetry --------------------------------------------------------------------------------------------------
 
 Q = "Tell me the count of active residents whose care taker is Nurse Sarah Jenkins?"
-PLAN = {"action": "count", "filters": {"status": {"include": ["active"]}, "primary_caregiver": {"include": ["Sarah Jenkins"]}}}
+PLAN = {"action": "count", "filters": {"status": {"include": ["active"]}, "primary_caregiver": {"include": ["person_1"]}}}
+MODEL_Q = Q.replace("Sarah Jenkins", "person_1")  # the model reads staff names as person_N
 
 
 class TimingOut(FakeTranslator):
@@ -170,7 +171,7 @@ async def test_other_failures_are_counted_as_failed(make_service):
 
 
 async def test_successful_call_counts(make_service):
-    service = await make_service(FakeTranslator({Q: PLAN}))
+    service = await make_service(FakeTranslator({MODEL_Q: PLAN}))
     r = await service.handle(Q)
     assert r["modelCalls"] == 1
     assert (r["modelCallsAttempted"], r["modelCallsSucceeded"], r["modelCallsTimedOut"]) == (1, 1, 0)
@@ -181,7 +182,7 @@ async def test_no_model_needed_counts_nothing(make_service):
     from app.engine.semantic_cache import SemanticPlanCache
     from tests.test_semantic_cache import FakeStore, SameVector
 
-    service = await make_service(FakeTranslator({Q: PLAN}))
+    service = await make_service(FakeTranslator({MODEL_Q: PLAN}))
     store = FakeStore()
     service.semantic_cache = SemanticPlanCache(store, SameVector, threshold=0.0, top_k=5, max_candidates=50,
                                                timeout_s=1.0, embedding_model="t")  # fmt: skip
