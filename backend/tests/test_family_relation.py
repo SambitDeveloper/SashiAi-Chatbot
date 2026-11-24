@@ -42,7 +42,8 @@ def test_relation_normalisation_and_self_exclusion():
     assert d["familyCount"] == 3  # "Self" is the resident, not a family member
     assert d["familyRelations"] == ["daughter", "son", "spouse"]  # " spouse " trimmed + lower-cased
     assert d["familyTypes"] == ["emergency", "family"]
-    assert d["familyFlags"] == ["portal_access", "guarantor"]  # Eleanor's own portal access (Self) does not count
+    # Eleanor's own portal access (Self) does not count; Margaret has an email, the family has phones
+    assert d["familyFlags"] == ["portal_access", "guarantor", "has_email", "has_phone"]
     assert d["familyMembers"] == ["Margaret Vance (Daughter)", "Thomas Vance (Son)", "Peter Vance (spouse)"]
 
 
