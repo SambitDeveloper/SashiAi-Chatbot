@@ -315,6 +315,25 @@ async def test_an_invented_family_condition_is_caught(make_service):
     assert len(fake.calls) == 2 and r["response"].get("needsClarification")
 
 
+@pytest.mark.parametrize(
+    ("question", "plan", "ids_or_count"),
+    [
+        # staging trace q_1c385a3050bc: a correct plan rejected as "negation missing", then a useless retry (5,320 tokens)
+        ("Find residents who do not have any family members registered.",
+         {"action": "list", "filters": {"family_count": {"min": 0, "max": 0}}}, 84),  # the plan Gemma wrote
+        ("How many residents don't have a daughter listed?",
+         {"action": "count", "filters": {"family_relation": {"exclude": ["daughter"]}}}, 87),
+        ("How many residents have no family member with portal access?",
+         {"action": "count", "filters": {"family_flags": {"exclude": ["portal_access"]}}}, 86),
+    ],
+)  # fmt: skip
+async def test_a_negation_expressed_by_a_family_condition_is_accepted(make_service, question, plan, ids_or_count):
+    fake = FakeTranslator({question: plan})
+    r = await (await make_service(fake)).handle(question)
+    assert len(fake.calls) == 1  # accepted on the first plan: no retry
+    assert not r["response"].get("needsClarification") and r["response"]["count"] == ids_or_count
+
+
 def test_describe_chips():
     chips = describe_filters(Filters.model_validate(
         {"family_relation": {"include": ["daughter"]}, "family_flags": {"include": ["portal_access"]}, "family_count": {"min": 3}}

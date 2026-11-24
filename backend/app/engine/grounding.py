@@ -626,6 +626,10 @@ def check_plan(
         negated
         and not excluded
         and not (f.age and f.age.max is not None)
+        # "no family members" / "not more than 3 staff" = a count with an upper bound, like "not older than 80"
+        and not any(getattr(f, n, None) is not None and getattr(f, n).max is not None for n in _COUNT_FIELDS)
+        # "no daughter listed", "no family member with portal access", "not a provider" (relation fields)
+        and not any(getattr(f, n, None) is not None and getattr(f, n).exclude for n in _RELATION_SET_FIELDS)
         and not any(getattr(f, n) is not None and getattr(f, n).missing is True for n in _ALL_FIELDS)  # "without a room"
         and plan.action != "lookup"
     ):
@@ -863,6 +867,9 @@ def _check_structure_semantics(plan: QueryPlan, low: str, mask: MaskResult, stru
             g.missing.append("operation: count the residents (the question asks how many)")
 
 
+_COUNT_FIELDS = ("family_count", "staff_count", "staff_resident_count")
+_RELATION_SET_FIELDS = ("family_relation", "family_type", "family_flags", "family_member", "staff_status",
+                        "staff_facility", "staff_type", "staff_name")  # fmt: skip
 _ALL_FIELDS = (
     "status", "care_type", "facility", "gender", "primary_caregiver", "room_number",
     "age", "admission_date", "created_date", "discharge_date",
