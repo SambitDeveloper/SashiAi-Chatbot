@@ -123,7 +123,8 @@ fields:
 
 # 4. Fields that are lists in the database (a resident has several staff). Grouping by them counts each value.
 #    The family* lists are derived from the `family` relation below (any family member has that value).
-list_fields: [primaryCaregiver, familyRelations, familyTypes, familyFlags, familyMembers, familyIds]
+list_fields: [primaryCaregiver, familyRelations, familyTypes, familyFlags, familyMembers, familyIds, staffRoles,
+              staffDesignations, careTeam]
 
 # 4b. Related collections (one-to-many, joined on the resident's record id). A relation is joined ONLY when a question
 #     uses one of its fields, and contributes resident-level fields derived from all of the resident's records, so a
@@ -185,6 +186,80 @@ relations:
       health_access: healthAccess
       guarantor: pcc_is_guarantor
 
+  # Staff (the `staffs` collection) linked to residents: residents.assignedStaff[] and residents.primaryPhysicianCName
+  # hold staffs.cName (unique). Used two ways, from this ONE definition (app/data/staff.py):
+  #   • a relation of residents  — "residents without a case manager", "Merry Johnson's care team / physician"
+  #   • an entity of its own     — "how many physicians are active", "staff with more than 20 residents"
+  # The recorded designation is always what is SHOWN; the canonical role is used only for matching question words.
+  staff:
+    collection: staffs
+    key: cName                         # staffs.cName ← residents.assignedStaff[] / residents.primaryPhysicianCName
+    resident_link: assignedStaff
+    physician_link: primaryPhysicianCName
+    max_per_resident: 200              # staging max is 147 assigned staff on one resident
+    # designation as recorded (compared trimmed, without case) → canonical role. Several spellings, one role.
+    roles:
+      physician: [Physician, Doctor]
+      nurse_practitioner: [Nurse Practitioner]
+      case_manager: [Case Manager]
+      social_worker: [Social Worker]
+      dietitian: [Dietitian, Registered Dietitian, Registered Dietician]
+      care_coordinator: [Care Coordinator, Patient Care Coordinator]
+      nurse: [Nurse, Nursing, Nursing Staff]
+      director_of_nursing: [Director of Nursing]
+      physical_therapist: [Physical Therapist]
+      occupational_therapist: [Occupation Therapist, Occupational Therapist]
+      speech_therapist: [Speech Therapist]
+      rehab_therapist: [Rehab Therapists, Rehab Therapist]
+      director_of_rehab: [Director of Rehab]
+      activities_director: [Activities Director]
+      activities_coordinator: [Activities Coordinator]
+      driver: [Transport Driver, Facility Driver]
+      salon_stylist: [Salon Stylist]
+      massage_therapist: [Massage Therapist]
+      private_trainer: [Private Trainer]
+      housekeeping: [Housekeeping Staff]
+      maintenance: [Maintenance Staff]
+      dining: [Dining Staff]
+      receptionist: [Receptionist]
+      reception_manager: [Reception Manager]
+      executive_director: [Executive Director]
+      billing: [Billing department]
+      payroll: [Payroll/AP]
+      caregiver: [Caregiver, Caregiver AM, Caregiver PM]
+    # a question word naming several roles ("therapists" = the rehab therapy roles; massage therapists are not)
+    role_groups:
+      therapist: [physical_therapist, occupational_therapist, speech_therapist, rehab_therapist, director_of_rehab]
+      nursing: [nurse, director_of_nursing]
+      activities: [activities_director, activities_coordinator]
+      reception: [receptionist, reception_manager]
+    # more question words for a role or group (the role name, its designations and their plurals are words already)
+    role_words:
+      physician: [doctor, doctors, dr, physicians, gp, gps]
+      nurse_practitioner: [np, nps]
+      nurse: [nurses]
+      therapist: [therapists, rehab therapy, therapy staff]
+      driver: [drivers, transport]
+      housekeeping: [housekeeper, housekeepers]
+      dining: [dining staff]
+      billing: [billing staff, billing department]
+    # test values and system accounts: not people. Never matched by a role, never counted as staff, never shown in a
+    # care team. Designations not listed anywhere above (Manager, DSD, Visitor CheckIn, RM Bill) are real staff
+    # without a role: shown with their recorded designation, matched only by that designation.
+    hidden_designations: [sdfsdf, llllllllllllllllll, ddddddddddd, anish, Time Pass, TAB ACCESS, TABLET, Profile Viewer,
+                          External User]
+    # staffs.type as recorded → value used in plans
+    types: {PROVIDER: provider, FACILITY_STAFF: facility_staff, EXTERNAL_USER: external_user}
+    # "caregiver" keeps its meaning in this assistant: ANY assigned staff member (primary_caregiver), never the role
+    not_role_words: [caregiver, caregivers]
+    # staff words that a resident question uses for the assigned staff in general ("Merry's nurse", "Nurse Sarah
+    # Jenkins"): they make a question about staff, but never demand a role condition on their own
+    generic_words: [nurse, nurses, aide, aides, carer, carers, caretaker, caretakers, staff, staffs, staff member,
+                    staff members]
+    # words that make a question about staff (grounding): any role word above, plus these
+    cue_words: [staff, staffs, staff member, staff members, employee, employees, care team, designation, designations,
+                role, roles, team member, team members, personnel]
+
 # 5. Values the mapping above uses to mean "not recorded" for a field, besides null, an absent field, "" and an empty
 #    list (which always count as missing). Used by `missing: true/false` filters, identically in MongoDB and in the
 #    in-memory test repository. Example: a resident without facilityId is mapped to wing "Unknown".
@@ -214,6 +289,8 @@ output_fields:
   family_members: familyMembers       # names + relations; for ONE resident the answer also shows phone and email
   family_count: familyCount
   family_relationship: familyContacts  # how the selected family member is related: one resident's answer only
+  care_team: careTeam                  # assigned staff "Name (Designation)", inactive staff marked
+  primary_physician: primaryPhysician  # residents.primaryPhysicianCName → that staff member
 identity_fields: [residentId, id, firstName, lastName]
 # familyContacts (phone, email per family member) never appears in a multi-resident result
 single_record_only: [emergencyContact, familyContacts]

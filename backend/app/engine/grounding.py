@@ -29,7 +29,15 @@ from app.data.relations import (
 )
 from app.data.repository import FIELD_MAP
 from app.data.schema_config import output_fields, single_record_only
-from app.models.plan import TEXT_MATCH_FIELDS, AgeRange, DateRange, QueryPlan
+from app.data.staff import staff_config
+from app.models.plan import (
+    ALL_TEXT_MATCH_FIELDS,
+    STAFF_RELATION_ATTRIBUTES,
+    STAFF_RELATION_FIELDS,
+    AgeRange,
+    DateRange,
+    QueryPlan,
+)
 from app.nlu.grammar import DateMatch, NumberMatch, parse_dates, parse_number_ranges
 from app.nlu.missing_values import MissingValueDetector
 from app.nlu.projection import ProjectionDetector, value_starts
@@ -142,7 +150,7 @@ OUT_OF_SCOPE = (
     "medication", "medications", "medicine", "medicines", "meds", "prescription", "prescriptions", "drug", "drugs",
     "dose", "dosage", "diagnosis", "diagnoses", "diagnosed", "diabetes", "diabetic", "dementia diagnosis", "allergy",
     "allergies", "allergic", "diet", "dietary", "meal", "meals", "billing", "bill", "bills", "invoice", "invoices",
-    "balance", "owe", "owes", "payment", "payments", "insurance", "doctor", "doctors", "physician", "visitor",
+    "balance", "owe", "owes", "payment", "payments", "insurance", "visitor",
     "visitors", "vitals", "blood pressure", "weight",
 )  # fmt: skip
 
@@ -335,7 +343,7 @@ def _needle_after_cue(op: str, needle: str, question: str) -> bool:
 
 def _check_text_matches(f, question: str, prev: dict, g: "Grounding") -> None:
     used: list[tuple[str, str, str]] = []  # (field, op, needle)
-    for name in TEXT_MATCH_FIELDS:
+    for name in ALL_TEXT_MATCH_FIELDS:
         sf = getattr(f, name)
         for op in ("starts_with", "contains"):
             for needle in (getattr(sf, op) or []) if sf is not None else []:
@@ -376,6 +384,134 @@ def _check_family(plan: QueryPlan, question: str, prev: dict, g: "Grounding", ma
     return cue
 
 
+_INACTIVE_WORDS = ("inactive", "former", "deactivated", "disabled", "no longer", "not active", "including", "all",
+                   "every", "both", "past", "previous", "left")  # fmt: skip
+_RESIDENT_WORDS = re.compile(r"\b(?:residents?|patients?|clients?|people|persons?)\b")
+
+
+def _without_care_types(question: str) -> str:
+    """The question with care-type phrases blanked out: "skilled nursing" is a care type, not the role "nursing"."""
+    out = question
+    for forms in SYNONYMS["care_type"].values():
+        for form in sorted(forms, key=len, reverse=True):
+            out = re.sub(rf"(?<![a-z]){re.escape(form)}(?![a-z])", lambda m: " " * len(m.group(0)), out, flags=re.I)
+    return out
+
+
+def _is_staff_word(text: str, index: EntityIndex) -> bool:
+    """A mention that is wholly staff vocabulary (a role word, "staff", a recorded designation), not a name — some staff
+    records are named after their role ("Dining Staff", "Physician Test")."""
+    cfg = staff_config()
+    t = re.sub(r"(?:'s|’s)$", "", text.strip(), flags=re.I)
+    if cfg is None or not t:
+        return False
+    cue = cfg._cue_pattern.fullmatch(t) if cfg._cue_pattern else None
+    return bool(cue) or any(_designation_supported(t, d) and len(d) >= len(t) - 1 for d in index.staff_designations)
+
+
+def _role_values_supported(cfg, question: str, values: list[str]) -> list[str]:
+    """Role values no word of the question names ("physician" needs physician/doctor/dr/...)."""
+    named = {r for _, roles in cfg.roles_in(_without_care_types(question)) for r in roles}
+    return [v for v in values if v not in named]
+
+
+def _designation_supported(question: str, value: str) -> bool:
+    low, v = question.lower(), value.lower()
+    return v in low or (v.endswith("s") and v[:-1] in low) or f"{v}s" in low
+
+
+def _check_staff(plan: QueryPlan, question: str, index: EntityIndex, prev: dict, g: "Grounding", mask=None) -> None:
+    """Resident plans: a question naming a staff ROLE ("residents without a case manager", "Merry's physician") must use
+    a staff field or show the care team / primary physician; a role or designation condition needs words that name it.
+    Generic staff words ("nurse", "staff") and titles before a name ("Dr. Raman") demand nothing (primary caregiver)."""
+    cfg = staff_config()
+    if cfg is None:
+        return
+    f = plan.filters
+    specific = cfg.specific_roles_in(_without_care_types(question), index.staff_name_tokens())
+    uses = any(getattr(f, n) is not None for n in STAFF_RELATION_FIELDS) or bool(
+        set(plan.output_fields) & set(STAFF_RELATION_ATTRIBUTES)
+    )
+    if specific and not uses and not any(k in STAFF_RELATION_FIELDS for k in prev):
+        g.missing.append(f'the staff the question asks about ("{specific[0][0]}")')
+    # "how many nurses are there?", "list the staff": the rows are staff members, never residents. A question that
+    # speaks of residents, names one, or names a staff member ("residents of Nurse Sarah Jenkins") stays a resident one.
+    cue = cfg.cue_in(_without_care_types(question))
+    names_someone = bool(mask is not None and mask.placeholders) or bool(index.mentioned_caregivers(question))
+    if cue and not _RESIDENT_WORDS.search(question.lower()) and not names_someone and not prev:
+        g.missing.append(f'staff members as the rows ("{cue}"): this is a question about staff, not residents')
+    if f.staff_role is not None and "staff_role" not in prev:
+        for v in _role_values_supported(cfg, question, [*(f.staff_role.include or []), *(f.staff_role.exclude or [])]):
+            g.invented.append(f"staff role {v.replace('_', ' ')}")
+    if f.staff_designation is not None and "staff_designation" not in prev:
+        for v in [*(f.staff_designation.include or []), *(f.staff_designation.exclude or [])]:
+            role_named = _role_values_supported(cfg, question, [cfg.role_for(v) or ""]) == []
+            if not _designation_supported(question, v) and not role_named:
+                g.invented.append(f'designation "{v}"')
+    if f.staff_count is not None and not re.search(r"\d|\b(?:no|any|none|zero|one|two|three|several|multiple|more|fewer|less|most)\b", question.lower()):
+        g.invented.append("a number of assigned staff")
+
+
+def check_staff_plan(
+    plan: QueryPlan,
+    question: str,
+    mask: MaskResult,
+    index: EntityIndex,
+    previous_filters: dict | None = None,
+    uses_previous: bool = False,
+) -> "Grounding":
+    """A staff plan (the rows are staff members) answers THIS question: the question is about staff, every role word is
+    a condition (or the grouping), conditions and names come from the question's words, inactive staff only when asked
+    for, and a resident status condition only when the question speaks of residents ("active physicians" is the staff
+    member's status)."""
+    g = Grounding(plan)
+    cfg = staff_config()
+    if cfg is None:
+        g.blocking.append("staff information is not configured")
+        return g
+    low = question.lower()
+    prev = (previous_filters or {}) if uses_previous else {}
+    f = plan.filters
+    designation_named = any(_designation_supported(question, d) for d in index.staff_designations)
+    if not cfg.cue_in(question) and not designation_named and not plan.lookup and not prev:
+        g.invented.append("a question about staff members (the question names no staff)")
+    groups = set(plan.group_by or [])
+    roles = cfg.specific_roles_in(_without_care_types(question), index.staff_name_tokens(), include_generic=True)
+    role_cond = f.staff_role is not None or f.staff_designation is not None
+    if roles and not role_cond and not groups & {"staff_role", "staff_designation"} and not plan.lookup and "staff_role" not in prev:
+        g.missing.append(f'the staff role "{roles[0][0]}"')
+    if f.staff_role is not None and "staff_role" not in prev:
+        for v in _role_values_supported(cfg, question, [*(f.staff_role.include or []), *(f.staff_role.exclude or [])]):
+            g.invented.append(f"staff role {v.replace('_', ' ')}")
+    if f.staff_designation is not None and "staff_designation" not in prev:
+        for v in [*(f.staff_designation.include or []), *(f.staff_designation.exclude or [])]:
+            if not _designation_supported(question, v):
+                g.invented.append(f'designation "{v}"')
+    if f.staff_status is not None and "inactive" in (f.staff_status.include or []) and not any(_has(w, low) for w in _INACTIVE_WORDS):
+        g.invented.append("inactive staff (the question does not ask for them)")
+    if f.status is not None and not _RESIDENT_WORDS.search(low) and "status" not in prev:
+        g.invented.append("a resident status (the question's status words describe the staff member: use staff_status)")
+    if groups and not any(_has(c, low) for c in (*GROUP_CUES, "breakdown")):
+        g.invented.append("grouping (the question asks for no breakdown)")
+
+    words = re.findall(r"[a-z][a-z'’-]*", low)
+
+    def named(name: str) -> bool:
+        parts = [p for p in _name_parts(name.split(",")[0]) if p not in _TITLE_WORDS]
+        return any(len(p) >= 3 and any(fuzz.ratio(p, w.replace("'", "")) >= 85 for w in words) for p in parts)
+
+    people = [*(plan.lookup.staff or [] if plan.lookup else []), *((f.staff_name.include or []) + (f.staff_name.exclude or []) if f.staff_name else [])]
+    for name in people:
+        if not named(name) and name not in (prev.get("staff_name") or {}).get("include", []):
+            g.invented.append(f'staff member "{name}"')
+    for name, values in index.mentioned_caregivers(question).items():
+        if _is_staff_word(name, index):  # "staff", "physicians": the question's wording, not a person's name
+            continue
+        if not set(values) & set(people) and not plan.lookup and f.staff_name is None and f.primary_caregiver is None:
+            g.missing.append(f'staff member "{name}"')
+    return g
+
+
 def check_plan(
     plan: QueryPlan,
     question: str,
@@ -395,6 +531,8 @@ def check_plan(
     g = Grounding(plan)
     if not plan.is_data_query:
         return g
+    if plan.entity == "staff":
+        return check_staff_plan(plan, question, mask, index, previous_filters, uses_previous)
     low = question.lower()
     # ---------------------------------------------------------------- structure: does the plan answer THIS question?
     if structure is not None:
@@ -465,7 +603,8 @@ def check_plan(
     negated = bool(_NEGATION.search(low))
     excluded = {
         n: set(getattr(f, n).exclude or [])
-        for n in ("status", "care_type", "gender", "facility", "primary_caregiver", "room_number")
+        for n in ("status", "care_type", "gender", "facility", "primary_caregiver", "room_number", "staff_role",
+                  "staff_designation")
         if getattr(f, n) is not None and getattr(f, n).exclude
     }
     if not negated:
@@ -544,11 +683,16 @@ def check_plan(
         hits = [m.span() for m in re.finditer(r"(?<![A-Za-z])" + re.escape(text) + r"(?![A-Za-z])", question, re.I)]
         return bool(hits) and all(any(s <= a and b <= e for s, e in entity_spans) for a, b in hits)
 
+    staff_used = any(getattr(f, n) is not None for n in STAFF_RELATION_FIELDS) or bool(
+        set(plan.output_fields) & set(STAFF_RELATION_ATTRIBUTES)
+    )
     if "primary_caregiver" not in groups and "primary_caregiver" not in attrs:
         used = set((f.primary_caregiver.include or []) + (f.primary_caregiver.exclude or [])) if f.primary_caregiver else set()
         for text, values in index.mentioned_caregivers(question).items():
             covered = _text_covers(f.primary_caregiver, FIELD_MAP["primary_caregiver"], list(values))
-            if not used & set(values) and not covered and not in_resident_name(text):
+            if not used & set(values) and not covered and not in_resident_name(text) and not (
+                staff_used and _is_staff_word(text, index)  # "case manager" names the role the plan uses, not a person
+            ):
                 g.missing.append(f'caregiver "{text}"')
     if "facility" not in groups and not attrs & {"facility", "room_number"}:
         used = set((f.facility.include or []) + (f.facility.exclude or [])) if f.facility else set()
@@ -561,6 +705,8 @@ def check_plan(
     _check_text_matches(f, question, prev, g)
     # ---------------------------------------------------------------- family relation (familymembers)
     _check_family(plan, question, prev, g, mask.text)
+    # ---------------------------------------------------------------- staff relation (assigned staff)
+    _check_staff(plan, question, index, prev, g, mask)
 
     # ---------------------------------------------------------------- age
     # an age range needs an age expression the grammar parsed ("over 80", "between 70 and 80"); any other number in
@@ -779,6 +925,13 @@ def _check_projection(plan, question, low, mask, index, scan, missing_detector, 
             if attribute is not None and pattern.search(masked_low)
         }
     shown = set(plan.output_fields)
+    cfg = staff_config()
+    if cfg is not None and "care_team" in shown and cfg.specific_roles_in(
+        _without_care_types(question), index.staff_name_tokens(), include_generic=True
+    ):
+        # "resident_1's physician / nurse": the care team, narrowed to that role, answers it
+        requested -= {"primary_caregiver"}
+        requested |= {"care_team"}
     rel = family_relation()
     if rel is not None and rel.cue_in(question, mask.text):  # "Eleanor's son's phone": family details answer it
         shown -= set(FAMILY_ATTRIBUTES) - requested
@@ -789,6 +942,8 @@ def _check_projection(plan, question, low, mask, index, scan, missing_detector, 
     } if plan.action == "lookup" else set()
     if plan.action == "lookup" and any(getattr(plan.filters, n) is not None for n in FAMILY_SELECTORS):
         conditions |= {"family_members"}  # "is X a family member of R?": the words name the condition, not a display
+    if plan.action == "lookup" and (plan.filters.staff_role is not None or plan.filters.staff_designation is not None):
+        conditions |= {"care_team"}  # "does resident_1 have a case manager?": a condition on the care team
     for attr in sorted(requested - (shown | conditions)):
         g.missing.append(f"show {attr.replace('_', ' ')}")
     for attr in sorted(shown - requested - conditions):

@@ -27,6 +27,11 @@ GROUP_LABELS = {
     "facility": "Facility",
     "gender": "Gender",
     "primary_caregiver": "Caregiver",
+    "staff_role": "Role",
+    "staff_designation": "Designation",
+    "staff_status": "Staff Status",
+    "staff_facility": "Facility",
+    "staff_type": "Staff Type",
 }
 ATTRIBUTE_LABELS = {
     "primary_caregiver": "Primary Caregiver",
@@ -43,7 +48,20 @@ ATTRIBUTE_LABELS = {
     "gender": "Gender",
     "family_members": "Family Members",
     "family_count": "Number of Family Members",
+    "care_team": "Care Team",
+    "primary_physician": "Primary Physician",
+    "staff_designation": "Designation",
+    "staff_role": "Role",
+    "staff_status": "Status",
+    "staff_facility": "Facility",
+    "staff_type": "Staff Type",
+    "staff_resident_count": "Assigned Residents",
+    "staff_email": "Email",
+    "staff_phone": "Phone",
+    "staff_residents": "Assigned Residents",
+    "staff_name": "Name",
 }
+STAFF_TYPE_LABELS = {"provider": "Provider", "facility_staff": "Facility Staff", "external_user": "External User"}
 FAMILY_FLAG_LABELS = {"portal_access": "portal access", "app_access": "app access", "health_access": "health access",
                       "guarantor": "guarantor"}  # fmt: skip
 _SET_FIELDS = [
@@ -56,7 +74,18 @@ _SET_FIELDS = [
     ("family_relation", "Family"),
     ("family_type", "Family contact"),
     ("family_flags", "Family with"),
+    ("staff_role", "Staff role"),
+    ("staff_designation", "Staff designation"),
+    ("staff_status", "Staff status"),
+    ("staff_facility", "Staff facility"),
+    ("staff_type", "Staff type"),
+    ("staff_name", "Staff member"),
 ]
+
+
+def role_label(value: str) -> str:
+    """A canonical role for display ("case_manager" → "Case Manager"); the recorded designation is shown elsewhere."""
+    return value.replace("_", " ").title()
 
 
 def label_value(field_name: str, value: str) -> str:
@@ -70,7 +99,23 @@ def label_value(field_name: str, value: str) -> str:
         return FAMILY_FLAG_LABELS.get(value, value)
     if field_name in ("family_relation", "family_type"):
         return value.replace("_", " ")
+    if field_name == "staff_role":
+        return role_label(value)
+    if field_name == "staff_status":
+        return value.title()
+    if field_name == "staff_type":
+        return STAFF_TYPE_LABELS.get(value, value)
     return value
+
+
+def _count_chip(label: str, lo: int | None, hi: int | None, none_text: str) -> str:
+    if hi == 0:
+        return none_text
+    if lo is not None and lo == hi:
+        return f"{label}: exactly {lo}"
+    if lo is not None and hi is not None:
+        return f"{label}: {lo} to {hi}"
+    return f"{label}: at least {lo}" if lo is not None else f"{label}: at most {hi}"
 
 
 def fmt_date(d: date | str) -> str:
@@ -112,6 +157,11 @@ def describe_filters(f: Filters) -> list[str]:
             chips.append(f"Family members: {lo} to {hi}")
         else:
             chips.append(f"Family members: at least {lo}" if lo is not None else f"Family members: at most {hi}")
+    if f.staff_count:
+        chips.append(_count_chip("Active assigned staff", f.staff_count.min, f.staff_count.max, "Active assigned staff: none"))
+    if f.staff_resident_count:
+        r = f.staff_resident_count
+        chips.append(_count_chip("Assigned residents", r.min, r.max, "Assigned residents: none"))
     if f.age:
         lo, hi = f.age.min, f.age.max
         if not f.age.has_range:
@@ -133,7 +183,7 @@ def describe_filters(f: Filters) -> list[str]:
 
 
 def describe_plan(plan: QueryPlan, name_of: Callable[[str], str]) -> list[str]:
-    chips: list[str] = []
+    chips: list[str] = ["Staff members"] if plan.entity == "staff" else []
     match plan.action:
         case "count":
             chips.append("Count")
@@ -152,6 +202,7 @@ def describe_plan(plan: QueryPlan, name_of: Callable[[str], str]) -> list[str]:
             )
         case "lookup":
             chips.extend(f"Resident: {name_of(i)} ({i})" for i in plan.lookup.residents)
+            chips.extend(f"Staff: {n}" for n in plan.lookup.staff or [])
             chips.extend(f"Asked: {ATTRIBUTE_LABELS.get(a, a)}" for a in plan.output_fields)
     chips.extend(describe_filters(plan.filters))
     if plan.sort:
@@ -162,5 +213,9 @@ def describe_plan(plan: QueryPlan, name_of: Callable[[str], str]) -> list[str]:
             what = f"{'Most recent' if s.direction == 'desc' else 'Earliest'} {ATTRIBUTE_LABELS.get(s.field, s.field).lower()}"
         if s.field == "family_count":
             what = "Most family members first" if s.direction == "desc" else "Fewest family members first"
+        if s.field == "staff_resident_count":
+            what = "Most assigned residents first" if s.direction == "desc" else "Fewest assigned residents first"
+        if s.field == "staff_name":
+            what = "By name" + (" (Z–A)" if s.direction == "desc" else "")
         chips.append(f"{what} · top {plan.limit}" if plan.limit else what)
     return chips

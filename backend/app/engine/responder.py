@@ -10,12 +10,14 @@ from app.engine.describe import (
     ATTRIBUTE_LABELS,
     CARE_TYPE_LABELS,
     GROUP_LABELS,
+    STAFF_TYPE_LABELS,
     STATUS_LABELS,
     describe_filters,
     label_value,
+    role_label,
 )
 from app.engine.executor import ExecutionData
-from app.models.plan import QueryPlan
+from app.models.plan import STAFF_FIELD_MAP, QueryPlan
 
 HELP_OPTIONS = [
     {"label": "How many residents are active?", "query": "How many residents are active?"},
@@ -65,7 +67,21 @@ def _readable(r: Resident) -> Resident:
 def _public(r: Resident) -> Resident:
     """A resident row as it may appear in a response: family details only through the answer text (and only what was
     asked), never record ids or contact lists in the raw row. The number of family members is not personal data."""
-    return {k: v for k, v in r.items() if k not in FAMILY_VIEW_FIELDS or k == "familyCount"}
+    return {k: v for k, v in r.items() if (k not in FAMILY_VIEW_FIELDS or k == "familyCount") and k != "careTeamMembers"}
+
+
+def _team(r: Resident) -> list[dict]:
+    value = r.get("careTeamMembers")
+    return [m for m in value if isinstance(m, dict)] if isinstance(value, list) else []
+
+
+def _team_text(members: list[dict]) -> str:
+    """One resident's care team grouped by designation as recorded: "Case Manager: Jane Okafor · Nurse: A, B (inactive)"."""
+    groups: dict[str, list[str]] = {}
+    for m in members:
+        who = (m.get("name") or NOT_RECORDED) + (" (inactive)" if m.get("status") == "inactive" else "")
+        groups.setdefault(m.get("designation") or "No designation", []).append(who)
+    return " · ".join(f"{d}: {', '.join(names)}" for d, names in sorted(groups.items()))
 
 
 def _contacts(r: Resident) -> list[dict]:
@@ -125,6 +141,16 @@ def spotlight(r: Resident, attribute: str) -> dict[str, Any]:
                         f"{len(people)} family member{'s' if len(people) != 1 else ''} of {name}.")  # fmt: skip
         case "family_count":
             return fact("Number of Family Members", r.get("familyCount", 0))
+        case "care_team":
+            members = _team(r)  # narrowed to the asked-for role(s) by the executor ("resident_1's physician")
+            if not members:
+                return fact("Care Team", "No matching staff member is assigned")
+            active = sum(1 for m in members if m.get("status") == "active")
+            detail = f"{len(members)} assigned staff member{'s' if len(members) != 1 else ''} of {name}" + (
+                f" ({len(members) - active} inactive)." if active < len(members) else ".")
+            return fact("Care Team", _team_text(members), detail)
+        case "primary_physician":
+            return fact("Primary Physician", r.get("primaryPhysician") or "No primary physician recorded")
         case "family_relationship":
             people = _contacts(r)  # already narrowed to the selected family member(s) by the executor
             if not people:
@@ -168,12 +194,17 @@ def _checked_values(plan: QueryPlan, r: Resident) -> str:
         parts.append(f"{r.get('age')} years" if r.get("age") != NOT_RECORDED else f"age {NOT_RECORDED}")
     if f.admission_date:
         parts.append(f"admitted {r.get('admissionDate')}")
+    if f.staff_role or f.staff_designation:
+        roles = [role_label(x) for x in r.get("staffRoles") or [] if isinstance(x, str)]
+        parts.append("staff: " + (", ".join(roles) if roles else "no active staff with a role"))
     return " · ".join(parts)
 
 
 def build_response(plan: QueryPlan, data: ExecutionData) -> dict[str, Any]:
     filter_text = " · ".join(describe_filters(plan.filters))
     scope = f" matching {filter_text}" if filter_text else ""
+    if plan.entity == "staff" and plan.is_data_query:
+        return _staff_response(plan, data, filter_text)
 
     if plan.action == "help":
         return {
@@ -414,3 +445,115 @@ def _columns(plan: QueryPlan) -> list[dict[str, str]]:
         for a in plan.output_fields
         if a in mapping
     ]
+
+
+# ---------------------------------------------------------------------- staff answers (plan.entity == "staff")
+def _staff_value(row: dict, attribute: str) -> str:
+    value = row.get(STAFF_FIELD_MAP[attribute])
+    if attribute == "staff_role":
+        return role_label(value) if isinstance(value, str) and value else "No role"
+    if attribute == "staff_status":
+        return str(value or NOT_RECORDED).title()
+    if attribute == "staff_type":
+        return STAFF_TYPE_LABELS.get(value, NOT_RECORDED) if value else NOT_RECORDED
+    if attribute == "staff_residents":
+        return ", ".join(value) if value else "No residents assigned"
+    if attribute == "staff_resident_count":
+        return str(value if value is not None else 0)
+    return str(value) if value not in (None, "") else NOT_RECORDED
+
+
+def _staff_row(row: dict) -> dict:
+    """A staff member as a result row the UI renders like a resident row (name + the requested columns). The record
+    key (staffs.cName) never leaves the backend."""
+    out = {k: v for k, v in row.items() if k not in ("staffId", "name")}
+    return {"firstName": row.get("name") or NOT_RECORDED, "lastName": "", "residentId": "", **out}
+
+
+def _staff_columns(plan: QueryPlan) -> list[dict[str, str]]:
+    return [{"key": STAFF_FIELD_MAP[a], "label": ATTRIBUTE_LABELS.get(a, a), "attribute": a} for a in plan.output_fields]
+
+
+def _staff_word(n: int) -> str:
+    return f"{n} staff member{'' if n == 1 else 's'}"
+
+
+def _staff_response(plan: QueryPlan, data: ExecutionData, filter_text: str) -> dict[str, Any]:
+    scope = f" matching {filter_text}" if filter_text else ""
+    active_note = " Only active staff are included; ask for inactive staff to include them." if data.staff_default_active else ""
+    who = "active staff members" if data.staff_default_active else "staff members"
+
+    if plan.action == "lookup":
+        rows = data.staff_rows or []
+        if not rows:
+            return {"headline": "Staff member not found", "summaryText": "No matching staff record was found.", "count": 0,
+                    "needsClarification": True}  # fmt: skip
+        attrs = plan.output_fields or ["staff_designation", "staff_status", "staff_facility", "staff_resident_count"]
+        if data.staff_contacts_withheld:
+            attrs = [a for a in attrs if a not in ("staff_email", "staff_phone")]
+        if data.checks is not None and len(rows) == 1:
+            ok = data.checks[0]
+            r = rows[0]
+            return {
+                "headline": f"{'Yes' if ok else 'No'} — {r.get('name')}",
+                "summaryText": f"{r.get('name')} {'matches' if ok else 'does not match'} {filter_text}. Designation: "
+                f"{_staff_value(r, 'staff_designation')}, {_staff_value(r, 'staff_status').lower()}.",
+                "count": 1,
+            }
+        spots = [
+            {"attribute": a, "label": f"{r.get('name')} · {ATTRIBUTE_LABELS.get(a, a)}" if len(rows) > 1 else ATTRIBUTE_LABELS.get(a, a),
+             "value": _staff_value(r, a), "supportingDetail": f"{ATTRIBUTE_LABELS.get(a, a)} of {r.get('name')}."}
+            for r in rows for a in attrs
+        ]  # fmt: skip
+        note = " Contact details are shown for one staff member at a time." if data.staff_contacts_withheld else ""
+        if len(spots) == 1:
+            return {"headline": f"{spots[0]['value']} — {spots[0]['label']}", "summaryText": spots[0]["supportingDetail"] + note,
+                    "count": 1, "attributeSpotlight": spots[0], "multiSpotlight": spots}  # fmt: skip
+        return {
+            "headline": " · ".join(str(s["value"]) for s in spots[: len(attrs)]) if len(rows) == 1 else f"{len(rows)} staff members",
+            "summaryText": " | ".join(f"{r.get('name')}: " + "; ".join(f"{ATTRIBUTE_LABELS.get(a, a)}: {_staff_value(r, a)}" for a in attrs)
+                                      for r in rows) + "." + note,
+            "count": len(rows),
+            "multiSpotlight": spots,
+        }  # fmt: skip
+
+    if plan.action == "breakdown":
+        groups = data.groups or []
+        denom = data.matched or 1
+        label = " × ".join(GROUP_LABELS[g] for g in plan.group_by)
+        return {
+            "headline": f"{_staff_word(data.matched)} by {label}",
+            "summaryText": f"Breakdown of {data.matched} {who}{scope} ({data.total} staff in total).{active_note}",
+            "count": data.matched,
+            "breakdown": [
+                {"key": "|".join(g.key), "label": " · ".join(label_value(f, k) for f, k in zip(plan.group_by, g.key, strict=True)),
+                 "count": g.count, "percentage": round(g.count / denom * 100)}
+                for g in groups
+            ],
+        }  # fmt: skip
+
+    if plan.action == "count":
+        return {
+            "headline": f"{_staff_word(data.matched)}" if data.matched else "No matching staff members",
+            "summaryText": f"{data.matched} {who}{scope} ({data.total} staff in total).{active_note}",
+            "count": data.matched,
+        }
+    rows = data.staff_rows or []
+    has_more = len(rows) < data.matched
+    if plan.sort and plan.limit == 1 and rows:
+        r = rows[0]
+        detail = f"{_staff_value(r, plan.sort.field)} {ATTRIBUTE_LABELS.get(plan.sort.field, '').lower()}".strip()
+        return {"headline": f"{r.get('name')} — {detail}", "summaryText": f"Chosen from {data.matched} {who}{scope}.{active_note}",
+                "count": 1, "residentsSample": [_staff_row(r)], "columns": _staff_columns(plan)}  # fmt: skip
+    summary = f"{data.matched} {who}{scope}." + (f" Showing {len(rows)} of {data.matched}." if has_more else "") + active_note
+    return {
+        "headline": "No matching staff members" if not data.matched else _staff_word(data.matched),
+        "summaryText": summary,
+        "count": data.matched,
+        "totalMatched": data.matched,
+        "returnedCount": len(rows),
+        "hasMore": has_more,
+        "entity": "staff",
+        "residentsSample": [_staff_row(r) for r in rows],
+        "columns": _staff_columns(plan),
+    }

@@ -19,6 +19,8 @@ class MongoResidentRepository(ViewRepository):
         # a cold Atlas connection took 8-10 s from the dev machine (SRV + TLS + auth, 2026-11-18): 5 s failed startup
         self._client: AsyncMongoClient = AsyncMongoClient(uri, maxPoolSize=20, serverSelectionTimeoutMS=30000)
         self._col = self._client[db][collection]
+        self._db = self._client[db]
+        self.resident_collection = collection
 
     async def init(self) -> None:
         await self._client.admin.command("ping")
@@ -27,5 +29,6 @@ class MongoResidentRepository(ViewRepository):
     async def close(self) -> None:
         await self._client.close()
 
-    async def _aggregate(self, pipeline: list[dict]) -> list[dict]:
-        return await (await self._col.aggregate(pipeline)).to_list()
+    async def _aggregate(self, pipeline: list[dict], collection: str | None = None) -> list[dict]:
+        col = self._db[collection] if collection else self._col  # e.g. staffs for staff questions
+        return await (await col.aggregate(pipeline)).to_list()

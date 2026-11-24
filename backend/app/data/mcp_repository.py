@@ -111,6 +111,7 @@ class McpResidentRepository(ViewRepository):
             "MDB_MCP_MAX_DOCUMENTS_PER_QUERY": str(max_documents),
         }
         self._base = {"connectionId": "preconfigured", "database": database, "collection": collection}
+        self.resident_collection = collection
         self._timeout = timeout_seconds
         self._owner: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -230,5 +231,6 @@ class McpResidentRepository(ViewRepository):
         return data
 
     # ------------------------------------------------------------------ repository interface (see ViewRepository)
-    async def _aggregate(self, pipeline: list[dict]) -> list[dict]:
-        return (await self._call("aggregate", {"pipeline": pipeline})).get("documents", [])
+    async def _aggregate(self, pipeline: list[dict], collection: str | None = None) -> list[dict]:
+        args: dict[str, Any] = {"pipeline": pipeline, **({"collection": collection} if collection else {})}
+        return (await self._call("aggregate", args)).get("documents", [])

@@ -170,6 +170,16 @@ class EntityIndex:
                 tokens, "".join(tokens), str(m.get("rel") or ""), str(m.get("relation") or ""),
             ))  # fmt: skip
         self.family_relations = list(getattr(vocab, "family_relations", []) or [])
+        # every staff member who is a person (staffs; app/data/staff.py), assigned or not, any status: staff questions
+        # ("Priya Raman's residents", "Dr. Hart's phone") name staff the caregiver list may not have
+        self._staff: list[_IndexedCaregiver] = []
+        for row in getattr(vocab, "staff", []) or []:
+            value = str(row.get("name") or "").strip()
+            tokens = [t for t in _name_parts(value.split(",")[0]) if t not in _TITLE_WORDS]
+            if value and tokens:
+                self._staff.append(_IndexedCaregiver(value, "".join(tokens), tokens))
+        self.staff_designations = sorted({str(r.get("designation")).strip() for r in getattr(vocab, "staff", []) or []
+                                          if isinstance(r.get("designation"), str) and r.get("designation").strip()})  # fmt: skip
         self._rooms = {re.sub(r"[^a-z0-9]", "", r.lower()): r for r in vocab.rooms if not is_missing(r, "roomNumber")}
 
     # ------------------------------------------------------------------ masking
@@ -545,17 +555,35 @@ class EntityIndex:
         return Resolution(fuzzy, ambiguous=len(fuzzy) > 1)
 
     def resolve_caregiver(self, text: str) -> Resolution:
+        return self._resolve_person(text, self._caregivers)
+
+    def staff_name_tokens(self) -> set[str]:
+        """Every word of a staff or caregiver name (titles excluded): "Dr. Raman" is a title + a name, not a role."""
+        return {t for c in [*self._staff, *self._caregivers] for t in c.tokens}
+
+    def resolve_staff(self, text: str) -> Resolution:
+        """A staff member named in a staff question: every staff person (any status), not only assigned caregivers."""
+        return self._resolve_person(text, self._staff or self._caregivers)
+
+    def resolve_designation(self, text: str) -> Resolution:
+        """A designation as recorded, compared without case and surrounding spaces ("case manager" → Case Manager)."""
+        want = " ".join(str(text).split()).lower()
+        hits = [d for d in self.staff_designations if d.lower() == want]
+        if not hits and want.endswith("s"):  # "case managers"
+            hits = [d for d in self.staff_designations if d.lower() == want[:-1]]
+        return Resolution(hits)
+
+    @staticmethod
+    def _resolve_person(text: str, pool: list[_IndexedCaregiver]) -> Resolution:
         tokens = [t for t in _name_parts(text.split(",")[0]) if t not in _TITLE_WORDS]
         if not tokens:
             return Resolution([])
         joined = "".join(tokens)
-        hits = [c for c in self._caregivers if all(t in c.tokens for t in tokens)]
+        hits = [c for c in pool if all(t in c.tokens for t in tokens)]
         if not hits:
-            hits = [c for c in self._caregivers if fuzz.ratio(joined, c.person) >= FULL_NAME_THRESHOLD]
+            hits = [c for c in pool if fuzz.ratio(joined, c.person) >= FULL_NAME_THRESHOLD]
         if not hits and len(tokens) == 1:
-            hits = [
-                c for c in self._caregivers if any(fuzz.ratio(tokens[0], t) >= SINGLE_NAME_THRESHOLD for t in c.tokens)
-            ]
+            hits = [c for c in pool if any(fuzz.ratio(tokens[0], t) >= SINGLE_NAME_THRESHOLD for t in c.tokens)]
         people = {c.person for c in hits}
         # The same person can appear under two job titles; that is one person, not an ambiguity.
         return Resolution([c.value for c in hits], ambiguous=len(people) > 1)

@@ -41,6 +41,9 @@ _IR_SCHEMA = RequestIR.model_json_schema()
 _IR_REQUIRED = [k for k in _IR_SCHEMA["properties"] if k in _IR_SCHEMA.get("required", [])]
 GRAMMAR_KEY_ORDER = _IR_REQUIRED + [k for k in _IR_SCHEMA["properties"] if k not in _IR_REQUIRED]
 ATTRIBUTES = list(ATTRIBUTES_IR)
+# staff fields are described in their own section (Bedrock prompt only); the resident tables stay as they were
+_STAFF_PREFIX = "staff_"
+RESIDENT_CONDITION_FIELDS = [n for n in CONDITION_FIELDS if not n.startswith(_STAFF_PREFIX)]
 
 
 def _family_rules(ctx: SchemaContext) -> str:
@@ -69,17 +72,54 @@ def _family_rules(ctx: SchemaContext) -> str:
     )
 
 
+def _staff_rules() -> str:
+    """Staff (the staffs collection; app/data/staff.py), for models without an output grammar. Field names come from
+    the compiler; role words are mapped to roles by the backend (resident_schema.yaml), never by the model."""
+    from app.models.plan import STAFF_ATTRIBUTES, STAFF_GROUP_FIELDS, STAFF_SINGLE_RECORD, STAFF_SORT_FIELDS
+
+    staff_fields = [n for n in CONDITION_FIELDS if n.startswith(_STAFF_PREFIX)]
+    ops: dict[tuple[str, ...], list[str]] = {}
+    for name in staff_fields:
+        ops.setdefault(operators_for(name), []).append(name)
+    shown = [a for a in STAFF_ATTRIBUTES if a not in STAFF_SINGLE_RECORD]
+    return (
+        "\n- Staff members (care team, physicians, case managers, nurses, therapists, drivers, ...):"
+        "\n  staff_role: the role word as written (physician, doctor, case manager, nurse practitioner, social worker,"
+        " dietitian, therapist, ...); staff_designation: a designation exactly as written. In a RESIDENT question they"
+        " mean ANY of the resident's active assigned staff: \"residents without a case manager\" is staff_role ne"
+        " \"case manager\"; staff_count = number of active assigned staff. \"caregiver\" stays primary_caregiver."
+        "\n  Show a resident's staff: care_team (assigned staff with designations; inactive marked) or primary_physician"
+        " (only for the words \"primary physician\"). \"resident_N's physician\" = lookup resident_N, attributes"
+        " [\"care_team\"], where staff_role eq \"physician\"; \"resident_N's care team\" = attributes [\"care_team\"]."
+        "\n  When the rows are STAFF MEMBERS (\"how many physicians\", \"list case managers\", \"staff with more than 20"
+        ' residents"), add "entity": "staff" right after "action". Staff fields: '
+        + "; ".join(f"{', '.join(names)}: {' | '.join(o)}" for o, names in ops.items())
+        + ". staff_status: active | inactive (omit = active staff only; \"including inactive\" = in [active, inactive]);"
+        " staff_type: provider | facility_staff | external_user; staff_name: a staff name as written;"
+        " staff_resident_count: number of assigned residents."
+        "\n  In a staff question every resident field is a condition on the staff member's assigned residents"
+        ' ("staff caring for memory care residents" = entity staff, care_type eq memory_care).'
+        f"\n  Staff group_by: {', '.join(STAFF_GROUP_FIELDS)} · sort: {', '.join(STAFF_SORT_FIELDS)} · projection:"
+        f" {', '.join(shown)}."
+        '\n  One named staff member: action lookup, entity staff, "lookup": {"staff": ["name as written"], "attributes":'
+        f" [...], ...}}; {', '.join(STAFF_SINGLE_RECORD)} only in such a lookup."
+        ' "residents assigned to <staff name>" is a RESIDENT list with primary_caregiver eq the name. "how many residents'
+        ' does each physician have" = entity staff, list, staff_role eq physician, projection staff_resident_count, sort'
+        " staff_resident_count desc."
+    )
+
+
 def _operator_rules(full: bool) -> str:
     """Predicate operators, generated from the compiler's definitions (request_ir.operators_for).
 
     full=False (grammar-constrained models, e.g. Qwen on llama.cpp): the output grammar already allows only the
     operators in PredicateOperator, so one compact line says which fields take text matching (keeps the prompt within
     its CPU size budget). full=True (no output grammar, e.g. Bedrock): the whole per-field table."""
-    text_fields = [n for n in CONDITION_FIELDS if set(TEXT_OPERATORS) <= set(operators_for(n))]
+    text_fields = [n for n in RESIDENT_CONDITION_FIELDS if set(TEXT_OPERATORS) <= set(operators_for(n))]
     if not full:
         return f"- {'/'.join(TEXT_OPERATORS)}: only {', '.join(text_fields)}"
     groups: dict[tuple[str, ...], list[str]] = {}
-    for name in CONDITION_FIELDS:
+    for name in RESIDENT_CONDITION_FIELDS:
         groups.setdefault(operators_for(name), []).append(name)
     lines = ["- Predicate operators — use ONLY these, per field:"]
     lines += [f"  {', '.join(names)}: {' | '.join(ops)}" for ops, names in groups.items()]
@@ -125,7 +165,7 @@ RequestIR fields:
 - action/action_status/action_evidence: operation, its status, and exact supporting quote.
 - where: predicate/and/or/not/relationship AST. Every node has status (supported, ambiguous, unsupported, unresolved)
   and exact evidence. Predicates use field/operator/value. Relationship nodes use relation/target and are rejected.
-{_operator_rules(operator_table)}{_family_rules(ctx) if operator_table else ''}
+{_operator_rules(operator_table)}{_family_rules(ctx) if operator_table else ''}{_staff_rules() if operator_table else ''}
 - group_by and projection: arrays of {{field, status, evidence}}; grouping is not filtering. Projection is what to SHOW,
   separate from where (for example "show room numbers" is projection, not a room filter).
 - aggregate, sort, limit, lookup: each has status and exact evidence.

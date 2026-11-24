@@ -6,7 +6,17 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from app.models.plan import TEXT_MATCH_FIELDS, QueryPlan, canonical_field
+from app.models.plan import (
+    ALL_TEXT_MATCH_FIELDS,
+    STAFF_ATTRIBUTES,
+    STAFF_ENTITY_SET_FIELDS,
+    STAFF_GROUP_FIELDS,
+    STAFF_RELATION_ATTRIBUTES,
+    STAFF_SORT_FIELDS,
+    TEXT_MATCH_FIELDS,
+    QueryPlan,
+    canonical_field,
+)
 from app.nlu import placeholders as ph
 
 Action = Literal["count", "list", "breakdown", "aggregate", "lookup", "clarify", "unsupported", "help"]
@@ -22,17 +32,21 @@ SET_FIELDS: tuple[str, ...] = (
     "status", "care_type", "facility", "gender", "primary_caregiver", "room_number",
     "family_relation", "family_type", "family_flags",  # family relation (app/data/relations.py): ANY member
     "family_member",  # a specific family member: a family_N / person_N placeholder, resolved by the backend
+    *STAFF_ENTITY_SET_FIELDS,  # staff (app/data/staff.py): role, designation, status, facility, type, name
 )  # fmt: skip
 DATE_FIELDS: tuple[str, ...] = ("admission_date", "created_date", "discharge_date")
-COUNT_FIELDS: tuple[str, ...] = ("family_count",)  # number of related records per resident (0 = none)
+# number of related records (always known, 0 = none): family members / active assigned staff of a resident, and the
+# assigned residents of a staff member
+COUNT_FIELDS: tuple[str, ...] = ("family_count", "staff_count", "staff_resident_count")
 RANGE_FIELDS: tuple[str, ...] = ("age", *DATE_FIELDS, *COUNT_FIELDS)
 CONDITION_FIELDS: tuple[str, ...] = (*SET_FIELDS, *RANGE_FIELDS)
-GROUP_FIELDS: tuple[str, ...] = ("status", "care_type", "facility", "gender", "primary_caregiver")
-SORT_FIELDS: tuple[str, ...] = ("admission_date", "created_date", "discharge_date", "age", "last_name", "family_count")
+GROUP_FIELDS: tuple[str, ...] = ("status", "care_type", "facility", "gender", "primary_caregiver", *STAFF_GROUP_FIELDS)
+SORT_FIELDS: tuple[str, ...] = ("admission_date", "created_date", "discharge_date", "age", "last_name", "family_count",
+                                *STAFF_SORT_FIELDS)  # fmt: skip
 ATTRIBUTES: tuple[str, ...] = (
     "primary_caregiver", "room_number", "facility", "admission_date", "created_date", "discharge_date",
     "emergency_contact", "resident_id", "status", "care_type", "age", "gender", "family_members", "family_count",
-    "family_relationship",
+    "family_relationship", *STAFF_RELATION_ATTRIBUTES, *STAFF_ATTRIBUTES,
 )  # fmt: skip
 SET_OPERATORS: tuple[str, ...] = ("eq", "ne", "in", "not_in", "missing", "present")
 TEXT_OPERATORS: tuple[str, ...] = ("starts_with", "contains")  # only on TEXT_MATCH_FIELDS (app/models/plan.py)
@@ -50,7 +64,7 @@ def operators_for(field: str) -> tuple[str, ...]:
         return COUNT_OPERATORS
     if field in RANGE_FIELDS:
         return RANGE_OPERATORS
-    if field in TEXT_MATCH_FIELDS:
+    if field in ALL_TEXT_MATCH_FIELDS:
         return (*SET_OPERATORS, *TEXT_OPERATORS)
     if field in SET_FIELDS:
         return SET_OPERATORS
@@ -159,10 +173,17 @@ class IRSort(_Strict):
 
 
 class IRLookup(_Strict):
-    residents: list[str] = Field(min_length=1, max_length=5)
+    residents: list[str] = Field(default_factory=list, max_length=5)
+    staff: list[str] = Field(default_factory=list, max_length=5)  # staff names as written (entity staff)
     attributes: list[str] = Field(default_factory=list, max_length=12)
     status: NodeStatus
     evidence: str = Field(min_length=1, max_length=300)
+
+    @model_validator(mode="after")
+    def _names_someone(self):
+        if not self.residents and not self.staff:
+            raise ValueError("lookup needs residents (resident_N) or staff (names)")
+        return self
 
 
 class IRLimit(_Strict):
@@ -178,6 +199,7 @@ class IRDiagnostic(_Strict):
 
 class RequestIR(_Strict):
     action: Action
+    entity: Literal["resident", "staff"] = "resident"  # what the rows are: residents (default) or staff members
     action_status: NodeStatus
     action_evidence: str = Field(min_length=1, max_length=300)
     where: IRNode | None
@@ -246,7 +268,7 @@ _DATE_FIELDS = set(DATE_FIELDS)
 _GROUP_FIELDS = set(GROUP_FIELDS)
 _ATTRIBUTES = set(ATTRIBUTES)
 _SORT_FIELDS = set(SORT_FIELDS)
-_TEXT_FIELDS = set(TEXT_MATCH_FIELDS)
+_TEXT_FIELDS = set(ALL_TEXT_MATCH_FIELDS)
 _STATUS_VALUES = {"active", "away", "inactive", "pending", "admitted", "discharged"}
 _CARE_VALUES = {"assisted_living", "memory_care", "independent_living", "skilled_nursing", "respite_care"}
 _GENDER_VALUES = {"Female", "Male", "Other"}
@@ -385,10 +407,12 @@ def compile_request_ir(
     lookup = None
     if ir.lookup:
         attributes = [_known_field(v, _ATTRIBUTES, "lookup attribute") for v in ir.lookup.attributes]
-        lookup = {"residents": list(ir.lookup.residents), "attributes": attributes}
+        lookup = {"residents": list(ir.lookup.residents), "attributes": attributes,
+                  **({"staff": list(ir.lookup.staff)} if ir.lookup.staff else {})}  # fmt: skip
 
     plan = {
         "action": ir.action,
+        "entity": ir.entity,
         "filters": filters,
         "group_by": group_by or None,
         "aggregate": aggregate,
@@ -518,12 +542,14 @@ def request_ir_from_plan(plan: dict, evidence: str) -> dict:
     if lookup_raw:
         lookup = {
             "residents": list(lookup_raw.get("residents") or []),
+            **({"staff": list(lookup_raw["staff"])} if lookup_raw.get("staff") else {}),
             "attributes": list(lookup_raw.get("attributes") or []),
             "status": "supported",
             "evidence": evidence,
         }
     return {
         "action": action,
+        **({"entity": plan["entity"]} if plan.get("entity") and plan["entity"] != "resident" else {}),
         "action_status": "supported",
         "action_evidence": evidence,
         "where": where,
@@ -1028,7 +1054,7 @@ def _check_operators(field: str, operators: list) -> None:
         raise IRCompilationError(
             f"operator {op} is not allowed on {field}", code="operator",
             details=[f"{field}: operator {op!r} is not allowed; allowed on {field}: {', '.join(allowed)}"
-                     + (f". Text matching works only on {', '.join(TEXT_MATCH_FIELDS)}" if text else "")],
+                     + (f". Text matching works only on {', '.join(ALL_TEXT_MATCH_FIELDS)}" if text else "")],
             capability=f"text matching on {field.replace('_', ' ')}" if text else None,
         )  # fmt: skip
 

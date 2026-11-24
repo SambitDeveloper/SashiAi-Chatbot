@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from app.data import text_match
 from app.data.relations import FAMILY_VIEW_FIELDS
 from app.data.schema_config import identity_fields, is_missing, list_fields
+from app.data.staff import STAFF_RESIDENT_FIELDS
 from app.models.plan import Filters, GroupField, Sort
 
 # Plan field name → field name in the resident view (app/data/resident_schema.yaml `fields`)
@@ -30,10 +31,15 @@ FIELD_MAP: dict[str, str] = {
     "family_count": "familyCount",
     "family_members": "familyMembers",
     "family_member": "familyIds",  # specific family members, by record id (resolved server side, never by name)
+    # derived from the `staff` relation (app/data/staff.py): the resident's ACTIVE assigned staff
+    "staff_role": "staffRoles",
+    "staff_designation": "staffDesignations",
+    "staff_count": "staffCount",
 }
 # the plan's set-valued fields, in the order both filter engines (matches / to_mongo_filter) apply them
 SET_FILTER_FIELDS = ("status", "care_type", "facility", "gender", "primary_caregiver", "room_number",
-                     "family_relation", "family_type", "family_flags", "family_member")  # fmt: skip
+                     "family_relation", "family_type", "family_flags", "family_member", "staff_role",
+                     "staff_designation")  # fmt: skip
 
 Resident = dict[str, Any]
 
@@ -51,6 +57,8 @@ class Vocabulary:
     family_relations: list[str] = field(default_factory=list)  # normalised relation values (familymembers)
     # family members of live residents for the entity index: {id, name, rel, relation, residentId, facilityId}
     family_members: list[dict] = field(default_factory=list)
+    # every staff member who is a person (app/data/staff.py), any status: {name, designation, role, status}
+    staff: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -158,6 +166,8 @@ def matches(record: Resident, filters: Filters) -> bool:
         checks.append(("age", filters.age, filters.age.min, filters.age.max))
     if filters.family_count:
         checks.append(("familyCount", filters.family_count, filters.family_count.min, filters.family_count.max))
+    if filters.staff_count:
+        checks.append(("staffCount", filters.staff_count, filters.staff_count.min, filters.staff_count.max))
     for plan_field in ("admission_date", "created_date", "discharge_date"):
         r = getattr(filters, plan_field)
         if r is not None:
@@ -220,5 +230,8 @@ def list_view(record: Resident) -> Resident:
     out["emergencyContact"] = {"name": "", "relationship": "", "phone": ""}
     for key in FAMILY_VIEW_FIELDS:  # family details only when asked for (projection) or for one resident
         if key != "familyCount":  # the number of family members is not personal data (shown when it was joined)
+            out.pop(key, None)
+    for key in STAFF_RESIDENT_FIELDS:  # staff details only when asked for; the number of assigned staff is not
+        if key != "staffCount":
             out.pop(key, None)
     return out

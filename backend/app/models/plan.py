@@ -13,8 +13,22 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 Status = Literal["active", "away", "inactive", "pending", "admitted", "discharged"]
 CareType = Literal["assisted_living", "memory_care", "independent_living", "skilled_nursing", "respite_care"]
 Gender = Literal["Female", "Male", "Other"]
-GroupField = Literal["status", "care_type", "facility", "gender", "primary_caregiver"]
-SortField = Literal["admission_date", "created_date", "discharge_date", "age", "last_name", "family_count"]
+ResidentGroupField = Literal["status", "care_type", "facility", "gender", "primary_caregiver"]
+# Staff (staffs collection; app/data/staff.py). A plan is about residents (default) or about staff members (`entity`).
+# The staff_* fields describe a STAFF MEMBER: in a resident plan the resident's assigned staff (ANY of them), in a staff
+# plan the staff member itself; in a staff plan every other condition applies to the staff member's assigned residents.
+Entity = Literal["resident", "staff"]
+StaffStatus = Literal["active", "inactive"]
+StaffType = Literal["provider", "facility_staff", "external_user"]
+StaffGroupField = Literal["staff_role", "staff_designation", "staff_status", "staff_facility", "staff_type"]
+GroupField = Literal[
+    "status", "care_type", "facility", "gender", "primary_caregiver",
+    "staff_role", "staff_designation", "staff_status", "staff_facility", "staff_type",
+]  # fmt: skip
+SortField = Literal[
+    "admission_date", "created_date", "discharge_date", "age", "last_name", "family_count",
+    "staff_name", "staff_resident_count",
+]  # fmt: skip
 # Family relation (familymembers; app/data/relations.py): the kinds of contact and the access flags of ANY member.
 FamilyType = Literal["family", "emergency"]
 FamilyFlag = Literal["portal_access", "app_access", "health_access", "guarantor"]
@@ -34,6 +48,11 @@ Attribute = Literal[
     "family_members",  # names + relations; one resident's answer also shows phone and email
     "family_count",
     "family_relationship",  # how the selected family member(s) are related to ONE looked-up resident
+    "care_team",  # the resident's assigned staff, "Name (Designation)"; inactive staff marked
+    "primary_physician",  # residents.primaryPhysicianCName (distinct from assigned staff and from designations)
+    # a staff member's own facts (staff plans only)
+    "staff_designation", "staff_role", "staff_status", "staff_facility", "staff_type", "staff_resident_count",
+    "staff_email", "staff_phone", "staff_residents",  # one staff member's answer only
 ]
 Action = Literal["count", "list", "breakdown", "aggregate", "lookup", "clarify", "unsupported", "help"]
 
@@ -47,6 +66,23 @@ def canonical_field(name):
     return LEGACY_FIELD_NAMES.get(name, name) if isinstance(name, str) else name
 
 
+RESIDENT_GROUP_FIELDS: tuple[str, ...] = ResidentGroupField.__args__  # type: ignore[attr-defined]
+STAFF_GROUP_FIELDS: tuple[str, ...] = StaffGroupField.__args__  # type: ignore[attr-defined]
+# staff-member conditions; in a resident plan only staff_role / staff_designation / staff_count (ANY active assigned staff)
+STAFF_ENTITY_SET_FIELDS = ("staff_role", "staff_designation", "staff_status", "staff_facility", "staff_type", "staff_name")
+STAFF_ONLY_FIELDS = ("staff_status", "staff_facility", "staff_type", "staff_name", "staff_resident_count")  # staff plans
+STAFF_RELATION_FIELDS = ("staff_role", "staff_designation", "staff_count")  # resident plans: the assigned staff
+STAFF_SORT_FIELDS = ("staff_name", "staff_resident_count")
+STAFF_ATTRIBUTES = ("staff_designation", "staff_role", "staff_status", "staff_facility", "staff_type",
+                    "staff_resident_count", "staff_email", "staff_phone", "staff_residents")  # fmt: skip
+STAFF_SINGLE_RECORD = ("staff_email", "staff_phone", "staff_residents")
+STAFF_RELATION_ATTRIBUTES = ("care_team", "primary_physician")
+# plan field → field of the staff view (app/data/staff.py)
+STAFF_FIELD_MAP = {
+    "staff_role": "role", "staff_designation": "designation", "staff_status": "status", "staff_facility": "facility",
+    "staff_type": "type", "staff_name": "name", "staff_resident_count": "residentCount", "staff_email": "email",
+    "staff_phone": "phone", "staff_residents": "residents",
+}  # fmt: skip
 STATUSES: tuple[str, ...] = Status.__args__  # type: ignore[attr-defined]
 CARE_TYPES: tuple[str, ...] = CareType.__args__  # type: ignore[attr-defined]
 
@@ -58,6 +94,8 @@ class _Strict(BaseModel):
 # Text matching ("room starts with A", "facility contains Garden") is allowed on these free-text plan fields ONLY.
 # Fixed-vocabulary fields (status, care type, gender) are matched by exact value. Semantics: app/data/text_match.py.
 TEXT_MATCH_FIELDS: tuple[str, ...] = ("room_number", "facility", "primary_caregiver")
+STAFF_TEXT_MATCH_FIELDS: tuple[str, ...] = ("staff_designation", "staff_facility", "staff_name")  # same semantics
+ALL_TEXT_MATCH_FIELDS: tuple[str, ...] = (*TEXT_MATCH_FIELDS, *STAFF_TEXT_MATCH_FIELDS)
 TEXT_MATCH_MAX_CHARS = 60
 
 
@@ -114,8 +152,8 @@ class SetFilter[T](_Strict):
 class CountRange(_Strict):
     """A number of related records per resident (always known: 0 when none is recorded). min/max are inclusive."""
 
-    min: int | None = Field(default=None, ge=0, le=100)
-    max: int | None = Field(default=None, ge=0, le=100)
+    min: int | None = Field(default=None, ge=0, le=1000)
+    max: int | None = Field(default=None, ge=0, le=1000)
 
     @model_validator(mode="after")
     def _order(self):
@@ -211,10 +249,22 @@ class Filters(_Strict):
     # specific family members, as familymembers record ids (resolved by the backend from family_N / person_N
     # placeholders; a model never writes an id or a name here)
     family_member: SetFilter[str] | None = None
+    # staff (app/data/staff.py). Roles are canonical role names (resolved from question words by the backend);
+    # designations are as recorded. Resident plan: ANY ACTIVE assigned staff member has it. Staff plan: the staff member.
+    staff_role: SetFilter[str] | None = None
+    staff_designation: SetFilter[str] | None = None
+    staff_count: CountRange | None = None  # resident plans: number of active assigned staff
+    # staff plans only
+    staff_status: SetFilter[StaffStatus] | None = None  # not given → active staff only
+    staff_facility: SetFilter[str] | None = None
+    staff_type: SetFilter[StaffType] | None = None
+    staff_name: SetFilter[str] | None = None  # staff names as recorded (resolved by the backend)
+    staff_resident_count: CountRange | None = None  # assigned residents (matching the plan's resident conditions)
 
     @model_validator(mode="after")
     def _text_match_fields(self):
-        for name in ("status", "care_type", "gender", "family_relation", "family_type", "family_flags", "family_member"):
+        for name in ("status", "care_type", "gender", "family_relation", "family_type", "family_flags", "family_member",
+                     "staff_role", "staff_status", "staff_type"):
             sf = getattr(self, name)
             if sf is not None and sf.has_text_match:
                 raise ValueError(f"starts_with/contains apply only to {', '.join(TEXT_MATCH_FIELDS)}, not {name}")
@@ -222,7 +272,7 @@ class Filters(_Strict):
 
     @property
     def has_text_match(self) -> bool:
-        return any(getattr(self, n) is not None and getattr(self, n).has_text_match for n in TEXT_MATCH_FIELDS)
+        return any(getattr(self, n) is not None and getattr(self, n).has_text_match for n in ALL_TEXT_MATCH_FIELDS)
 
     def is_empty(self) -> bool:
         return all(getattr(self, f) is None for f in type(self).model_fields)
@@ -239,8 +289,15 @@ class Sort(_Strict):
 
 
 class Lookup(_Strict):
-    residents: list[str] = Field(min_length=1, max_length=5)
+    residents: list[str] = Field(default_factory=list, max_length=5)
+    staff: list[str] | None = Field(default=None, max_length=5)  # staff names (resolved by the backend)
     attributes: list[Attribute] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _one_kind(self):
+        if bool(self.residents) == bool(self.staff):
+            raise ValueError("lookup needs residents or staff (one of them, at least one)")
+        return self
 
 
 class Option(_Strict):
@@ -263,6 +320,8 @@ class QueryPlan(_Strict):
         return data
 
     action: Action
+    # None = residents (the default; left out of serialised plans so resident plans are exactly what they were)
+    entity: Entity | None = None
     filters: Filters = Field(default_factory=Filters)
     group_by: list[GroupField] | None = Field(default=None, min_length=1, max_length=2)
     aggregate: Aggregate | None = None
@@ -275,6 +334,11 @@ class QueryPlan(_Strict):
     fields: list[Attribute] | None = Field(default=None, min_length=1, max_length=len(Attribute.__args__))  # type: ignore[attr-defined]
     message: str | None = Field(default=None, max_length=500)
     options: list[Option] | None = Field(default=None, max_length=6)
+
+    @field_validator("entity")
+    @classmethod
+    def _default_entity(cls, v):
+        return None if v == "resident" else v
 
     @field_validator("group_by")
     @classmethod
@@ -304,6 +368,34 @@ class QueryPlan(_Strict):
                 raise ValueError("fields (what to show) apply to list, breakdown and lookup only")
             if len(set(self.fields)) != len(self.fields):
                 raise ValueError("fields must be unique")
+        return self._entity_requirements()
+
+    def _entity_requirements(self):
+        """Which fields belong to which entity (see the staff_* comment at the top of this module)."""
+        f, shown, groups = self.filters, self.output_fields, self.group_by or []
+        sort = self.sort.field if self.sort else None
+        if self.entity == "staff":
+            wrong = [n for n in ("staff_count",) if getattr(f, n) is not None]
+            wrong += [a for a in shown if a not in STAFF_ATTRIBUTES]
+            wrong += [g for g in groups if g not in STAFF_GROUP_FIELDS]
+            wrong += [sort] if sort and sort not in STAFF_SORT_FIELDS else []
+            if wrong:
+                raise ValueError(f"not available for staff: {', '.join(dict.fromkeys(wrong))}")
+            if self.action == "aggregate":
+                raise ValueError("aggregate is not available for staff")
+            if self.lookup and self.lookup.residents:
+                raise ValueError("a staff lookup names staff (lookup.staff), not residents")
+            if self.action != "lookup" and set(shown) & set(STAFF_SINGLE_RECORD):
+                raise ValueError("staff_email, staff_phone and staff_residents are shown for one looked-up staff member only")
+        else:
+            wrong = [n for n in STAFF_ONLY_FIELDS if getattr(f, n) is not None]
+            wrong += [a for a in shown if a in STAFF_ATTRIBUTES]
+            wrong += [g for g in groups if g in STAFF_GROUP_FIELDS]
+            wrong += [sort] if sort in STAFF_SORT_FIELDS else []
+            if wrong:
+                raise ValueError(f"staff fields need entity staff: {', '.join(dict.fromkeys(wrong))}")
+            if self.lookup and self.lookup.staff:
+                raise ValueError("lookup.staff needs entity staff")
         return self
 
     @property

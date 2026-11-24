@@ -36,7 +36,7 @@ from app.engine.responder import HELP_OPTIONS, build_response
 from app.engine.semantic_cache import Compatibility, QuestionView, SemanticPlanCache
 from app.engine.steps import StepTrace, reason_code
 from app.engine.stores import TTLCache
-from app.models.plan import QueryPlan, canonical_field
+from app.models.plan import STAFF_RELATION_FIELDS, QueryPlan, canonical_field
 from app.nlu import placeholders as ph
 from app.nlu.direct_query import DirectQueryBuilder
 from app.nlu.grammar import skeleton as grammar_skeleton
@@ -898,6 +898,9 @@ class QueryService:
             # and served for "daughter" / "at least 5"). Showing family members is fine: the resident is a slot and
             # the attribute is fixed, like "what is X's room?"
             and not plan_uses_family(plan.filters, sort_field=plan.sort.field if plan.sort else None)
+            # staff questions are model-only for now: a role word or a staff name is not a template slot
+            and plan.entity != "staff"
+            and not any(getattr(plan.filters, n) is not None for n in STAFF_RELATION_FIELDS)
             and not outcome.problem
             and not grounding_problems
             and g is not None

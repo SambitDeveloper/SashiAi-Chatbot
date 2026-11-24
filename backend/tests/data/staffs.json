@@ -1,0 +1,19 @@
+[
+  {"_id": "st-001", "cName": "c-jenkins", "name": "Nurse Sarah Jenkins, RN", "designation": "Nurse", "active": true, "facilityId": "Garden Terrace", "type": "FACILITY_STAFF", "email": "sarah.jenkins@example.test", "phone": "555-0101"},
+  {"_id": "st-002", "cName": "c-oconnor", "name": "Head Nurse David O'Connor, RN", "designation": "Director of Nursing", "active": true, "facilityId": "North Wing", "type": "FACILITY_STAFF"},
+  {"_id": "st-003", "cName": "c-gallagher", "name": "Nurse Liam Gallagher, LPN", "designation": "Nursing", "active": true, "facilityId": "South Wing"},
+  {"_id": "st-004", "cName": "c-rostova", "name": "Care Aide Elena Rostova", "designation": "Caregiver AM", "active": true, "facilityId": "East Wing"},
+  {"_id": "st-005", "cName": "c-chen", "name": "Care Aide Marcus Chen", "designation": "Caregiver PM", "active": false, "facilityId": "Garden Terrace"},
+  {"_id": "st-006", "cName": "c-patel-cc", "name": "Care Coordinator Maya Patel", "designation": "Care Coordinator", "active": true, "facilityId": "North Wing"},
+  {"_id": "st-007", "cName": "c-patel-wc", "name": "Wellness Coordinator Maya Patel", "designation": "Activities Coordinator", "active": true, "facilityId": "North Wing"},
+  {"_id": "st-008", "cName": "c-raman", "name": "Priya Raman", "designation": "Physician", "active": true, "facilityId": "Garden Terrace", "type": "PROVIDER", "email": "priya.raman@example.test", "phone": "555-0108",
+   "fixtureResidents": ["RES-1001", "RES-1002", "RES-1004"], "fixturePrimaryPhysicianOf": ["RES-1002"]},
+  {"_id": "st-009", "cName": "c-hart", "name": "Owen Hart", "designation": "Doctor", "active": false, "facilityId": "Garden Terrace", "type": "PROVIDER",
+   "fixtureResidents": ["RES-1003"]},
+  {"_id": "st-010", "cName": "c-okafor", "name": "Jane Okafor", "designation": "Case Manager", "active": true, "facilityId": "Garden Terrace",
+   "fixtureResidents": ["RES-1001", "RES-1005"]},
+  {"_id": "st-011", "cName": "c-tablet", "name": "Lobby Tablet", "designation": "TABLET", "active": true, "facilityId": "Garden Terrace",
+   "fixtureResidents": ["RES-1001"]},
+  {"_id": "st-012", "cName": "c-reyes", "name": "Tom Reyes", "designation": "Physical Therapist", "active": true, "facilityId": "East Wing"},
+  {"_id": "st-013", "cName": "c-boyd", "name": "Ann Boyd", "designation": "Manager", "active": true, "facilityId": "East Wing"}
+]

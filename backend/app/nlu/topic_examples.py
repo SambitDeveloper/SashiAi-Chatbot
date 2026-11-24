@@ -29,6 +29,15 @@ RESIDENT = [
     "How many active residents does the caregiver have?",
     "Who is the primary caretaker of the resident?",
     "Residents per caregiver",
+    # staff (care team, roles, assignments)
+    "How many physicians are active?",
+    "List the case managers",
+    "Who is on the resident's care team?",
+    "Who is the resident's physician?",
+    "Which residents do not have a case manager?",
+    "Staff grouped by designation",
+    "Which staff members have the most residents?",
+    "What is the staff member's phone number?",
     # demographics
     "How many male residents do we have?",
     "How many residents are over 80?",
@@ -59,7 +68,6 @@ RESIDENT = [
     "What can you do?",
     # in-domain but unsupported data: let the language model explain politely
     "What medication is the resident on?",
-    "Who is the resident's doctor?",
     "Does the resident have any allergies?",
     "When is the resident's birthday?",
 ]

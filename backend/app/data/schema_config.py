@@ -44,6 +44,8 @@ def output_fields() -> dict[str, str]:
     mapped = set((cfg.get("fields") or {}).keys())
     if (cfg.get("relations") or {}).get("family"):  # fields the family relation derives (app/data/relations.py)
         mapped |= {"familyCount", "familyMembers", "familyContacts"}
+    if (cfg.get("relations") or {}).get("staff"):  # fields the staff relation derives (app/data/staff.py)
+        mapped |= {"careTeam", "primaryPhysician"}
     return {a: f for a, f in (cfg.get("output_fields") or {}).items() if f in mapped}
 
 

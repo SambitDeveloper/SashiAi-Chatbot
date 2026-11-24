@@ -8,6 +8,7 @@ from app.data import scope
 from app.data.relations import FAMILY_VIEW_FIELDS, family_relation
 from app.data.repository import (
     FIELD_MAP,
+    MISSING_GROUP,
     GroupAggregateRow,
     GroupRow,
     Resident,
@@ -19,20 +20,29 @@ from app.data.repository import (
     typed_order,
 )
 from app.data.schema_config import list_fields
-from app.models.plan import Filters, GroupField, Sort
+from app.data.staff import STAFF_RESIDENT_FIELDS, resident_part, staff_config, staff_matches, staff_part
+from app.models.plan import STAFF_FIELD_MAP, Filters, GroupField, Sort
 
 # test data only: production always reads the Care App MongoDB (see app/main.py build_repository)
 SEED_FILE = Path(__file__).resolve().parents[2] / "tests" / "data" / "residents.json"
 FAMILY_FILE = SEED_FILE.with_name("familymembers.json")  # raw familymembers documents, keyed by residentId
+STAFF_FILE = SEED_FILE.with_name("staffs.json")  # raw staffs documents
+
+
+def _names(value) -> list[str]:
+    return [v for v in (value if isinstance(value, list) else [value]) if isinstance(v, str) and v]
 
 
 class MemoryResidentRepository:
     name = "memory"
 
-    def __init__(self, records: list[Resident] | None = None, family: list[dict] | None = None):
+    def __init__(self, records: list[Resident] | None = None, family: list[dict] | None = None, staff: list[dict] | None = None):
         self._records = records if records is not None else json.loads(SEED_FILE.read_text(encoding="utf-8"))
         if family is None and records is None and FAMILY_FILE.exists():
             family = json.loads(FAMILY_FILE.read_text(encoding="utf-8"))
+        if staff is None and records is None and STAFF_FILE.exists():
+            staff = json.loads(STAFF_FILE.read_text(encoding="utf-8"))
+        self._staff_raw: list[dict] = list(staff or [])
         # the family relation's derived fields, by the same rules as the MongoDB view (app/data/relations.py); a
         # family record whose resident does not exist (an orphan) is never attached to anyone
         rel = family_relation()
@@ -47,6 +57,89 @@ class MemoryResidentRepository:
             self._records = [{**r, **rel.derive(by_resident.get(r["residentId"], []))} for r in self._records]
         else:
             self._family_rows = []
+        self._attach_staff()
+
+    # ------------------------------------------------------------------ staff (app/data/staff.py rules)
+    def _assigned(self, staff_raw: dict, resident: Resident) -> bool:
+        """A resident's assigned staff: their assignedStaff keys (like MongoDB), or in the fixture the staff member
+        whose name is the resident's caregiver, or who lists the resident in fixtureResidents."""
+        cfg = staff_config()
+        key = staff_raw.get(cfg.key)
+        if isinstance(resident.get(cfg.resident_link), list):
+            return key in resident[cfg.resident_link]
+        return staff_raw.get("name") in _names(resident.get("primaryCaregiver")) or (
+            resident.get("residentId") in (staff_raw.get("fixtureResidents") or [])
+        )
+
+    def _attach_staff(self) -> None:
+        cfg = staff_config()
+        if cfg is None:
+            return
+        out = []
+        for r in self._records:
+            team = [s for s in self._staff_raw if self._assigned(s, r)]
+            link = r.get(cfg.physician_link)
+            physician = next((s for s in self._staff_raw if (link and s.get(cfg.key) == link)
+                              or r.get("residentId") in (s.get("fixturePrimaryPhysicianOf") or [])), None)  # fmt: skip
+            out.append({**r, **cfg.derive(team, physician)})
+        self._records = out
+
+    def _staff_rows(self, contacts: bool = False) -> list[dict]:
+        cfg = staff_config()
+        return [cfg.entity_record(s, {}, contacts) for s in self._staff_raw if not cfg.is_hidden(s.get("designation"))]
+
+    def _staff_filtered(self, filters: Filters, residents: bool = False, contacts: bool = False, rows=None) -> list[dict]:
+        """Mirrors ViewRepository._staff_pipeline: own conditions, assigned residents matching the resident conditions
+        (at least one when there are any), then the resident-count conditions."""
+        about = resident_part(filters)
+        conditional = not about.is_empty()
+        own = staff_part(filters)
+        by_id = {s.get(staff_config().key): s for s in self._staff_raw}
+        out = []
+        for row in rows if rows is not None else self._staff_rows(contacts):
+            if not staff_matches(row, own.model_copy(update={"staff_resident_count": None})):
+                continue
+            raw = by_id.get(row["staffId"], {})
+            assigned = [r for r in self._scoped() if self._assigned(raw, r) and (not conditional or matches(r, about))]
+            row = {**row, "residentCount": len(assigned)}
+            if conditional and not assigned:
+                continue
+            if not staff_matches(row, Filters(staff_resident_count=filters.staff_resident_count)):
+                continue
+            if residents:
+                row["residents"] = [f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() for r in assigned]
+            out.append(row)
+        return out
+
+    async def staff_total(self) -> int:
+        return len(self._staff_rows())
+
+    async def staff_count(self, filters: Filters) -> int:
+        return len(self._staff_filtered(filters))
+
+    async def staff_find(self, filters: Filters, sort=None, limit: int | None = None, fields: list[str] | None = None) -> list[dict]:
+        rows = sorted(self._staff_filtered(filters), key=lambda r: (r["name"], r["staffId"]))
+        if sort:
+            field = STAFF_FIELD_MAP[sort.field]
+            rows.sort(key=lambda r: typed_order(r.get(field)), reverse=sort.direction == "desc")
+        rows = rows[:limit] if limit else rows
+        keep = ["staffId", "name", *(fields or [])]
+        return [{k: r[k] for k in keep if k in r} for r in rows]
+
+    async def staff_group_count(self, filters: Filters, fields: list[str]) -> list[GroupRow]:
+        def key(r: dict) -> tuple[str, ...]:
+            return tuple(str(r.get(STAFF_FIELD_MAP[f])) if r.get(STAFF_FIELD_MAP[f]) not in (None, "") else MISSING_GROUP
+                         for f in fields)  # fmt: skip
+
+        counter = Counter(key(r) for r in self._staff_filtered(filters))
+        return [GroupRow(key=k, count=c) for k, c in counter.most_common()]
+
+    async def staff_by_names(self, names: list[str], contacts: bool = False) -> list[dict]:
+        rows = [r for r in self._staff_rows(contacts) if r["name"] in names]
+        return sorted(self._staff_filtered(Filters(), residents=True, rows=rows), key=lambda r: (r["name"], r["staffId"]))[:20]
+
+    async def staff_vocabulary(self) -> list[dict]:
+        return [{k: r[k] for k in ("name", "designation", "role", "status")} for r in self._staff_rows() if r["name"]]
 
     async def init(self) -> None:
         return None
@@ -83,7 +176,7 @@ class MemoryResidentRepository:
         if fields is None:
             return rows
         # a projected list field is shown as one text, like ResidentView.display_stage ("A (Son), B (Daughter)")
-        shown_lists = [f for f in fields if f in FAMILY_VIEW_FIELDS and f in list_fields()]
+        shown_lists = [f for f in fields if f in (*FAMILY_VIEW_FIELDS, *STAFF_RESIDENT_FIELDS) and f in list_fields()]
         out = [project(r, fields) for r in rows]
         for r in out:
             for f in shown_lists:
@@ -152,4 +245,5 @@ class MemoryResidentRepository:
             care_types=sorted({r["careType"] for r in self._records if r.get("careType")}),
             family_relations=sorted({v for r in self._records for v in r.get("familyRelations") or []}),
             family_members=[dict(row) for row in self._family_rows],
+            staff=await self.staff_vocabulary(),
         )
