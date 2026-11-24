@@ -15,7 +15,8 @@ Family semantics, per resident:
   • familyCount    = number of members (0 = none recorded).
   • familyRelations / familyTypes = the distinct non-empty relations / types of the members (a resident "has a
                      daughter" when ANY member is a daughter).
-  • familyFlags    = flag names whose source field is exactly `true` on ANY member (portal_access, ...).
+  • familyFlags    = flag names whose source field is exactly `true` on ANY member (portal_access, ...), and
+                     contact flags whose contact field is non-blank on ANY member (has_email, has_phone).
   • familyMembers  = "Name (Relation as recorded)" per member, for display in lists.
   • familyContacts = name, relation, type, phone, email per member: single-resident answers only.
 Limitation: conditions on different fields are tested independently (has a daughter AND some member has portal
@@ -54,7 +55,9 @@ class FamilyRelation:
         self.exclude: list[str] = [str(x).strip().lower() for x in config.get("exclude_relations") or []]
         self.aliases: dict[str, str] = {str(k).strip().lower(): str(v) for k, v in (config.get("relation_aliases") or {}).items()}
         self.terms: dict[str, list[str]] = {str(k).lower(): [str(x) for x in v] for k, v in (config.get("relation_terms") or {}).items()}
-        self.flags: dict[str, str] = dict(config.get("flags") or {})
+        self.flags: dict[str, str] = dict(config.get("flags") or {})  # flag → boolean source field
+        self.contact_flags: dict[str, str] = dict(config.get("contact_flags") or {})  # flag → contact field
+        self.flag_names: tuple[str, ...] = (*self.flags, *self.contact_flags)
         self._cues = self._pattern(config.get("cue_words"))
         self._weak_cues = self._pattern(config.get("weak_cue_words"))
 
@@ -104,7 +107,7 @@ class FamilyRelation:
     @cached_property
     def lookup_stage(self) -> dict:
         project = {"_id": 0, "memberId": 1, "rel": 1, "typ": 1, "name": 1, "relationRaw": 1, "phone": 1, "email": 1,
-                   **{f"f_{flag}": 1 for flag in self.flags}}  # fmt: skip
+                   **{f"f_{flag}": 1 for flag in self.flag_names}}  # fmt: skip
         return {
             "$lookup": {
                 "from": self.collection,
@@ -120,6 +123,8 @@ class FamilyRelation:
                         "phone": {"$trim": {"input": _text("$phone")}},
                         "email": {"$trim": {"input": _text("$email")}},
                         **{f"f_{flag}": {"$eq": [f"${src}", True]} for flag, src in self.flags.items()},
+                        **{f"f_{flag}": {"$gt": [{"$strLenCP": {"$trim": {"input": _text(f"${src}")}}}, 0]}
+                           for flag, src in self.contact_flags.items()},
                     }},
                     *([{"$match": {"rel": {"$nin": self.exclude}}}] if self.exclude else []),
                     {"$sort": {"_id": 1}},
@@ -145,7 +150,7 @@ class FamilyRelation:
             "familyRelations": {"$setDifference": [{"$setUnion": ["$_family.rel", []]}, [""]]},
             "familyTypes": {"$setDifference": [{"$setUnion": ["$_family.typ", []]}, [""]]},
             "familyFlags": {"$concatArrays": [
-                {"$cond": [{"$in": [True, f"$_family.f_{flag}"]}, [flag], []]} for flag in self.flags
+                {"$cond": [{"$in": [True, f"$_family.f_{flag}"]}, [flag], []]} for flag in self.flag_names
             ]},
             "familyMembers": {"$map": {"input": "$_family", "as": "m", "in": member_label}},
             "familyContacts": {"$map": {"input": "$_family", "as": "m", "in": {
@@ -167,13 +172,14 @@ class FamilyRelation:
                 "relationRaw": _py_text(m.get("relation")).strip(), "phone": _py_text(m.get("phone")).strip(),
                 "email": _py_text(m.get("email")).strip(),
                 **{f"f_{flag}": m.get(src) is True for flag, src in self.flags.items()},
+                **{f"f_{flag}": bool(_py_text(m.get(src)).strip()) for flag, src in self.contact_flags.items()},
             })  # fmt: skip
         members = members[: self.cap]
         return {
             "familyCount": len(members),
             "familyRelations": sorted({m["rel"] for m in members} - {""}),
             "familyTypes": sorted({m["typ"] for m in members} - {""}),
-            "familyFlags": [flag for flag in self.flags if any(m[f"f_{flag}"] for m in members)],
+            "familyFlags": [flag for flag in self.flag_names if any(m[f"f_{flag}"] for m in members)],
             "familyMembers": [m["name"] + (f" ({m['relationRaw']})" if m["relationRaw"] else "") for m in members],
             "familyContacts": [
                 {"id": m["memberId"], "name": m["name"], "relation": m["relationRaw"], "rel": m["rel"], "type": m["typ"],
@@ -209,7 +215,7 @@ def family_relation() -> FamilyRelation | None:
 
 def flag_names() -> tuple[str, ...]:
     rel = family_relation()
-    return tuple(rel.flags) if rel else ()
+    return rel.flag_names if rel else ()
 
 
 def plan_uses_family(filters=None, fields: list[str] | None = None, sort_field: str | None = None) -> bool:

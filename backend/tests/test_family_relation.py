@@ -125,6 +125,34 @@ async def test_family_filters(filters, ids):
     assert {r["residentId"] for r in rows} == ids
 
 
+@pytest.mark.parametrize(
+    ("flag", "ids"),
+    [
+        ("has_email", {"RES-1001"}),  # only Margaret (Eleanor's daughter) has an email recorded
+        ("has_phone", {"RES-1001", "RES-1002", "RES-1003", "RES-1004"}),  # Eleanor's own "Self" contact does not count
+    ],
+)
+async def test_contact_flags_filter_on_a_recorded_contact(flag, ids):
+    """"residents with a family member whose email is registered": the yes/no only, from a non-blank contact."""
+    rows = await MemoryResidentRepository().find(Filters.model_validate({"family_flags": {"include": [flag]}}))
+    assert {r["residentId"] for r in rows} == ids
+
+
+def test_contact_flags_ignore_blank_contacts():
+    d = REL.derive([{"_id": "a", "relation": "Son", "email": "  ", "phone": None}])
+    assert d["familyFlags"] == []
+
+
+def test_contact_flags_in_mongo_stages_and_prompt():
+    stage = json.dumps(REL.lookup_stage)
+    assert '"f_has_email": {"$gt": [{"$strLenCP"' in stage
+    assert to_mongo_filter(Filters.model_validate({"family_flags": {"include": ["has_email"]}})) == {
+        "familyFlags": {"$in": ["has_email"]}
+    }
+    ctx = SchemaContext(["active"], ["memory_care"], [], family_relations=["daughter"])
+    assert 'family_flags eq "has_email"' in build_system_prompt(ctx, operator_table=True)  # Bedrock prompt
+
+
 async def test_no_family_members_and_orphans():
     repo = MemoryResidentRepository()
     assert await repo.count(Filters.model_validate({"family_count": {"max": 0}})) == 84

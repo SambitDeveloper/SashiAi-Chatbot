@@ -31,7 +31,7 @@ SortField = Literal[
 ]  # fmt: skip
 # Family relation (familymembers; app/data/relations.py): the kinds of contact and the access flags of ANY member.
 FamilyType = Literal["family", "emergency"]
-FamilyFlag = Literal["portal_access", "app_access", "health_access", "guarantor"]
+FamilyFlag = Literal["portal_access", "app_access", "health_access", "guarantor", "has_email", "has_phone"]
 Attribute = Literal[
     "primary_caregiver",
     "room_number",

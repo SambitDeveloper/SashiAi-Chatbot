@@ -63,7 +63,7 @@ ATTRIBUTE_LABELS = {
 }
 STAFF_TYPE_LABELS = {"provider": "Provider", "facility_staff": "Facility Staff", "external_user": "External User"}
 FAMILY_FLAG_LABELS = {"portal_access": "portal access", "app_access": "app access", "health_access": "health access",
-                      "guarantor": "guarantor"}  # fmt: skip
+                      "guarantor": "guarantor", "has_email": "an email on file", "has_phone": "a phone number on file"}  # fmt: skip
 _SET_FIELDS = [
     ("status", "Status"),
     ("care_type", "Care Type"),

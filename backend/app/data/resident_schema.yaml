@@ -185,6 +185,11 @@ relations:
       app_access: isAuthorizedAppAccess
       health_access: healthAccess
       guarantor: pcc_is_guarantor
+    # contact flags: true when ANY family member has that contact recorded (non-blank). Only the yes/no is used for
+    # filtering; the contact itself is never part of a list answer or of model input.
+    contact_flags:
+      has_email: email
+      has_phone: phone
 
   # Staff (the `staffs` collection) linked to residents: residents.assignedStaff[] and residents.primaryPhysicianCName
   # hold staffs.cName (unique). Used two ways, from this ONE definition (app/data/staff.py):

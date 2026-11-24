@@ -54,8 +54,10 @@ def _family_rules(ctx: SchemaContext) -> str:
         "\n- Family (the resident's family members; a condition holds when ANY of them matches):"
         f"\n  family_relation: {relations}. eq/in = has such a family member; ne/not_in = has none;"
         " a word like spouse, children or parents may be used as written."
-        "\n  family_type: family | emergency · family_flags: portal_access | app_access | health_access | guarantor."
-        ' "a family member with portal access" is family_flags eq "portal_access" (never missing/present with a value).'
+        "\n  family_type: family | emergency · family_flags: portal_access | app_access | health_access | guarantor |"
+        " has_email | has_phone."
+        ' "a family member with portal access" is family_flags eq "portal_access"; "a family member whose email is'
+        ' registered / on file" is family_flags eq "has_email" (never missing/present with a value).'
         "\n  family_count: number of family members (0 = none recorded); sort by family_count for most / fewest."
         "\n  To SHOW family: projection family_members (names + relations; for ONE named resident also phone and"
         " email) or family_count. A family question about one named resident is a lookup with attribute"
