@@ -168,6 +168,46 @@ async def test_same_name_same_kind_is_told_apart_by_designation(settings):
     assert fake.calls == []
 
 
+def test_phone_country_code_is_a_staff_phone_question():
+    asked = PARSER.parse("What is Jone's phone country code?")
+    assert (asked.name, asked.attributes, asked.kinds) == ("Jone", [("staff_phone", "staff")], {"staff"})
+
+
+@pytest.mark.parametrize(
+    ("raw", "shown"),
+    [
+        ({"phone": "5550100", "countryCode": "+1"}, "+1 5550100"),
+        ({"phone": " +44 20 7946 0000 ", "countryCode": "+1"}, "+44 20 7946 0000"),  # already international
+        ({"phone": "5550100", "countryCode": ""}, "5550100"),
+        ({"phone": "", "countryCode": "+1"}, ""),  # a code alone is not a phone
+    ],
+)
+def test_staff_phone_is_shown_with_its_country_code(raw, shown):
+    from app.data.staff import _py_phone
+
+    assert _py_phone(raw) == shown
+
+
+async def test_phone_country_code_is_answered_without_the_model(settings):
+    """Staging trace q_b7f8073e31a2: "What is Jone's phone country code?" went to the model (3,417 tokens) and failed."""
+    from app.engine.service import QueryService
+    from tests.test_staff import STAFF, _repo_with
+
+    twins = [{"_id": "j1", "cName": "c-j1", "name": "Jone", "designation": "Transport Driver", "active": True,
+              "phone": "5550100", "countryCode": "+1"},
+             {"_id": "j2", "cName": "c-j2", "name": "Jone", "designation": "Social Worker", "active": True,
+              "phone": "5550199", "countryCode": "+91"}]  # fmt: skip
+    fake = FakeTranslator({})
+    service = QueryService(_repo_with([*STAFF, *twins]), fake, settings)
+    await service.refresh_vocabulary()
+    both = await service.handle("What is Jone's phone country code?")
+    assert both["response"].get("needsClarification") and "Transport Driver" in text(both)
+    assert "555" not in text(both)  # never several people's contacts
+    one = await service.handle("What is staff member Jone (Transport Driver)'s phone country code?")
+    assert "+1 5550100" in text(one) and "5550199" not in text(one)
+    assert fake.calls == [] and one["tokensConsumed"] == 0
+
+
 async def test_only_residents_keep_the_usual_resident_path(make_service):
     plan = {"action": "lookup", "lookup": {"residents": ["resident_1"]}}
     r, _ = await ask(make_service, "Who is Eleanor Vance?", {"Who is resident_1?": plan})

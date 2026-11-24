@@ -49,6 +49,24 @@ def _plural(word: str) -> str:
     return word + "s"
 
 
+def _phone_expr() -> dict:
+    """The phone as shown: "+1 5551234567" — the recorded countryCode in front, unless the number already starts with
+    "+" or no code is recorded. No number → "" (a code alone is not a phone)."""
+    return {"$let": {
+        "vars": {"p": {"$trim": {"input": _text("$phone")}}, "c": {"$trim": {"input": _text("$countryCode")}}},
+        "in": {"$cond": [
+            {"$or": [{"$eq": ["$$p", ""]}, {"$eq": ["$$c", ""]}, {"$eq": [{"$substrCP": ["$$p", 0, 1]}, "+"]}]},
+            "$$p", {"$concat": ["$$c", " ", "$$p"]},
+        ]},
+    }}  # fmt: skip
+
+
+def _py_phone(raw: dict) -> str:
+    """In memory, the same as _phone_expr."""
+    phone, code = _py_text(raw.get("phone")).strip(), _py_text(raw.get("countryCode")).strip()
+    return phone if not phone or not code or phone.startswith("+") else f"{code} {phone}"
+
+
 class StaffConfig:
     def __init__(self, config: dict):
         self.collection: str = config.get("collection", "staffs")
@@ -211,7 +229,7 @@ class StaffConfig:
             "facility": {"$convert": {"input": {"$ifNull": [{"$first": "$_facility.facilityName"}, "$facilityId"]},
                                       "to": "string", "onError": "", "onNull": ""}},
             "type": self._type_expr(),
-            **({"email": {"$trim": {"input": _text("$email")}}, "phone": {"$trim": {"input": _text("$phone")}}} if contacts else {}),
+            **({"email": {"$trim": {"input": _text("$email")}}, "phone": _phone_expr()} if contacts else {}),
         }  # fmt: skip
         return [
             self.visible_match,
@@ -237,7 +255,7 @@ class StaffConfig:
             **self.member(raw),
             "facility": facility_names.get(fid) or (fid if isinstance(fid, str) else ""),
             "type": self.types.get(raw.get("type"), "") if isinstance(raw.get("type"), str) else "",
-            **({"email": _py_text(raw.get("email")), "phone": _py_text(raw.get("phone"))} if contacts else {}),
+            **({"email": _py_text(raw.get("email")).strip(), "phone": _py_phone(raw)} if contacts else {}),
         }
 
     @staticmethod

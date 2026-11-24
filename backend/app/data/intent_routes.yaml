@@ -131,7 +131,9 @@ direct:
       staff_role: [role, roles]
       staff_residents: [assigned residents, residents assigned, residents, patients, caseload, who does look after]
       staff_resident_count: [how many residents, number of residents, resident count, number of assigned residents]
-      staff_phone: [phone, phones, phone number, phone numbers, mobile, contact number]
+      # the phone is shown with its country code ("+1 5551234567"), so the code's words ask for the phone too
+      staff_phone: [phone, phones, phone number, phone numbers, mobile, contact number, country code,
+                    phone country code, dial code, dialing code, calling code, phone code]
       staff_email: [email, emails, email address, email addresses, mail]
     # attributes both residents and staff have: the person decides which one is meant
     shared_attributes:

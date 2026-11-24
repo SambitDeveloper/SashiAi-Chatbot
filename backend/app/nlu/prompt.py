@@ -107,7 +107,7 @@ def _staff_rules() -> str:
         f"\n  Staff group_by: {', '.join(STAFF_GROUP_FIELDS)} · sort: {', '.join(STAFF_SORT_FIELDS)} · projection:"
         f" {', '.join(shown)}."
         '\n  One named staff member: action lookup, entity staff, "lookup": {"staff": ["name as written"], "attributes":'
-        f" [...], ...}}; {', '.join(STAFF_SINGLE_RECORD)} only in such a lookup."
+        f" [...], ...}}; {', '.join(STAFF_SINGLE_RECORD)} only in such a lookup (staff_phone includes the country code)."
         ' "residents assigned to <staff name>" is a RESIDENT list with primary_caregiver eq the name. "how many residents'
         ' does each physician have" = entity staff, list, staff_role eq physician, projection staff_resident_count, sort'
         " staff_resident_count desc."

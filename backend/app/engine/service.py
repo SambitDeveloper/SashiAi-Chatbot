@@ -38,7 +38,7 @@ from app.engine.responder import HELP_OPTIONS, build_response
 from app.engine.semantic_cache import Compatibility, QuestionView, SemanticPlanCache
 from app.engine.steps import StepTrace, reason_code
 from app.engine.stores import TTLCache
-from app.models.plan import STAFF_RELATION_FIELDS, QueryPlan, canonical_field
+from app.models.plan import STAFF_RELATION_FIELDS, STAFF_SINGLE_RECORD, QueryPlan, canonical_field
 from app.nlu import placeholders as ph
 from app.nlu.direct_query import DirectQueryBuilder
 from app.nlu.grammar import skeleton as grammar_skeleton
@@ -1301,7 +1301,10 @@ class QueryService:
             return None  # ONE resident: the resident fast path answers it (and remembers the resident for follow-ups)
         trace = t.trace
         trace.skip_until("fast_path", "question about one named person")
-        single = len(kinds) == 1 and (kinds[0] == "staff" and len({s["name"] for s in found["staff"]}) <= 5
+        # one person's details only (phone, email, assigned residents): several matching staff → ask which one, never
+        # an answer listing blanks ("Jone: | Jone:")
+        one_record = any(a in STAFF_SINGLE_RECORD for a, _ in asked.attributes)
+        single = len(kinds) == 1 and (kinds[0] == "staff" and not one_record and len({s["name"] for s in found["staff"]}) <= 5
                                       or len(found[kinds[0]]) == 1)  # fmt: skip
         if single:
             kind = kinds[0]
@@ -1312,6 +1315,12 @@ class QueryService:
                 wanted = {s["designation"] for s in found["staff"]}
                 data.staff_rows = [r for r in data.staff_rows if r.get("designation") in wanted] or data.staff_rows
                 data.matched = len(data.staff_rows)
+                if data.staff_contacts_withheld and len(data.staff_rows) == 1:
+                    # contacts were withheld because the NAME matches several people; the detail picked exactly one
+                    full = [r for r in await self.repo.staff_by_names([data.staff_rows[0]["name"]], contacts=True)
+                            if r.get("designation") in wanted]  # fmt: skip
+                    if len(full) == 1:
+                        data.staff_rows, data.staff_contacts_withheld = full, False
             response, matched, total = build_response(plan, data), data.matched, data.total
             subject = "staff" if kind == "staff" else "resident"
         else:
