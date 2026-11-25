@@ -154,8 +154,9 @@ class MemoryResidentRepository:
         return None
 
     def _scoped(self) -> list[Resident]:
-        """The residents of the request's facility scope (app/data/scope.py), like the MongoDB view's scope stage."""
-        return [r for r in self._records if scope.in_scope(r.get("facilityId"))]
+        """The residents of the request's scope (facility and staff assignment, app/data/scope.py), like the MongoDB
+        view's scope stage."""
+        return [r for r in self._records if scope.record_in_scope(r)]
 
     def _filtered(self, filters: Filters) -> list[Resident]:
         return [r for r in self._scoped() if matches(r, filters)]
@@ -242,14 +243,16 @@ class MemoryResidentRepository:
         ]
 
     async def vocabulary(self) -> Vocabulary:
+        records = self._scoped()  # within the request's scope, like the MongoDB view (all when unrestricted)
+        ids = {r["residentId"] for r in records}
         return Vocabulary(
-            residents=[{k: r[k] for k in ("residentId", "firstName", "lastName")} for r in self._records],
-            wings=sorted({r["wing"] for r in self._records}),
-            caregivers=sorted({r["primaryCaregiver"] for r in self._records}),
-            rooms=sorted({r["roomNumber"] for r in self._records}),
-            statuses=sorted({r["status"] for r in self._records if r.get("status")}),
-            care_types=sorted({r["careType"] for r in self._records if r.get("careType")}),
-            family_relations=sorted({v for r in self._records for v in r.get("familyRelations") or []}),
-            family_members=[dict(row) for row in self._family_rows],
+            residents=[{k: r[k] for k in ("residentId", "firstName", "lastName")} for r in records],
+            wings=sorted({r["wing"] for r in records}),
+            caregivers=sorted({r["primaryCaregiver"] for r in records}),
+            rooms=sorted({r["roomNumber"] for r in records}),
+            statuses=sorted({r["status"] for r in records if r.get("status")}),
+            care_types=sorted({r["careType"] for r in records if r.get("careType")}),
+            family_relations=sorted({v for r in records for v in r.get("familyRelations") or []}),
+            family_members=[dict(row) for row in self._family_rows if row.get("residentId") in ids],
             staff=await self.staff_vocabulary(),
         )

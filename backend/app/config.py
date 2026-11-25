@@ -110,6 +110,12 @@ class Settings(BaseSettings):
     family_names_permitted: bool = True
     family_contacts_permitted: bool = True
     caller_facility_ids: list[str] | None = None
+    # Authorization guardrails (app/auth, policy: app/auth/access_policy.yaml). AUTH_MODE:
+    #   off  = no caller (today's behaviour, unrestricted)
+    #   file = every request is the signed-in user in the file below (the app's user data: cName, facilityId, scope,
+    #          accessPermissions), until the chatbot is integrated into the app. Never in production.
+    auth_mode: Literal["off", "file"] = "off"
+    auth_user_context_file: str = "app/auth/dummy_user_context.json"
     # Gemma 4 reasons by default; Chat Completions does not return the reasoning, only its latency. None = model default.
     bedrock_reasoning_effort: Literal["low", "medium", "high"] | None = None
 
@@ -188,6 +194,13 @@ class Settings(BaseSettings):
         for name in ("plan_cache_database", "plan_cache_collection", "plan_cache_vector_index"):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name.upper()} must not be empty")
+        return self
+
+    @model_validator(mode="after")
+    def _auth_config(self) -> "Settings":
+        """The dummy user never reaches production (every request would be that user)."""
+        if self.auth_mode == "file" and self.environment == "production":
+            raise ValueError("AUTH_MODE=file is not allowed in production (every request would be the file's user)")
         return self
 
     @model_validator(mode="after")

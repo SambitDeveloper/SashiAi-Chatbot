@@ -105,7 +105,7 @@ export interface ExtractedParameters {
 export interface PolicyCheckResult {
   passed: boolean;
   violationReason?: string;
-  policyCategory?: 'RESIDENT_INTENT' | 'STAFF_INTENT' | 'PROMPT_INJECTION' | 'OUT_OF_SCOPE' | 'SYSTEM_PROBING';
+  policyCategory?: 'RESIDENT_INTENT' | 'STAFF_INTENT' | 'PROMPT_INJECTION' | 'OUT_OF_SCOPE' | 'SYSTEM_PROBING' | 'ACCESS_DENIED';
   suggestedAction?: string;
 }
 

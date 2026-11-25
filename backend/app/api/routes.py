@@ -7,6 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
+from app.auth.guard import AccessDenied
+from app.auth.identity import AuthError, IdentityResolver
+from app.auth.principal import Principal
 from app.config import Settings
 from app.data.repository import list_view
 from app.engine.service import QueryService
@@ -37,6 +40,17 @@ def require_token(request: Request, settings: Settings = Depends(get_settings_de
     given = header[7:] if header.startswith("Bearer ") else ""
     if not hmac.compare_digest(given.encode(), settings.api_token.encode()):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def get_principal(request: Request, settings: Settings = Depends(get_settings_dep)) -> Principal:
+    """Who is asking (app/auth/identity.py; AUTH_MODE). Unknown or inactive callers stop here, before any query."""
+    resolver = getattr(request.app.state, "identity", None)
+    if resolver is None:
+        resolver = request.app.state.identity = IdentityResolver(settings)
+    try:
+        return await resolver.resolve(request.headers)
+    except AuthError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from None
 
 
 public = APIRouter(prefix="/api")
@@ -93,17 +107,24 @@ async def stats(service: QueryService = Depends(get_service)) -> dict:
 
 @protected.post("/query")
 @limiter.limit(lambda: _rate_limit())
-async def query(request: Request, body: QueryRequest, service: QueryService = Depends(get_service)) -> dict:
-    return await service.handle(body.query, body.session_id)
+async def query(
+    request: Request, body: QueryRequest, service: QueryService = Depends(get_service),
+    principal: Principal = Depends(get_principal),
+) -> dict:
+    return await service.handle(body.query, body.session_id, principal=principal)
 
 
 @protected.get("/residents")
 async def residents(
-    service: QueryService = Depends(get_service), settings: Settings = Depends(get_settings_dep)
+    service: QueryService = Depends(get_service), settings: Settings = Depends(get_settings_dep),
+    principal: Principal = Depends(get_principal),
 ) -> dict:
     if not settings.enable_data_browser:
         raise HTTPException(status_code=403, detail="The data browser is disabled on this deployment.")
-    rows = await service.repo.find(Filters(), sort=Sort(field="last_name", direction="asc"), limit=500)
+    try:  # the same guardrails as a question: the Residents module, then only the caller's residents
+        rows = await service.browse(Filters(), Sort(field="last_name", direction="asc"), 500, principal)
+    except AccessDenied as exc:
+        raise HTTPException(status_code=403, detail=exc.message) from None
     return {"residents": [list_view(r) for r in rows]}
 
 

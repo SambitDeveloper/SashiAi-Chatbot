@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from itertools import product
 
+from app.auth.guard import check_plan as authorize_plan
 from app.data.relations import FAMILY_SELECTORS
 from app.data.repository import (
     FIELD_MAP,
@@ -57,6 +58,9 @@ def projected_view_fields(plan: QueryPlan) -> list[str] | None:
 async def execute(plan: QueryPlan, repo: ResidentRepository) -> ExecutionData:
     if not plan.is_data_query:
         return ExecutionData(total=0)
+    # C (app/auth/guard.py): every plan — fast path, template, follow-up, model — needs only what the caller may read;
+    # raises AccessDenied. The rows themselves are limited by the request's row scope (app/data/scope.py).
+    authorize_plan(plan)
     if plan.entity == "staff":
         return await _execute_staff(plan, repo)
     total = await repo.total()

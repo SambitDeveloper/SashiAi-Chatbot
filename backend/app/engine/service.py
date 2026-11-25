@@ -16,16 +16,21 @@ import logging
 import re
 import secrets
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
 
 import yaml
 
+from app.auth.gate import check_question
+from app.auth.guard import AccessDenied, current_principal, require, use_principal
+from app.auth.policy import access_policy
+from app.auth.principal import SYSTEM, Principal
 from app.config import Settings
 from app.data.relations import family_relation, plan_uses_family
 from app.data.repository import ResidentRepository
-from app.data.scope import facility_scope
+from app.data.scope import assignment_scope, facility_scope
 from app.data.staff import staff_config
 from app.engine import people
 from app.engine.caller import CallerContext, use_caller
@@ -51,7 +56,7 @@ from app.nlu.request_ir import IRCompilationError, compile_request_ir, normalize
 from app.nlu.structure import StructureAnalyzer
 from app.nlu.topic_gate import TopicGate
 from app.nlu.translator import ModelUsage, QueryTranslator, SchemaContext, TranslationRequest, TranslatorUnavailable
-from app.nlu.vocabulary import EntityIndex
+from app.nlu.vocabulary import EntityIndex, MaskResult
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +65,7 @@ GATE_MESSAGE = (
     "That doesn't look like a question about residents. I can help with resident counts, status, care type, "
     "facility, room, caregiver, age and admission or discharge dates."
 )
+_REQUEST_INDEX: "ContextVar[EntityIndex | None]" = ContextVar("request_index", default=None)
 _REQUEST_IR_VERSION = "request-ir-v3"
 RETRY_MIN_BUDGET_S = 1.0  # a retry with less of the request's model-time budget left than this is not attempted
 # What a stored plan template's meaning depends on besides the vocabulary: the plan model and the resident view mapping.
@@ -92,7 +98,7 @@ _STAFF_CATEGORY = {"count": "STAFF_COUNT", "list": "STAFF_LIST", "breakdown": "S
 class Stats:
     queries: int = 0
     by_tier: dict[str, int] = field(
-        default_factory=lambda: {"llm": 0, "cache": 0, "template": 0, "gate": 0, "direct": 0, "unavailable": 0}
+        default_factory=lambda: {"llm": 0, "cache": 0, "template": 0, "gate": 0, "direct": 0, "unavailable": 0, "auth": 0}
     )
     model_calls: int = 0  # local Qwen inferences (no per-token cost)
     prompt_tokens: int = 0
@@ -200,6 +206,22 @@ def _bindings(mask: Any) -> str:
            for kind in ("family", "persons", "model_persons", "inherited_persons")},
     }  # fmt: skip
     return hashlib.sha256(json.dumps(people, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _limit_mask(mask: MaskResult, visible: set[str]) -> None:
+    """Keep only candidates the caller may see: residents by id, family members by their resident's id (staff names
+    are not resident data; the plan check decides whether staff may be asked about)."""
+
+    def rid(c) -> str:
+        return str(c if isinstance(c, str) else (c.get("residentId") or c.get("id") or "")).upper()
+
+    mask.placeholders = {k: [i for i in v if str(i).upper() in visible] for k, v in mask.placeholders.items()}
+    mask.family = {k: [c for c in v if rid(c) in visible] for k, v in mask.family.items()}
+    for named in (mask.persons, mask.model_persons):
+        for cands in named.values():
+            for kind in ("residents", "family"):
+                if cands.get(kind):
+                    cands[kind] = [c for c in cands[kind] if rid(c) in visible]
 
 
 def _session_cache_key(session_id: str, context: str) -> str:
@@ -353,7 +375,19 @@ class QueryService:
         self.sessions = TTLCache(settings.session_max_entries, settings.session_ttl_seconds)
         self.stats = Stats()
         self.index: EntityIndex | None = None
+        # a restricted caller's own view of the names (only the residents they may see), rebuilt at most every
+        # principal.cache_ttl_seconds (app/auth/access_policy.yaml)
+        self._caller_indexes = TTLCache(256, float(access_policy().setting("cache_ttl_seconds", 60)))
         self._refresh_task: asyncio.Task | None = None
+
+    @property
+    def index(self) -> EntityIndex | None:
+        """The names this request may resolve against: the caller's own view when restricted (app/auth), else all."""
+        return _REQUEST_INDEX.get() or self._index
+
+    @index.setter
+    def index(self, value: EntityIndex | None) -> None:
+        self._index = value
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -366,6 +400,7 @@ class QueryService:
 
     async def refresh_vocabulary(self) -> None:
         vocab = await self.repo.vocabulary()
+        self._vocab = vocab  # the shared values; a restricted caller's index narrows only the names (_index_for)
         self.index = EntityIndex(vocab)
         # schema/vocabulary version: changes whenever the values the planners resolve against change
         self.vocab_version = hashlib.sha256(
@@ -378,7 +413,7 @@ class QueryService:
         so adding one does not invalidate every template."""
         s = self.settings
         vocab = hashlib.sha256(
-            json.dumps([sorted(self.index.statuses), sorted(self.index.care_types)]).encode()
+            json.dumps([sorted(self._index.statuses), sorted(self._index.care_types)]).encode()
         ).hexdigest()[:16]
         return Compatibility(
             request_ir_version=_REQUEST_IR_VERSION,
@@ -394,7 +429,9 @@ class QueryService:
         s = self.settings
         scope = f"{s.data_source}:{s.mongodb_db}.{s.mongodb_collection}"  # the data scope (tenant scope: not built yet)
         model = s.model_version_tag
-        return f"{_REQUEST_IR_VERSION}|{self.vocab_version}|{scope}|{model}"
+        # the caller's effective rules (app/auth): a remembered failure or a conversation never crosses callers
+        caller = current_principal().policy_version()
+        return f"{_REQUEST_IR_VERSION}|{self.vocab_version}|{scope}|{model}|{caller}"
 
     async def _refresh_loop(self) -> None:
         while True:
@@ -410,13 +447,46 @@ class QueryService:
 
     # ------------------------------------------------------------------ main entry
     async def handle(
-        self, question: str, session_id: str | None = None, caller: CallerContext | None = None
+        self, question: str, session_id: str | None = None, caller: CallerContext | None = None,
+        principal: Principal | None = None,
     ) -> dict[str, Any]:
         """Answer one question. Every pipeline step is logged as step-01 … step-19 (app/engine/steps.py).
-        `caller`: facility scope and family permissions (default: from Settings, today's unrestricted behaviour)."""
-        caller = caller or CallerContext.from_settings(self.settings)
-        with facility_scope(caller.facilities), use_caller(caller):
-            return await self._handle_scoped(question, session_id)
+        `caller`: facility scope and family permissions (default: from Settings, today's unrestricted behaviour).
+        `principal`: who is asking (app/auth; default: no identity = unrestricted). Their modules and resident scope
+        narrow `caller`, every query (row scope) and the names this request may resolve."""
+        principal = principal or SYSTEM
+        caller = principal.caller(caller or CallerContext.from_settings(self.settings))
+        with (facility_scope(caller.facilities), assignment_scope(principal.assignment()), use_caller(caller),
+              use_principal(principal)):  # fmt: skip
+            index_token = _REQUEST_INDEX.set(await self._index_for(principal, caller))
+            try:
+                return await self._handle_scoped(question, session_id)
+            finally:
+                _REQUEST_INDEX.reset(index_token)
+
+    async def browse(self, filters, sort, limit: int, principal: Principal | None = None) -> list[dict]:
+        """The data browser's resident list, under the same guardrails as a question (Residents module, row scope)."""
+        principal = principal or SYSTEM
+        caller = principal.caller(CallerContext.from_settings(self.settings))
+        with facility_scope(caller.facilities), assignment_scope(principal.assignment()), use_principal(principal):
+            require(["residents"], "plan")
+            return await self.repo.find(filters, sort=sort, limit=limit)
+
+    async def _index_for(self, principal: Principal, caller: CallerContext) -> EntityIndex | None:
+        """Restricted callers resolve names only among what they may see (their residents and those residents' family);
+        built from the repository's vocabulary inside the request's scope, cached per caller."""
+        if principal.unrestricted and caller.facilities is None:
+            return None  # the shared index
+        key = f"{principal.policy_version()}|{sorted(caller.facilities) if caller.facilities is not None else '*'}"
+        index = self._caller_indexes.get(key)
+        if index is None:
+            # only WHO they may see is narrowed (residents and those residents' family members); statuses, care types,
+            # facilities, rooms and staff stay the shared values, so a condition such as "memory care" is always
+            # understood (in the caller's scope it may simply match nobody)
+            mine = await self.repo.vocabulary()  # inside the request's row scope
+            index = EntityIndex(dataclasses.replace(self._vocab, residents=mine.residents, family_members=mine.family_members))
+            self._caller_indexes.set(key, index)
+        return index
 
     async def _handle_scoped(self, question: str, session_id: str | None) -> dict[str, Any]:
         query_id = f"q_{secrets.token_hex(6)}"
@@ -453,6 +523,15 @@ class QueryService:
         stopped = await self._screen(t)  # 05 topic · 06 policy
         if stopped is not None:
             return stopped
+        stopped = self._authorize_question(t)  # E: the caller's modules, before any model call (app/auth)
+        if stopped is not None:
+            return stopped
+        try:
+            return await self._handle_authorized(t)
+        except AccessDenied as denied:  # C: a plan needing what the caller cannot read (right before execution)
+            return self._access_denied(t, denied)
+
+    async def _handle_authorized(self, t: "_Turn") -> dict[str, Any]:
         stopped = await self._answer_person(t)  # "Who is Jone?": the people we know, no model (logged as 09 fast path)
         if stopped is not None:
             return stopped
@@ -473,7 +552,12 @@ class QueryService:
         today = self.settings.today()
         today_d = date.fromisoformat(today)
         trace.start("mask_names")
-        mask = self.index.mask(question, family=self.settings.family_name_resolution_enabled)
+        # every known name is masked with the FULL index (no name the caller cannot see ever reaches the model as
+        # text); a restricted caller's candidates are then limited to what they may see (app/auth): an out-of-scope
+        # name is answered exactly like an unknown one
+        mask = self._index.mask(question, family=self.settings.family_name_resolution_enabled)
+        if self.index is not self._index:
+            _limit_mask(mask, set(self.index.display_by_id))
         trace.record("mask_names", "ok", residents_masked=len(mask.placeholders),
                      ambiguous_names=sum(1 for ids in mask.placeholders.values() if len(ids) > 1))  # fmt: skip
         scan = scan_question(mask.text, today_d)
@@ -1217,7 +1301,15 @@ class QueryService:
         interpretation = describe_plan(plan, lambda i: self.index.display_by_id.get(i, i))
         plan_json = plan.model_dump(mode="json", exclude_none=True)
         is_data = plan.is_data_query
+        principal = current_principal()
+        if principal.kind == "staff" and is_data and plan.entity != "staff" and response.get("summaryText"):
+            # R4: a staff member's resident answers cover their assigned residents only — said so, never "the census"
+            response = {**response, "summaryText": response["summaryText"].replace(" in the census", "").rstrip()
+                        + " " + access_policy().message("scoped_note")}  # fmt: skip
         return {
+            # who asked (app/auth): every answer says whose view of the data it is
+            "caller": {"role": principal.kind, "name": principal.name or None, "facilityId": principal.facility_id,
+                       "residentScope": "assigned" if principal.assignment() is not None else "all"},  # fmt: skip
             "queryId": query_id,
             "timestamp": datetime.now(UTC).isoformat(),
             "userQuery": question,
@@ -1312,6 +1404,7 @@ class QueryService:
                                       or len(found[kinds[0]]) == 1)  # fmt: skip
         access = None
         if single and asked.sections:  # app permissions of ONE staff member (yes / no per section asked)
+            require(["staff_permissions"], "plan")  # not an executed plan: checked here (the gate already did)
             person = found["staff"][0]
             records = await self.repo.staff_access(person["name"], person["designation"])
             if len(records) == 1:
@@ -1371,6 +1464,51 @@ class QueryService:
         if t.mask.family or (rel is not None and rel.cue_in(t.question, t.mask.text)):
             return "family"
         return "resident"
+
+    def _authorize_question(self, t: "_Turn") -> dict[str, Any] | None:
+        """E (app/auth/gate.py): the question's own words → the capabilities it needs; one the caller lacks is refused
+        here, before the fast path or any model call. A staff member with no residents is told so (resident
+        questions only)."""
+        principal = current_principal()
+        if principal.unrestricted:
+            return None
+        asked = self.person_questions.parse(t.question)
+        gate = check_question(t.question, principal, names_resident=bool(t.mask.placeholders),
+                              app_sections=bool(asked and asked.sections))  # fmt: skip
+        if gate.denied is not None:
+            return self._access_denied(t, gate.denied)
+        if any(not ids for ids in t.mask.placeholders.values()):
+            # a resident's name the caller may not see (masked, so it never reached a model): not found, 0 tokens
+            return self._access_denied(t, None, access_policy().message("resident_not_in_scope"))
+        resident_caps = {"residents", "resident_details", "family", "care_team"}
+        if (principal.kind == "staff" and any(set(rule) <= resident_caps for rule in gate.needed)
+                and self.index is not None and not self.index.display_by_id):  # fmt: skip
+            return self._access_denied(t, None, access_policy().message("no_residents"))
+        return None
+
+    def _access_denied(self, t: "_Turn", denied: AccessDenied | None, message: str | None = None) -> dict[str, Any]:
+        """A refusal that names what is missing, never the data. Audited (no names, no rows)."""
+        principal = current_principal()
+        message = message or denied.message
+        layer = denied.layer if denied is not None else "scope"
+        calls = t.calls.attempted if getattr(t, "calls", None) is not None else 0
+        log.info("authorization decision", extra={
+            "query_id": t.query_id, "decision": "deny", "layer": layer, "principal_kind": principal.kind,
+            "principal_id": principal.id, "facility_id": principal.facility_id, "policy_version": principal.policy_version(),
+            "capability": denied.capability if denied is not None else None, "gate_miss": layer == "plan" and calls > 0,
+        })  # fmt: skip
+        t.trace.finish("refused", tier="auth", model_calls=calls)
+        self.stats.queries += 1
+        self.stats.by_tier["auth"] += 1
+        plan = QueryPlan(action="unsupported", message=message)
+        response = {"headline": "Not available", "summaryText": message, "count": 0, "isAccessDenied": True}
+        latency = round((time.perf_counter() - t.started) * 1000)
+        usage = getattr(t, "usage", None) or ModelUsage()
+        result = self._result(t.query_id, t.question, plan, 0, 0, response, "auth", usage, latency)
+        result["policy"] = {"passed": False, "policyCategory": "ACCESS_DENIED", "violationReason": message}
+        result["authorization"] = {"decision": "deny", "layer": layer,
+                                   "capability": denied.capability if denied is not None else None}  # fmt: skip
+        return result
 
     def _gated(self, query_id: str, question: str, started: float) -> dict[str, Any]:
         self.stats.queries += 1

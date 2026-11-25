@@ -1,0 +1,116 @@
+# Authorization guardrails of the chatbot (design: "SashiAI Chatbot — Authorization Guardrails", 2026-11-24).
+#
+# ONE policy, enforced in three places (app/auth):
+#   E  pre-model gate   — app/auth/gate.py:   question words → capabilities; a denied one is answered before any
+#                         model call (0 tokens)
+#   C  plan policy      — app/auth/guard.py:  every plan (fast path, template, follow-up, model) → capabilities, checked
+#                         right before execution (app/engine/executor.py); a denial there after a model call is a
+#                         "gate miss" (logged, to be fixed here)
+#   D  row scope        — app/data/scope.py:  a staff member's residents only, inside every MongoDB pipeline
+#
+# Product decisions still open at Gate 0 are settings below, each with the safe default proposed in the design.
+version: 1
+
+principal:
+  # a restricted caller's view of the names (their residents only) is rebuilt at most this often
+  cache_ttl_seconds: 60
+  # The signed-in user's data, as the Shashi Care app holds it (its profile response) and hands it to the chatbot with
+  # every request — today from a dummy file (AUTH_MODE=file, Settings.auth_user_context_file). Field names and role
+  # values live here only.
+  context:
+    role_field: scope
+    admin_roles: [admin]
+    staff_roles: [staff]
+    key_field: cName            # the user's key: also what residents' assigned-staff field holds (R3)
+    facility_field: facilityId  # the active facility
+    permissions_field: accessPermissions
+    active_field: active        # optional in the data; absent = active
+    name_field: name
+  # OPEN DECISION (inactive staff): true = a staff account with active: false is refused
+  deny_inactive_staff: true
+  # OPEN DECISION (admin facility): all = an admin sees every facility (R1), own = only their facilityId
+  admin_facility_scope: all
+  # R3: the residents of a staff member = residents whose assigned-staff field holds the staff member's key
+  # (the field is relations.staff.resident_link of resident_schema.yaml)
+  # OPEN DECISION (primary physician): not yet a way to be associated with a resident
+  resident_link: "@schema:relations.staff.resident_link"
+
+modules:
+  # a module (accessPermissions entry) is allowed when every flag is true; a child also needs its parent. Write access
+  # never grants anything here (the chatbot is read-only). A name not mapped below grants nothing.
+  allowed_when: [allowed, isRead]
+
+# What each kind of data needs. A plan needs EVERY capability its entity, fields, filters, grouping, sorting and
+# aggregate use; each capability needs EVERY module listed. Fields not listed belong to the entity's base capability.
+capabilities:
+  residents:
+    label: Residents
+    modules: [Residents, residents-list]
+    base_of: resident
+  resident_details:
+    label: resident details
+    modules: [Residents, resident-details]
+    fields: [age, gender, admission_date, created_date, discharge_date, emergency_contact]
+    # any question about ONE resident (a lookup), whatever it asks: the app's details page, not its list page
+    # (decision 2026-11-24). residents-list alone = counts, lists and groupings only.
+    actions: [lookup]
+  family:
+    label: family members
+    # OPEN DECISION (family): names and relationships with resident details
+    modules: [Residents, resident-details]
+    fields: [family_relation, family_type, family_flags, family_count, family_member, family_members,
+             family_relationship]
+  family_contacts:
+    label: family contact details
+    # OPEN DECISION (family): phone and email of family members (one resident's answer only)
+    modules: [Contact Management]
+  care_team:
+    label: residents' care teams
+    modules: [Residents, resident-details]
+    fields: [care_team, primary_physician, staff_role, staff_designation, staff_count, staff_name]
+  staff_directory:
+    label: Staff
+    # OPEN DECISION (staff directory): other staff members need the Staff module
+    modules: [Staff]
+    base_of: staff
+  staff_permissions:
+    label: staff app permissions
+    modules: [Access Management]
+
+# E: words that show a question needs a capability. A rule with several capabilities is satisfied by any one of them
+# ("case manager" may be the staff directory or a resident's care team); the plan check decides between them.
+# "@<source>:<path>" reads a word list from resident_schema.yaml (schema) or intent_routes.yaml (routes).
+gate:
+  - any_of: [residents]
+    words: [resident, residents, patient, patients]
+    names_residents: true   # also when the question names a resident
+  # a question naming a resident is about that one resident: resident details (refused before any model call)
+  - any_of: [resident_details]
+    names_residents: true
+  - any_of: [family]
+    words: ["@schema:relations.family.cue_words"]
+  - any_of: [care_team, staff_directory]
+    words: ["@schema:relations.staff.cue_words", "@schema:relations.staff.roles"]
+  # staff words in a question that speaks of no resident ("how many physicians are there?"): the staff directory
+  - any_of: [staff_directory]
+    words: ["@schema:relations.staff.cue_words", "@schema:relations.staff.roles"]
+    unless_words: [resident, residents, patient, patients]
+    unless_names_resident: true
+  - any_of: [resident_details]
+    words: ["@routes:direct.lookup_attributes.age", "@routes:direct.lookup_attributes.gender",
+            "@routes:direct.lookup_attributes.admission_date", "@routes:direct.lookup_attributes.discharge_date",
+            "@routes:direct.lookup_attributes.created_date", "@routes:direct.lookup_attributes.emergency_contact"]
+  - any_of: [care_team]
+    words: ["@routes:direct.lookup_attributes.care_team", "@routes:direct.lookup_attributes.primary_physician"]
+  - any_of: [staff_permissions]
+    # a question the person-question grammar reads as "can <staff> access <app section>?" (not every "access":
+    # "portal access" is a family flag)
+    app_sections: true
+
+messages:
+  module_denied: "You don't have access to {label} in Shashi Care, so I can't answer that."
+  no_residents: "You don't have any assigned residents yet."
+  # added to a staff member's resident answers (R4: counts and lists cover their assigned residents only)
+  scoped_note: "(Only your assigned residents are included.)"
+  # never says whether the person exists for someone else
+  resident_not_in_scope: "I couldn't find that resident among your assigned residents."

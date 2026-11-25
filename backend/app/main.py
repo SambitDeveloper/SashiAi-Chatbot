@@ -199,6 +199,9 @@ def create_app(
                 "llm_server": (getattr(model, "endpoint", None) or settings.llm_server_url) if model is not None else None,
                 "topic_check": topic_gate is not None,
                 "semantic_router": intent_router is not None,
+                # app/auth: off = every question unrestricted; file = asked as the user in auth_user_context_file
+                "auth_mode": settings.auth_mode,
+                "auth_user_context_file": settings.auth_user_context_file if settings.auth_mode == "file" else None,
             },
         )
         yield
