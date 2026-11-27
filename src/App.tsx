@@ -5,7 +5,7 @@ import { InspectorDrawer } from './components/InspectorDrawer';
 import { DatabaseModal } from './components/DatabaseModal';
 import { ArchitectureModal } from './components/ArchitectureModal';
 import { ChatMessage, QueryExecutionResult } from './types/resident';
-import { api, ApiError, ApiMeta, newSessionId } from './api/client';
+import { ApiError, ApiMeta, api, hasCredentials, newSessionId, setCredentials } from './api/client';
 import { SendHorizontal, Shield, Users, Tag, Calendar, ArrowRight, X } from 'lucide-react';
 import { BotAvatar } from './components/Avatars';
 
@@ -50,6 +50,24 @@ function welcomeMessage(meta: ApiMeta | null): ChatMessage {
   );
 }
 
+/** sessionStorage can be blocked (private windows, embedded views): never let that break the page. */
+function readSession(key: string): string {
+  try {
+    return sessionStorage.getItem(key) || '';
+  } catch {
+    return '';
+  }
+}
+
+function writeSession(key: string, value: string): void {
+  try {
+    if (value) sessionStorage.setItem(key, value);
+    else sessionStorage.removeItem(key);
+  } catch {
+    /* not available: the fields still work for this page view */
+  }
+}
+
 export default function App() {
   const [meta, setMeta] = useState<ApiMeta | null>(null);
   const [sessionId, setSessionId] = useState<string>(() => newSessionId());
@@ -65,8 +83,15 @@ export default function App() {
   const [totalQueriesRun, setTotalQueriesRun] = useState<number>(0);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  // Dev sign-in for the standalone page: the user's access token and facility, kept only in this browser tab.
+  const [accessToken, setAccessToken] = useState<string>(() => readSession('chat-access-token'));
+  const [facilityId, setFacilityId] = useState<string>(() => readSession('chat-facility-id'));
+  setCredentials(accessToken, facilityId); // every api.* call from here on sends them (api/client.ts)
 
   useEffect(() => {
+    writeSession('chat-access-token', accessToken);
+    writeSession('chat-facility-id', facilityId);
+    if (!hasCredentials()) return;
     api
       .meta()
       .then(m => {
@@ -77,7 +102,7 @@ export default function App() {
         const msg = err instanceof ApiError ? err.message : 'Cannot reach the server.';
         setMessages(prev => [...prev, systemMessage('Server unavailable', msg, { needsClarification: true })]);
       });
-  }, []);
+  }, [accessToken, facilityId]);
 
   // Auto-scroll to bottom of messages
   useEffect(() => {
@@ -218,6 +243,26 @@ export default function App() {
 
       {/* Bottom Input Composer */}
       <footer className="px-4 pt-3 pb-3 bg-white/80 backdrop-blur border-t border-brand-100">
+        {/* Dev sign-in: inside the Care App web the host app supplies these (setCredentials in api/client.ts) */}
+        <div className="max-w-6xl mx-auto mb-2 flex flex-wrap gap-2 text-xs">
+          <input
+            id="chat-access-token"
+            type="password"
+            value={accessToken}
+            onChange={(e) => setAccessToken(e.target.value)}
+            placeholder="Access token (Cognito)"
+            autoComplete="off"
+            className="flex-1 min-w-[12rem] px-3 py-1.5 rounded-full border border-brand-100 bg-white"
+          />
+          <input
+            id="chat-facility-id"
+            type="text"
+            value={facilityId}
+            onChange={(e) => setFacilityId(e.target.value)}
+            placeholder="Facility id"
+            className="w-36 px-3 py-1.5 rounded-full border border-brand-100 bg-white"
+          />
+        </div>
         <form
           onSubmit={(e) => {
             e.preventDefault();

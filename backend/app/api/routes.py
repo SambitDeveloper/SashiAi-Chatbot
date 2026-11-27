@@ -1,6 +1,7 @@
 """HTTP routes."""
 
 import hmac
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -8,14 +9,16 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.auth.guard import AccessDenied
-from app.auth.identity import AuthError, IdentityResolver
-from app.auth.principal import Principal
+from app.auth.identity import AuthError, principal_from_caller
+from app.auth.principal import SYSTEM, Principal
 from app.config import Settings
 from app.data.repository import list_view
+from app.data.snf_mcp_repository import use_credentials
 from app.engine.service import QueryService
 from app.models.plan import Filters, Sort
 
 limiter = Limiter(key_func=get_remote_address)
+log = logging.getLogger(__name__)
 
 
 class QueryRequest(BaseModel):
@@ -33,28 +36,44 @@ def get_settings_dep(request: Request) -> Settings:
 
 
 def require_token(request: Request, settings: Settings = Depends(get_settings_dep)) -> None:
-    """Optional shared-secret auth for service-to-service calls (Authorization: Bearer <API_TOKEN>)."""
+    """Optional shared secret for service-to-service calls (x-api-key: <API_TOKEN>). Authorization carries the user's
+    own access token (forward_credentials)."""
     if not settings.api_token:
         return
-    header = request.headers.get("authorization", "")
-    given = header[7:] if header.startswith("Bearer ") else ""
+    given = request.headers.get("x-api-key", "")
     if not hmac.compare_digest(given.encode(), settings.api_token.encode()):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-async def get_principal(request: Request, settings: Settings = Depends(get_settings_dep)) -> Principal:
-    """Who is asking (app/auth/identity.py; AUTH_MODE). Unknown or inactive callers stop here, before any query."""
-    resolver = getattr(request.app.state, "identity", None)
-    if resolver is None:
-        resolver = request.app.state.identity = IdentityResolver(settings)
+async def forward_credentials(request: Request, service: QueryService = Depends(get_service)) -> None:
+    """The signed-in user's Cognito access token (Authorization: Bearer …) and facility (x-facility-id), sent by the UI
+    with every request, for every snf_mcp call of this request. They are only passed on: snf_mcp verifies the token
+    and checks the facility; the role and permissions come from snf_mcp, never from the browser."""
+    if not getattr(service.repo, "per_caller", False):
+        return  # the in-memory test data has no users
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+    facility = request.headers.get("x-facility-id", "").strip()
+    if not token or not facility:
+        raise HTTPException(status_code=401, detail="Sign in to use the assistant: the request has no access token "
+                                                    "(Authorization: Bearer …) or facility (x-facility-id).")  # fmt: skip
+    use_credentials(token, facility)
+
+
+async def get_principal(service: QueryService = Depends(get_service)) -> Principal:
+    """Who is asking: the SNF_MCP_TOKEN user (app/auth/identity.py). Refused or inactive callers stop here, before any
+    query. The in-memory test data has no caller: unrestricted."""
+    caller = getattr(service.repo, "caller", None)
+    if caller is None:
+        return SYSTEM
     try:
-        return await resolver.resolve(request.headers)
-    except AuthError as exc:
+        return principal_from_caller(await caller())
+    except AuthError as exc:  # DataUnavailable propagates: 503 (app/main.py), never an unrestricted caller
         raise HTTPException(status_code=exc.status, detail=exc.message) from None
 
 
 public = APIRouter(prefix="/api")
-protected = APIRouter(prefix="/api", dependencies=[Depends(require_token)])
+protected = APIRouter(prefix="/api", dependencies=[Depends(require_token), Depends(forward_credentials)])
 
 
 @public.get("/health")
@@ -64,10 +83,11 @@ async def health() -> dict:
 
 @public.get("/ready")
 async def ready(service: QueryService = Depends(get_service)) -> dict:
-    try:
-        await service.repo.total()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="data source unavailable") from exc
+    if not getattr(service.repo, "per_caller", False):  # per-user data (snf_mcp) cannot be read without a user
+        try:
+            await service.repo.total()
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="data source unavailable") from exc
     if not service.ready:
         raise HTTPException(status_code=503, detail="index not ready")
     # The local model is optional for readiness: simple questions are answered without it.
@@ -109,9 +129,12 @@ async def stats(service: QueryService = Depends(get_service)) -> dict:
 @limiter.limit(lambda: _rate_limit())
 async def query(
     request: Request, body: QueryRequest, service: QueryService = Depends(get_service),
-    principal: Principal = Depends(get_principal),
+    principal: Principal = Depends(get_principal), settings: Settings = Depends(get_settings_dep),
 ) -> dict:
-    return await service.handle(body.query, body.session_id, principal=principal)
+    result = await service.handle(body.query, body.session_id, principal=principal)
+    if settings.log_api_responses:  # the exact JSON the UI renders (src/types/resident.ts QueryExecutionResult)
+        log.info("api response", extra={"path": "/api/query", "response": result})
+    return result
 
 
 @protected.get("/residents")

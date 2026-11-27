@@ -1,23 +1,13 @@
-"""Who is asking: the signed-in user's data, as the Shashi Care app holds it → a Principal (app/auth/principal.py).
+"""Who is asking: the user of the SNF_MCP_TOKEN access token, as our snf_mcp server reports them → a Principal.
 
-The app already has, for every signed-in user, their key (cName), active facility (facilityId), role (scope: admin /
-staff) and app permissions (accessPermissions). The chatbot builds its principal from exactly that data; the field
-names and role values are access_policy.yaml `principal.context`.
-
-AUTH_MODE (Settings.auth_mode):
-  off   no caller (today's behaviour): the unrestricted system principal.
-  file  until the chatbot is integrated into the app: every request is the user in Settings.auth_user_context_file
-        (re-read when the file changes, so a test can switch user or role without a restart). Refused in production.
-
-When integrated, the app's BACKEND will send the same data with each request (server to server, behind API_TOKEN):
-never accept it from a browser, which could claim any role or permission.
+Every `run_query` result returns `caller`: the token's username (cName) and Cognito groups, and the user's own staff
+record from the database (active, name, accessPermissions; for contact staff, their membership at this facility). The
+role comes from the groups, the facility is SNF_MCP_FACILITY_ID, which snf_mcp has already checked. Field names and role values are access_policy.yaml `principal.context`. Nothing is taken from what
+a browser says about itself.
 """
 
-import json
-from pathlib import Path
-
 from app.auth.policy import AccessPolicy, access_policy
-from app.auth.principal import SYSTEM, Principal, readable_modules
+from app.auth.principal import Principal, readable_modules
 
 
 class AuthError(Exception):
@@ -57,31 +47,16 @@ def principal_from_context(data: dict, policy: AccessPolicy | None = None) -> Pr
     return principal
 
 
-class IdentityResolver:
-    """The API's single way to turn a request into a Principal."""
-
-    def __init__(self, settings, policy: AccessPolicy | None = None):
-        self.mode = settings.auth_mode
-        self.policy = policy or access_policy()
-        self.path = Path(settings.auth_user_context_file)
-        self._loaded: tuple[float, Principal] | None = None
-
-    async def resolve(self, headers=None) -> Principal:
-        if self.mode == "off":
-            return SYSTEM
-        if self.mode == "file":
-            return self._from_file()
-        raise AuthError(401, "Caller identity is not configured.")
-
-    def _from_file(self) -> Principal:
-        try:
-            mtime = self.path.stat().st_mtime
-        except OSError:
-            raise AuthError(401, "The user context file is missing.") from None
-        if self._loaded is None or self._loaded[0] != mtime:
-            try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-            except ValueError:
-                raise AuthError(401, "The user context file is not valid JSON.") from None
-            self._loaded = (mtime, principal_from_context(data, self.policy))
-        return self._loaded[1]
+def principal_from_caller(caller: dict, policy: AccessPolicy | None = None) -> Principal:
+    """snf_mcp's `caller` (+ facility_id) → Principal. A staff member without a staff record reads nothing."""
+    p = policy or access_policy()
+    ctx = dict(p.setting("context") or {})
+    groups = {str(g).lower() for g in caller.get("groups") or []}
+    roles = [*(ctx.get("admin_roles") or []), *(ctx.get("staff_roles") or [])]  # admin first
+    role = next((r for r in roles if str(r).lower() in groups), "")
+    profile = caller.get("profile") or {}
+    return principal_from_context({
+        ctx["role_field"]: role, ctx["key_field"]: caller.get("c_name") or "",
+        ctx["facility_field"]: caller.get("facility_id"), ctx["permissions_field"]: profile.get("access_permissions"),
+        ctx.get("active_field", "active"): profile.get("active", True), ctx.get("name_field", "name"): profile.get("name") or "",
+    }, p)  # fmt: skip

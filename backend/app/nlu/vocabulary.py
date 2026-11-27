@@ -786,6 +786,18 @@ class EntityIndex:
                              for m in self._family if all(w in m.tokens for w in words)]  # fmt: skip
         return out
 
+    def name_is_unknown(self, name: str) -> bool:
+        """True when no word of `name` is, or is close to, a word of any person's name this index holds (residents,
+        staff, caregivers, family members): a question about that person has no answer anywhere, the model included
+        (it only ever sees known names, as placeholders). A typo of a known name is NOT unknown (the usual matching
+        and the model still get their chance)."""
+        words = [t for t in _name_parts(name) if t not in _TITLE_WORDS]
+        known = {*(t for r in self._residents for t in (*r.first, *r.last)), *self.staff_name_tokens(),
+                 *(t for m in self._family for t in m.tokens)}  # fmt: skip
+        return bool(words) and not any(
+            w in known or any(fuzz.ratio(w, k) >= SINGLE_NAME_THRESHOLD for k in known) for w in words
+        )
+
     def staff_name_tokens(self) -> set[str]:
         """Every word of a staff or caregiver name (titles excluded): "Dr. Raman" is a title + a name, not a role."""
         return {t for c in [*self._staff, *self._caregivers] for t in c.tokens}

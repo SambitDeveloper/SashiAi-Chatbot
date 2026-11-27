@@ -213,9 +213,10 @@ async def test_only_residents_keep_the_usual_resident_path(make_service):
     assert "Resident: Eleanor Vance" in " ".join(r["interpretation"]) and r["policy"]["policyCategory"] == "RESIDENT_INTENT"
 
 
-async def test_unknown_names_go_on_as_before(make_service):
+async def test_a_name_nobody_has_is_not_found_without_the_model(make_service):
+    # changed deliberately (2026-11-26): the model only sees known names as placeholders, so it could never answer
     r, fake = await ask(make_service, "Who is Zzyzx?", {"Who is Zzyzx?": {"action": "clarify", "message": "?"}})
-    assert len(fake.calls) == 1  # nobody of that name: the normal pipeline decides
+    assert fake.calls == [] and r["response"]["headline"] == "Not found"
 
 
 # ======================================================================== 3. person_N for the model (complex questions)

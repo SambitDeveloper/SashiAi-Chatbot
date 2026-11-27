@@ -19,7 +19,7 @@ principal:
   # values live here only.
   context:
     role_field: scope
-    admin_roles: [admin]
+    admin_roles: [admin, super_admin]   # Cognito groups (lower-cased), checked in this order
     staff_roles: [staff]
     key_field: cName            # the user's key: also what residents' assigned-staff field holds (R3)
     facility_field: facilityId  # the active facility
@@ -50,9 +50,11 @@ capabilities:
   resident_details:
     label: resident details
     modules: [Residents, resident-details]
-    fields: [age, gender, admission_date, created_date, discharge_date, emergency_contact]
+    fields: [gender, emergency_contact]
     # any question about ONE resident (a lookup), whatever it asks: the app's details page, not its list page
     # (decision 2026-11-24). residents-list alone = counts, lists and groupings only.
+    # Decision 2026-11-26: age and the admission, created and discharge dates are LIST fields (residents-list), so
+    # lists, counts and groupings may filter, sort and show them; one resident's details still need resident-details.
     actions: [lookup]
   family:
     label: family members
@@ -97,9 +99,7 @@ gate:
     unless_words: [resident, residents, patient, patients]
     unless_names_resident: true
   - any_of: [resident_details]
-    words: ["@routes:direct.lookup_attributes.age", "@routes:direct.lookup_attributes.gender",
-            "@routes:direct.lookup_attributes.admission_date", "@routes:direct.lookup_attributes.discharge_date",
-            "@routes:direct.lookup_attributes.created_date", "@routes:direct.lookup_attributes.emergency_contact"]
+    words: ["@routes:direct.lookup_attributes.gender", "@routes:direct.lookup_attributes.emergency_contact"]
   - any_of: [care_team]
     words: ["@routes:direct.lookup_attributes.care_team", "@routes:direct.lookup_attributes.primary_physician"]
   - any_of: [staff_permissions]

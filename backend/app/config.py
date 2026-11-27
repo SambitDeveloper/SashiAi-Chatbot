@@ -21,16 +21,18 @@ class Settings(BaseSettings):
     app_timezone: str = "UTC"
 
     # Data source
-    # mcp = MongoDB MCP Server tools (read-only; needs Node.js) · mongodb = PyMongo driver · memory = tests only
-    data_source: Literal["memory", "mongodb", "mcp"] = "mcp"
-    mongodb_uri: str | None = None
-    mongodb_db: str = "care_app"
-    mongodb_collection: str = "residents"
+    # mcp = our snf_mcp server's run_query tool (app/data/snf_mcp_repository.py) · memory = tests only
+    data_source: Literal["memory", "mcp"] = "mcp"
     vocab_refresh_seconds: int = Field(default=300, ge=10)
-    mcp_server_command: str = "mongodb-mcp-server"  # always started with --readOnly and telemetry disabled
-    mcp_node_path: str | None = None  # Node.js binary for the MCP server; default: first suitable one found
-    mcp_max_documents: int = Field(default=5000, ge=100)
-    mcp_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    snf_mcp_url: str = "http://127.0.0.1:7100/mcp"
+    # the user's access token and facility are NOT settings: the UI sends them with every request (api/routes.py)
+    snf_mcp_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    # log every run_query call to snf_mcp: pipeline, caller and returned documents. Resident data (PHI):
+    # development only, refused in production
+    snf_mcp_log_responses: bool = False
+    # log every /api/query response exactly as the UI receives it (QueryExecutionResult in src/types/resident.ts).
+    # Answers contain resident names: development only, refused in production
+    log_api_responses: bool = False
 
     # Local query-translation model: Qwen3-0.6B (GGUF Q4_K_M, non-thinking mode) served by llama.cpp `llama-server` on the
     # private network. Model path, context size, threads and parallel slots are llama-server flags (deploy/); these
@@ -110,12 +112,6 @@ class Settings(BaseSettings):
     family_names_permitted: bool = True
     family_contacts_permitted: bool = True
     caller_facility_ids: list[str] | None = None
-    # Authorization guardrails (app/auth, policy: app/auth/access_policy.yaml). AUTH_MODE:
-    #   off  = no caller (today's behaviour, unrestricted)
-    #   file = every request is the signed-in user in the file below (the app's user data: cName, facilityId, scope,
-    #          accessPermissions), until the chatbot is integrated into the app. Never in production.
-    auth_mode: Literal["off", "file"] = "off"
-    auth_user_context_file: str = "app/auth/dummy_user_context.json"
     # Gemma 4 reasons by default; Chat Completions does not return the reasoning, only its latency. None = model default.
     bedrock_reasoning_effort: Literal["low", "medium", "high"] | None = None
 
@@ -131,7 +127,7 @@ class Settings(BaseSettings):
     # planner. Routes are defined in a YAML file (default: app/data/intent_routes.yaml).
     semantic_router_enabled: bool = True
     semantic_router_routes_file: str | None = None
-    # Answer confident, simple questions directly with MongoDB MCP tools (no model call); rules in intent_routes.yaml
+    # Answer confident, simple questions directly with snf_mcp tools (no model call); rules in intent_routes.yaml
     direct_answers_enabled: bool = True
 
     # Failure cache and conversation memory (per process; use Redis for multiple replicas). CACHE_MAX_ENTRIES bounds the
@@ -143,7 +139,7 @@ class Settings(BaseSettings):
 
     # Semantic query-plan template cache (app/engine/semantic_cache.py): checked plan templates in a DEDICATED MongoDB
     # Atlas database with a Vector Search index, reused for re-worded questions after slot filling and the existing
-    # validator. Needs its OWN restricted credential (readWrite on PLAN_CACHE_DATABASE only), never MONGODB_URI.
+    # validator. Needs its OWN restricted credential (readWrite on PLAN_CACHE_DATABASE only).
     # Off until the Atlas user and index exist (README "Semantic plan cache"); off = no successful-plan caching at all.
     plan_cache_enabled: bool = False
     plan_cache_mongodb_uri: str | None = None
@@ -186,21 +182,16 @@ class Settings(BaseSettings):
             return self
         if not self.plan_cache_mongodb_uri:
             raise ValueError("PLAN_CACHE_ENABLED=true needs PLAN_CACHE_MONGODB_URI (a dedicated, restricted credential)")
-        if self.mongodb_uri and self.plan_cache_mongodb_uri.strip() == self.mongodb_uri.strip():
-            raise ValueError("PLAN_CACHE_MONGODB_URI must not reuse MONGODB_URI: create a user with readWrite on "
-                             "PLAN_CACHE_DATABASE only")  # fmt: skip
-        if self.plan_cache_database == self.mongodb_db:
-            raise ValueError("PLAN_CACHE_DATABASE must not be the resident database (MONGODB_DB)")
         for name in ("plan_cache_database", "plan_cache_collection", "plan_cache_vector_index"):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name.upper()} must not be empty")
         return self
 
     @model_validator(mode="after")
-    def _auth_config(self) -> "Settings":
-        """The dummy user never reaches production (every request would be that user)."""
-        if self.auth_mode == "file" and self.environment == "production":
-            raise ValueError("AUTH_MODE=file is not allowed in production (every request would be the file's user)")
+    def _no_resident_data_in_production_logs(self) -> "Settings":
+        if self.environment == "production" and (self.snf_mcp_log_responses or self.log_api_responses):
+            raise ValueError("SNF_MCP_LOG_RESPONSES / LOG_API_RESPONSES write resident data to the logs: not allowed "
+                             "in production")  # fmt: skip
         return self
 
     @model_validator(mode="after")

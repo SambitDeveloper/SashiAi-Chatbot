@@ -48,6 +48,8 @@ export type QueryCategory =
   | 'STAFF_LOOKUP'
   | 'HELP'
   | 'OUT_OF_POLICY'
+  | 'NOT_SUPPORTED'
+  | 'BED_QUERY'
   | 'AMBIGUOUS_QUERY';
 
 /** How the plan was produced: by the local Qwen model ('llm'), the deterministic planner ('direct'), the plan cache, or not at all. */
@@ -105,7 +107,7 @@ export interface ExtractedParameters {
 export interface PolicyCheckResult {
   passed: boolean;
   violationReason?: string;
-  policyCategory?: 'RESIDENT_INTENT' | 'STAFF_INTENT' | 'PROMPT_INJECTION' | 'OUT_OF_SCOPE' | 'SYSTEM_PROBING' | 'ACCESS_DENIED';
+  policyCategory?: 'RESIDENT_INTENT' | 'STAFF_INTENT' | 'PROMPT_INJECTION' | 'OUT_OF_SCOPE' | 'SYSTEM_PROBING' | 'ACCESS_DENIED' | 'NOT_SUPPORTED' | 'BED_INTENT';
   suggestedAction?: string;
 }
 
@@ -196,6 +198,8 @@ export interface QueryExecutionResult {
     multiSpotlight?: AttributeSpotlight[];
     isLlmInterpreted?: boolean;
     isPolicyViolation?: boolean;
+    /** Allowed, but the data isn't available to the assistant for this role yet (not an authorization denial). */
+    isNotSupported?: boolean;
     needsClarification?: boolean;
     clarificationOptions?: Array<{ label: string; query: string }> | null;
     /** Explicit projection: the columns the question asked to see (identity is always shown). Absent → default columns. */

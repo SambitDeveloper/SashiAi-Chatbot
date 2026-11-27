@@ -14,7 +14,7 @@ question → mask resident names → plan cache?
          → deterministic RequestIR compiler → resolver (exact DB values) → Pydantic QueryPlan
          → grounding check (app/engine/grounding.py) → read-only database query
          → model plans failing validation are retried once, then the user is asked to clarify
-         → MongoDB MCP tools (read-only) → deterministic answer template + "Interpreted as" chips
+         → snf_mcp MCP tool (read-only) → deterministic answer template + "Interpreted as" chips
 ```
 
 ## Run locally
@@ -38,48 +38,31 @@ If llama-server is not running, simple questions are still answered; questions t
 "couldn't interpret that right now" reply (there is no fallback to any external model). `LLM_ENABLED=false` turns the
 model off entirely. `curl localhost:8000/api/ready` shows `llmReady`; `/api/meta` shows `provider` and `model`.
 
-## Data: the Care App MongoDB (DATA_SOURCE=mcp)
+## Data: through our snf_mcp server (DATA_SOURCE=mcp)
 
-Every answer comes from the Care App's MongoDB. The backend starts the official MongoDB MCP Server as a child process
-and runs every query through its `aggregate` tool, always with `--readOnly` (no insert/update/delete tools exist) and
-telemetry disabled (the server's default is enabled).
+The app has no database connection for resident data; every read is a tool call to our MCP server
+[`snf_mcp`](../../snf_mcp) with `SNF_MCP_TOKEN` and `SNF_MCP_FACILITY_ID`. Who is asking comes from snf_mcp's
+`get_caller` (role from the token's Cognito groups, the user's own staff record and app permissions); the question gate
+and plan guard here use it. Then, by role (`app/data/snf_mcp_repository.py`):
 
-```bash
-npm install -g mongodb-mcp-server@3.3.0      # needs Node.js 20.19+, 22.13+ or 24+ installed (e.g. via nvm)
-# backend/.env:  DATA_SOURCE=mcp  MONGODB_URI=mongodb+srv://...  MONGODB_DB=sal_staging  MONGODB_COLLECTION=residents
-```
-The Docker image already contains Node.js and `mongodb-mcp-server@3.3.0`. `DATA_SOURCE=mongodb` runs the same
-queries through the PyMongo driver instead. There is no built-in data: startup fails without `MONGODB_URI`.
-
-### Schema mapping — `app/data/resident_schema.yaml`
-
-The assistant works with a small set of fields (status, care type, gender, age, facility, caregiver, room, dates).
-The YAML file says how each one is computed from the real collection, and every query starts with it inside MongoDB:
-
-| App field | From the Care App collection |
+| Caller | How a question is answered |
 |---|---|
-| (all) | only documents with `deletedAt: null` (soft-deleted residents never count) |
-| `status` | `status` lower-cased: Active → active, Away → away, Discharged → discharged |
-| `gender` | Female/F → Female, Male/M → Male, anything else (Unknown, empty) → Other |
-| `age` | stored `age`, otherwise calculated from `birthDate`; values outside 0–120 count as unknown |
-| `wing` | the facility: `facilities.facilityName` joined on `facilityId`, else the facility code |
-| `primaryCaregiver` | names of all `assignedStaff` (joined to `staffs.cName` → `staffs.name`); a caregiver question matches if any assigned staff member matches |
-| `roomNumber` | `unitNo` |
-| `admissionDate` / `createdDate` / `dischargeDate` | `admissionDate` text, `createdAt` and `dischargeDate` dates, as YYYY-MM-DD |
-| `residentId` | the document `_id` |
+| `ADMIN` / `SUPER_ADMIN` | The aggregation `app/data/resident_view.py` builds from the validated plan runs through snf_mcp's `run_query` (PyMongo, read-only user, scoped by snf_mcp to the facility). Every field and question type is available. |
+| `STAFF` | Only the snf_mcp tools in `app/data/staff_tools.yaml`, which call the Care App REST API as the user: `list_my_residents` (their assigned residents) and `find_staff` (staff directory, by role). Before every question the tool must exist in snf_mcp and the plan may use only that tool's fields; the plan then runs in memory over the tool's rows. |
 
-Only these fields leave the database (MongoDB's `$project` is the whitelist); medications, insurance, phone, email,
-address and PCC details are never read by the app. When the database changes, edit the YAML — no code changes.
-Startup stops with a clear message when the collection lacks `required_source_fields` or the mapping cannot run.
+Anything a staff tool does not provide (care type, gender, age, discharge or created date, emergency contact, family
+contact details, staff totals without a role) is answered "That isn't supported yet". Adding a tool or a field is an
+edit of `staff_tools.yaml`. If snf_mcp is unreachable, refuses the caller or the token has expired, every question gets
+HTTP 503 with the same message (the reason is logged).
 
-Testing the mapping locally (fixed test data written in the real Care App shape into a local MongoDB):
 ```bash
-docker run -d --name care-mongo -p 27017:27017 mongo:7.0
-uv run python -m scripts.seed_mongo mongodb://localhost:27017     # refuses non-local hosts
-MCP_TEST_MONGODB_URI=mongodb://localhost:27017 uv run pytest -k mcp
+# ../../snf_mcp/.env:  MONGODB_URI=<read-only user>  MONGODB_DB=<database>  API_BASE_URL=<Care App API>   then: uv run snf-mcp
+# backend/.env:        DATA_SOURCE=mcp  SNF_MCP_URL=http://127.0.0.1:7100/mcp
+#                      SNF_MCP_TOKEN=<Cognito ACCESS token>  SNF_MCP_FACILITY_ID=<facility id>
 ```
+One token user answers for everyone who chats; a Cognito access token expires after 1 hour by default.
 
-## Direct answers (semantic router → MongoDB MCP, no language model)
+## Direct answers (semantic router → snf_mcp tools, no language model)
 
 `app/data/intent_routes.yaml` defines each kind of question (route) with example questions and `metadata`
 (action, allowed fields, grouping/sort). A question is answered directly — 0 tokens — only when the router is
@@ -205,7 +188,7 @@ or extending the deterministic grammar; measure on a held-out question set, not 
 ## Tests and lint
 
 ```bash
-uv run pytest          # model calls are faked; set MCP_TEST_MONGODB_URI to also test the real MCP server
+uv run pytest          # model calls are faked
 uv run ruff check app tests
 ```
 
@@ -228,20 +211,18 @@ uv run ruff check app tests
 | `LLM_MAX_CONCURRENCY` | `2` | Concurrent inferences; keep equal to llama-server `--parallel` |
 | llama-server flags | see `deploy/` | `--ctx-size 4096 --parallel 2 --threads 4 --n-predict 512 --no-webui --no-slots --offline` |
 | `APP_TIMEZONE` | `UTC` | Facility timezone for "today", "last week", … (e.g. `Asia/Kolkata`) |
-| `DATA_SOURCE` | `mcp` | `mcp` (MongoDB MCP Server tools, read-only) or `mongodb` (driver); `memory` is test-only |
-| `MCP_SERVER_COMMAND` | `mongodb-mcp-server` | How to start the MCP server (Docker image sets the bundled path) |
-| `MCP_MAX_DOCUMENTS` / `MCP_TIMEOUT_SECONDS` | `5000` / `20` | Result cap per MCP query (server default is 100) and per-call timeout |
-| `MCP_NODE_PATH` | auto | Node.js binary for the MCP server. By default the first suitable `node` on PATH, else the newest nvm/volta/`/usr/local` install (an old system Node 18 is skipped) |
+| `DATA_SOURCE` | `mcp` | `mcp` (our snf_mcp server); `memory` is test-only |
+| `SNF_MCP_URL` / `SNF_MCP_TIMEOUT_SECONDS` | `http://127.0.0.1:7100/mcp` / `30` | snf_mcp endpoint and per-call timeout |
+| `SNF_MCP_TOKEN` / `SNF_MCP_FACILITY_ID` | – | Cognito access token of a staff/admin user, and the facility (`x-facility-id`); both required |
 | `SEMANTIC_ROUTER_ENABLED` / `SEMANTIC_ROUTER_ROUTES_FILE` | `true` / `app/data/intent_routes.yaml` | Intent scoring and routes file |
-| `DIRECT_ANSWERS_ENABLED` | `true` | Answer confident simple questions via MongoDB MCP without any model call |
-| `MONGODB_URI` / `MONGODB_DB` / `MONGODB_COLLECTION` | – / `care_app` / `residents` | MongoDB connection |
+| `DIRECT_ANSWERS_ENABLED` | `true` | Answer confident simple questions via snf_mcp tools without any model call |
 | `VOCAB_REFRESH_SECONDS` | `300` | How often names/wings/rooms are reloaded from the database |
 | `TOPIC_GATE_ENABLED` | `true` | Local topic check: a small embedding model on this server stops clearly off-topic questions before any planning |
 | `TOPIC_GATE_MODEL` / `TOPIC_GATE_CACHE_DIR` | `BAAI/bge-small-en-v1.5` / `.models` | Embedding model (~65 MB, downloaded once) and where it is stored |
 | `TOPIC_GATE_MARGIN` | `0.02` | How clearly off-topic a question must be to block it; higher blocks less. Tuned so no resident test question is blocked. Reference examples: `app/nlu/topic_examples.py` |
 | `CACHE_MAX_ENTRIES` | `5000` | Failure cache: a question whose model plan failed validation is not re-planned in the same context. (`CACHE_TTL_SECONDS` and the exact successful-plan cache were removed 2026-11-18.) |
 | `PLAN_CACHE_ENABLED` | `false` | Semantic plan-template cache (see "Semantic plan cache"). Off = no successful-plan caching at all |
-| `PLAN_CACHE_MONGODB_URI` | – | **Dedicated** credential: `readWrite` on `PLAN_CACHE_DATABASE` only. Must differ from `MONGODB_URI` (startup fails otherwise) |
+| `PLAN_CACHE_MONGODB_URI` | – | **Dedicated** credential: `readWrite` on `PLAN_CACHE_DATABASE` only |
 | `PLAN_CACHE_DATABASE` / `PLAN_CACHE_COLLECTION` | `sal_staging_vector` / `residents_ai` | Where templates live (never the resident database; startup fails if equal to `MONGODB_DB`) |
 | `PLAN_CACHE_VECTOR_INDEX` | `query_plan_embedding_index` | Atlas Vector Search index name |
 | `PLAN_CACHE_SIMILARITY_THRESHOLD` | `0.88` | **Experimental** cosine threshold for nominating candidates — not a safety boundary |

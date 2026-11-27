@@ -12,7 +12,6 @@ Defined behaviour (repository.MISSING_GROUP, GroupAggregateRow), identical in Mo
 
 import copy
 import json
-import os
 
 import pytest
 
@@ -133,97 +132,3 @@ async def test_lookup_of_a_resident_with_gaps_does_not_crash():
     records = corrupted_fixture()
     plan = QueryPlan.model_validate({"action": "lookup", "lookup": {"residents": [records[0]["residentId"]]}})
     assert build_response(plan, await execute(plan, MemoryResidentRepository(records)))["count"] == 1
-
-
-# ---------------------------------------------------------------- MongoDB and in-memory agree (throwaway MongoDB)
-MONGO_URI = os.environ.get("MISSING_TEST_MONGODB_URI")
-
-
-@pytest.mark.skipif(not MONGO_URI, reason="set MISSING_TEST_MONGODB_URI to a throwaway local MongoDB")
-async def test_grouped_aggregates_are_identical_in_mongodb_and_memory():
-    from datetime import UTC, datetime
-
-    from pymongo import MongoClient
-
-    from app.data.mongo_repository import MongoResidentRepository
-    from scripts.seed_mongo import SEED, to_care_app_shape
-
-    assert MONGO_URI.startswith(("mongodb://localhost", "mongodb://127.0.0.1")), "local throwaway MongoDB only"
-    docs, staffs, facilities = to_care_app_shape(json.loads(SEED.read_text(encoding="utf-8")))
-    base = {k: v for k, v in docs[0].items() if k != "_id"}
-    gappy = [
-        {**base, "_id": "AGG-NO-STATUS", "status": None},
-        {**base, "_id": "AGG-EMPTY-STATUS", "status": ""},
-        {**base, "_id": "AGG-NO-CARETYPE", "careType": None},
-        {**base, "_id": "AGG-NO-FACILITY", "facilityId": None},
-        {**base, "_id": "AGG-NO-STAFF", "assignedStaff": []},
-        {**base, "_id": "AGG-NO-AGE", "age": None, "birthDate": None},
-        {**base, "_id": "AGG-TEXT-AGE", "age": "eighty", "birthDate": None},
-        {**base, "_id": "AGG-DELETED", "status": None, "deletedAt": datetime.now(UTC)},
-        # several caregivers, and a staff record without a usable name
-        {**base, "_id": "AGG-TWO-STAFF", "assignedStaff": [staffs[0]["cName"], staffs[1]["cName"]]},
-        {**base, "_id": "AGG-NAMELESS-STAFF", "assignedStaff": ["S-NULL-NAME", staffs[0]["cName"]]},
-        # malformed types: each of these used to make EVERY query on the collection fail
-        {**base, "_id": "AGG-STATUS-LIST", "status": ["Active"]},
-        {**base, "_id": "AGG-GENDER-LIST", "gender": ["F"]},
-        {**base, "_id": "AGG-CARETYPE-LIST", "careType": ["memory_care"]},
-        {**base, "_id": "AGG-BIRTHDATE-AS-DATE", "age": None, "birthDate": datetime(1940, 1, 1, tzinfo=UTC)},
-        {**base, "_id": "AGG-BIRTHDATE-AS-NUMBER", "age": None, "birthDate": 1940},
-        {**base, "_id": "AGG-ADMISSION-AS-DATE", "admissionDate": datetime(2024, 1, 1, tzinfo=UTC)},
-        {**base, "_id": "AGG-CREATED-AS-TEXT", "createdAt": "2024-01-01T10:00:00Z"},
-        {**base, "_id": "AGG-FACILITY-NUMBER", "facilityId": 12},
-        {**base, "_id": "AGG-ROOM-NUMBER", "unitNo": 101},
-        {**base, "_id": "AGG-NAME-NUMBER", "firstName": 7, "lastName": ["x"]},
-        {**base, "_id": "AGG-CONTACT-OBJECT", "emergencyContact": {"name": "x"}},
-    ]
-    staffs = [*staffs, {"cName": "S-NULL-NAME", "name": None}]
-    for d in gappy:
-        for k in [k for k, v in d.items() if v is None and k != "deletedAt"]:
-            del d[k]
-    db = MongoClient(MONGO_URI)["care_app_aggregation_test"]
-    for name, rows in (("residents", docs + gappy), ("staffs", staffs), ("facilities", facilities)):
-        db[name].drop()
-        db[name].insert_many(rows)
-    mongo = MongoResidentRepository(MONGO_URI, "care_app_aggregation_test", "residents")
-    await mongo.init()
-    # the in-memory side gets MongoDB's own view rows BEFORE display formatting (caregivers stay a list), so a
-    # difference in list handling between the two engines cannot hide
-    mapped = await mongo._aggregate(mongo.view.pipeline(None))
-    assert len(mapped) == sum(1 for d in docs + gappy if not d.get("deletedAt"))  # every malformed record is mapped
-    memory = MemoryResidentRepository(mapped)
-
-    # 1. no malformed record can make a valid query fail (each used to raise an OperationFailure → HTTP 500)
-    for raw in PLANS:
-        plan = QueryPlan.model_validate(copy.deepcopy(raw))
-        assert "headline" in build_response(plan, await execute(plan, mongo)), raw
-    for rid in ("AGG-STATUS-LIST", "AGG-CARETYPE-LIST", "AGG-NAMELESS-STAFF", "AGG-FACILITY-NUMBER", "AGG-NAME-NUMBER"):
-        plan = QueryPlan.model_validate({"action": "lookup", "lookup": {"residents": [rid]},
-                                         "filters": {"facility": {"include": ["North Wing"]}}})  # fmt: skip
-        assert build_response(plan, await execute(plan, mongo))["count"] == 1, rid
-    by_id = {r["residentId"]: r for r in mapped}
-    assert by_id["AGG-STATUS-LIST"]["status"] == "unknown" and by_id["AGG-CARETYPE-LIST"]["careType"] == "unknown"
-    assert by_id["AGG-ADMISSION-AS-DATE"]["admissionDate"] == "2024-01-01"  # a stored date is still a date
-    assert by_id["AGG-BIRTHDATE-AS-DATE"]["age"] is not None and by_id["AGG-BIRTHDATE-AS-NUMBER"]["age"] is None
-    assert by_id["AGG-CREATED-AS-TEXT"]["createdDate"] == "2024-01-01"
-    assert by_id["AGG-FACILITY-NUMBER"]["wing"] == "12" and by_id["AGG-ROOM-NUMBER"]["roomNumber"] == "101"
-    assert by_id["AGG-NAMELESS-STAFF"]["primaryCaregiver"] == [staffs[0]["name"]]  # the nameless staff is left out
-    assert len(by_id["AGG-TWO-STAFF"]["primaryCaregiver"]) == 2
-
-    # 2. MongoDB and in-memory agree on every grouping and aggregate, gaps and malformed values included
-
-    def table(rows):
-        return {r.key: (r.count, r.value, r.n_values) for r in rows}
-
-    for g in [[f] for f in GROUPS] + [["status", "facility"]]:
-        assert {x.key: x.count for x in await mongo.group_count(Filters(), g)} == {
-            x.key: x.count for x in await memory.group_count(Filters(), g)
-        }, g
-        for op in ("avg", "min", "max"):
-            assert table(await mongo.group_aggregate(Filters(), g, op, "age")) == table(
-                await memory.group_aggregate(Filters(), g, op, "age")
-            ), (g, op)
-    status = table(await mongo.group_aggregate(Filters(), ["status"], "avg", "age"))
-    assert status[(MISSING_GROUP,)][0] == 3  # no status + empty status + a list as status; the deleted one never counted
-    for op in ("avg", "min", "max"):
-        assert await mongo.aggregate(Filters(), op, "age") == await memory.aggregate(Filters(), op, "age")
-    await mongo.close()

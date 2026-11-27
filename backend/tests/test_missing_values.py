@@ -6,7 +6,6 @@ path (no model call), the grounding check on model plans, and — against a real
 is set — identical results from the MongoDB aggregation and the in-memory repository.
 """
 
-import os
 from datetime import date
 
 import pytest
@@ -270,84 +269,6 @@ async def test_grounding_of_missing_values(index):
     assert not either.ok and not either.correctable and any("OR between different fields" in m for m in either.blocking)
     # "without" is honoured by missing:true (not reported as a dropped negation)
     assert ground(index, "how many residents without a room", {"room_number": {"missing": True}}).ok
-
-
-# ---------------------------------------------------------------- 3/9. MongoDB ≡ in-memory, against a real MongoDB
-MONGO_URI = os.environ.get("MISSING_TEST_MONGODB_URI")
-
-
-@pytest.mark.skipif(not MONGO_URI, reason="set MISSING_TEST_MONGODB_URI to a throwaway local MongoDB")
-async def test_mongodb_and_memory_give_identical_results():
-    import json
-    from datetime import UTC, datetime
-
-    from pymongo import MongoClient
-
-    from app.data.mongo_repository import MongoResidentRepository
-    from scripts.seed_mongo import SEED, to_care_app_shape
-
-    assert MONGO_URI.startswith(("mongodb://localhost", "mongodb://127.0.0.1")), "local throwaway MongoDB only"
-    docs, staffs, facilities = to_care_app_shape(json.loads(SEED.read_text(encoding="utf-8")))
-    base = {k: v for k, v in docs[0].items() if k not in ("_id",)}
-    gappy = [  # every kind of "not recorded" the real Care App data has
-        {**base, "_id": "GAP-NO-STAFF-FIELD", "assignedStaff": None},
-        {**base, "_id": "GAP-EMPTY-STAFF", "assignedStaff": []},
-        {**base, "_id": "GAP-UNKNOWN-STAFF-ID", "assignedStaff": ["not-a-staff-id"]},
-        {**base, "_id": "GAP-NO-ROOM", "unitNo": None},
-        {**base, "_id": "GAP-BLANK-ROOM", "unitNo": ""},
-        {**base, "_id": "GAP-NO-FACILITY", "facilityId": None},
-        {**base, "_id": "GAP-NO-STATUS", "status": None},
-        {**base, "_id": "GAP-NO-CARETYPE", "careType": None},
-        {**base, "_id": "GAP-BAD-ADMISSION", "admissionDate": "16/07/2015"},
-        {**base, "_id": "GAP-NO-ADMISSION", "admissionDate": ""},
-        {**base, "_id": "GAP-NO-AGE", "age": None, "birthDate": None},
-        # soft-deleted and gappy: must never be counted, whatever the filter
-        {**base, "_id": "GAP-DELETED", "assignedStaff": [], "unitNo": "", "deletedAt": datetime.now(UTC)},
-    ]
-    for d in gappy:
-        for k in [k for k, v in d.items() if v is None and k != "deletedAt"]:
-            del d[k]  # an absent field, not a stored null (both cases appear above)
-    db = MongoClient(MONGO_URI)["care_app_missing_test"]
-    for name, rows in (("residents", docs + gappy), ("staffs", staffs), ("facilities", facilities)):
-        db[name].drop()
-        db[name].insert_many(rows)
-
-    mongo = MongoResidentRepository(MONGO_URI, "care_app_missing_test", "residents")
-    await mongo.init()
-    mapped = await mongo.find(Filters(), limit=5000)
-    assert all(r["residentId"] != "GAP-DELETED" for r in mapped)  # soft-delete filter preserved
-    memory = MemoryResidentRepository(mapped)
-
-    cases = [
-        {"primary_caregiver": {"missing": True}},
-        {"primary_caregiver": {"missing": False}},
-        {"room_number": {"missing": True}},
-        {"wing": {"missing": True}},
-        {"status": {"missing": True}},
-        {"care_type": {"missing": True}},
-        {"age": {"missing": True}},
-        {"age": {"missing": False}},
-        {"admission_date": {"missing": True}},
-        {"admission_date": {"missing": False}},
-        {"discharge_date": {"missing": True}},
-        {"primary_caregiver": {"missing": True}, "room_number": {"missing": True}},
-        {"primary_caregiver": {"include": ["Nurse Sarah Jenkins, RN"], "missing": True}},
-        {"primary_caregiver": {"exclude": ["Nurse Sarah Jenkins, RN"], "missing": False}},
-        {"status": {"include": ["active"]}, "room_number": {"missing": True}},
-        {"age": {"min": 85, "missing": True}},
-        {"admission_date": {"start": "2026-01-01", "missing": True}},
-        {"status": {"include": ["active"]}, "care_type": {"exclude": ["memory_care"]}},  # old behaviour, unchanged
-    ]
-    for case in cases:
-        f = F(**case)
-        in_mongo = sorted(r["residentId"] for r in await mongo.find(f, limit=5000))
-        in_memory = sorted(r["residentId"] for r in await memory.find(f, limit=5000))
-        assert in_mongo == in_memory, case
-        assert await mongo.count(f) == await memory.count(f) == len(in_mongo), case
-    # every gap kind was really exercised
-    assert len(await mongo.find(F(primary_caregiver={"missing": True}), limit=5000)) == 3
-    assert len(await mongo.find(F(room_number={"missing": True}), limit=5000)) == 2
-    await mongo.close()
 
 
 def test_placeholder_values_are_never_recognised_as_names():

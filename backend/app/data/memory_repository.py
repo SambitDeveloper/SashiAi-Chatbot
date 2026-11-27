@@ -248,7 +248,7 @@ class MemoryResidentRepository:
         return Vocabulary(
             residents=[{k: r[k] for k in ("residentId", "firstName", "lastName")} for r in records],
             wings=sorted({r["wing"] for r in records}),
-            caregivers=sorted({r["primaryCaregiver"] for r in records}),
+            caregivers=sorted({n for r in records for n in _names(r.get("primaryCaregiver"))}),  # one or several
             rooms=sorted({r["roomNumber"] for r in records}),
             statuses=sorted({r["status"] for r in records if r.get("status")}),
             care_types=sorted({r["careType"] for r in records if r.get("careType")}),

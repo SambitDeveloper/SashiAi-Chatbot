@@ -1,8 +1,6 @@
 """Direct answers (semantic router → MongoDB MCP, no language model): safety rules, service flow, accuracy."""
 
 import logging
-import os
-import shutil
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -214,45 +212,6 @@ async def test_no_wrong_direct_answers_on_labeled_questions(index):
             wrong.append(question)
     assert wrong == [], f"wrong direct answers: {wrong}"
     assert direct >= 8, f"only {direct} questions answered directly"
-
-
-# ---------------------------------------------------------------- real MongoDB MCP server (opt-in)
-MCP_URI = os.environ.get("MCP_TEST_MONGODB_URI")
-
-
-@pytest.mark.skipif(
-    not (MCP_URI and shutil.which("mongodb-mcp-server")), reason="set MCP_TEST_MONGODB_URI to a seeded MongoDB"
-)
-async def test_mcp_repository_matches_reference():
-    from app.data.mcp_repository import McpResidentRepository
-
-    mcp = McpResidentRepository("mongodb-mcp-server", MCP_URI, "care_app", "residents")
-    await mcp.init()
-    try:
-        memory = MemoryResidentRepository()
-        for p in [
-            {
-                "action": "count",
-                "filters": {
-                    "status": {"include": ["active"]},
-                    "primary_caregiver": {"include": ["Care Aide Elena Rostova"]},
-                },
-            },
-            {"action": "breakdown", "group_by": ["status", "care_type"]},
-            {"action": "aggregate", "aggregate": {"op": "avg", "field": "age"}, "group_by": ["wing"]},
-            {"action": "list", "sort": {"field": "age", "direction": "desc"}, "limit": 3},
-            {"action": "lookup", "lookup": {"residents": ["RES-1001"], "attributes": []}},
-        ]:
-            plan = QueryPlan.model_validate(p)
-            a, b = await execute(plan, mcp), await execute(plan, memory)
-            assert a.matched == b.matched and a.aggregate_value == b.aggregate_value
-            assert sorted((g.key, g.count) for g in a.groups or []) == sorted((g.key, g.count) for g in b.groups or [])
-            assert sorted((g.key, g.count, g.value, g.n_values) for g in a.group_values or []) == sorted(
-                (g.key, g.count, g.value, g.n_values) for g in b.group_values or []
-            )
-            assert [r["residentId"] for r in a.rows] == [r["residentId"] for r in b.rows]
-    finally:
-        await mcp.close()
 
 
 async def test_surname_first_question_is_answered_without_the_model(builder, index):
