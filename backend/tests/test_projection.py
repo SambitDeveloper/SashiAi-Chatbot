@@ -6,7 +6,6 @@ execution in the in-memory repository and — when PROJECTION_TEST_MONGODB_URI i
 MongoDB, the response columns and the end-to-end flow without a model call.
 """
 
-import os
 from datetime import date
 
 import pytest
@@ -19,7 +18,7 @@ from app.data.schema_config import identity_fields, output_fields
 from app.engine.executor import ExecutionData, execute
 from app.engine.grounding import check_plan, scan_question
 from app.engine.responder import build_response
-from app.models.plan import Filters, QueryPlan
+from app.models.plan import QueryPlan
 from app.nlu.direct_query import DirectQueryBuilder
 from app.nlu.intent_router import DEFAULT_ROUTES_FILE, IntentScore, SemanticIntentRouter
 from app.nlu.missing_values import MissingValueDetector
@@ -321,41 +320,3 @@ async def test_reported_question_end_to_end_without_a_model():
     assert [c["label"] for c in r["response"]["columns"]] == ["Room"]
     assert all(set(row) <= {*identity_fields(), "roomNumber"} for row in r["response"]["residentsSample"])
     assert "Show: Room" in r["interpretation"]
-
-
-# ---------------------------------------------------------------- MongoDB ≡ in-memory projection
-MONGO_URI = os.environ.get("PROJECTION_TEST_MONGODB_URI")
-
-
-@pytest.mark.skipif(not MONGO_URI, reason="set PROJECTION_TEST_MONGODB_URI to a throwaway local MongoDB")
-async def test_mongodb_and_memory_projection_are_identical():
-    import json
-
-    from pymongo import MongoClient
-
-    from app.data.mongo_repository import MongoResidentRepository
-    from scripts.seed_mongo import SEED, to_care_app_shape
-
-    assert MONGO_URI.startswith(("mongodb://localhost", "mongodb://127.0.0.1")), "local throwaway MongoDB only"
-    docs, staffs, facilities = to_care_app_shape(json.loads(SEED.read_text(encoding="utf-8")))
-    db = MongoClient(MONGO_URI)["care_app_projection_test"]
-    for name, rows in (("residents", docs), ("staffs", staffs), ("facilities", facilities)):
-        db[name].drop()
-        db[name].insert_many(rows)
-    mongo = MongoResidentRepository(MONGO_URI, "care_app_projection_test", "residents")
-    await mongo.init()
-    memory = MemoryResidentRepository(await mongo.find(Filters(), limit=5000))
-    cases = [
-        ["roomNumber"],
-        ["primaryCaregiver"],  # list field (joined for display, only when projected)
-        ["roomNumber", "primaryCaregiver", "age", "admissionDate"],
-        ["emergencyContact"],  # nested object (repository level; lists are blocked by the validator)
-        ["residentId"],
-    ]
-    f = Filters.model_validate({"status": {"include": ["active"]}})
-    for fields in cases:
-        a = sorted(await mongo.find(f, limit=5000, fields=fields), key=lambda r: r["residentId"])
-        b = sorted(await memory.find(f, limit=5000, fields=fields), key=lambda r: r["residentId"])
-        assert a == b, fields
-        assert all(set(r) <= {*identity_fields(), *fields} for r in a), fields
-    await mongo.close()

@@ -6,7 +6,7 @@ Everything here is driven by configuration and data:
   • the values recognised in the question (statuses, care types, genders, wings, caregivers, residents) → the database
 
 A plan is returned only when every rule passes; otherwise a reason is returned and the question goes to the
-language model. The plan then runs through the same validation and the MongoDB MCP tools as any other plan.
+language model. The plan then runs through the same validation and the snf_mcp tools as any other plan.
 """
 
 import re

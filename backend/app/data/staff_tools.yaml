@@ -1,0 +1,43 @@
+# Staff (non-admin) callers: their questions are answered ONLY through these snf_mcp tools, which call the Care App
+# REST API as the user. Admins use snf_mcp's run_query instead (app/data/snf_mcp_repository.py).
+#
+# For each subject of a question (plan `entity`): the tool, its fixed arguments, and the plan fields its result
+# provides. Before every staff question the chatbot checks that the tool exists in snf_mcp and that the plan uses only
+# these fields; otherwise the answer is "That isn't supported yet". A new tool or field = an edit here, no code.
+
+resident:
+  tool: list_my_residents             # GET /api/staff/my-residents: only the caller's assigned residents
+  args: {status: All}
+  fields: [status, room_number, admission_date, primary_caregiver, staff_name, staff_designation, staff_role,
+           staff_count, care_team, primary_physician, family_relation, family_member, family_members, family_count,
+           family_relationship, resident_id]
+  # the only values of a field the tool returns: the backend's caseload holds Active and Discharged residents only,
+  # so "away" (or any other status) is "not supported" for staff, never a wrong 0
+  only_values: {status: [active, discharged]}
+  # fields usable only once the tool returns them for every one of the caller's residents that must have one (all, or
+  # those matching a condition: only discharged residents have a discharge date). They need the backend to add
+  # `careType age birthDate dischargeDate` to GET /api/staff/my-residents (staff.controller.ts getMyResidents); until
+  # then, or while any such resident has none, the question is "not supported" (a missing value is never read as
+  # "does not match")
+  fields_when_populated:
+    created_date: all                 # sent today (createdAt); listed here so a missing one never counts as "no match"
+    care_type: all
+    age: all
+    discharge_date: {status: discharged}
+
+staff:
+  tool: find_staff                    # GET /api/staff: active staff the caller may see, one call per designation
+  fields: [staff_role, staff_designation, staff_name, staff_status]
+
+# Values a staff question may name even when none of the caller's residents has them (no data needed), so the question
+# is understood (and then answered, or refused by only_values) instead of silently losing its condition.
+values:
+  status: [active, away, discharged]
+  careType: [assisted_living, memory_care, independent_living, skilled_nursing, respite_care]  # the plan's care types
+
+# Follow-up suggestions offered to staff instead of the general ones: questions their tools can answer that need only
+# the Residents list permission (one resident's details need resident-details, which not every staff has).
+suggestions:
+  - {label: "How many residents are active?", query: "How many residents are active?"}
+  - {label: "Residents by status", query: "Residents by status"}
+  - {label: "List my residents", query: "List all residents"}

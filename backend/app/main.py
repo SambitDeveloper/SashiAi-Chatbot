@@ -19,8 +19,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.routes import limiter, protected, public
 from app.config import Settings, get_settings
-from app.data.repository import ResidentRepository
-from app.engine.service import QueryService
+from app.data.repository import DataUnavailable, ResidentRepository
+from app.engine.service import NOT_SUPPORTED_MESSAGE, QueryService
 from app.logging_setup import configure_logging
 from app.nlu.intent_router import DEFAULT_ROUTES_FILE, SemanticIntentRouter
 from app.nlu.topic_gate import TopicGate
@@ -40,30 +40,18 @@ SECURITY_HEADERS = {
 
 
 def build_repository(settings: Settings) -> ResidentRepository:
-    """Answers always come from the Care App's MongoDB; the in-memory test data is refused outside tests."""
+    """Answers always come from our snf_mcp server's tools; the in-memory test data is refused outside tests."""
     if settings.data_source == "memory":
         if settings.environment != "test":
-            raise RuntimeError("DATA_SOURCE=memory is for tests only. Set DATA_SOURCE=mcp and MONGODB_URI.")
+            raise RuntimeError("DATA_SOURCE=memory is for tests only. Set DATA_SOURCE=mcp and SNF_MCP_*.")
         from app.data.memory_repository import MemoryResidentRepository
 
         return MemoryResidentRepository()
-    if not settings.mongodb_uri:
-        raise RuntimeError(f"MONGODB_URI is required (DATA_SOURCE={settings.data_source}). Set it in backend/.env.")
-    if settings.data_source == "mcp":
-        from app.data.mcp_repository import McpResidentRepository
+    from app.data.snf_mcp_repository import SnfMcpRepository
 
-        return McpResidentRepository(
-            settings.mcp_server_command,
-            settings.mongodb_uri,
-            settings.mongodb_db,
-            settings.mongodb_collection,
-            max_documents=settings.mcp_max_documents,
-            timeout_seconds=settings.mcp_timeout_seconds,
-            node_path=settings.mcp_node_path,
-        )
-    from app.data.mongo_repository import MongoResidentRepository
-
-    return MongoResidentRepository(settings.mongodb_uri, settings.mongodb_db, settings.mongodb_collection)
+    # the access token and facility come from the UI with every request (api/routes.py forward_credentials)
+    return SnfMcpRepository(settings.snf_mcp_url, settings.snf_mcp_timeout_seconds,
+                            log_responses=settings.snf_mcp_log_responses)  # fmt: skip
 
 
 def build_translator(settings: Settings) -> QueryTranslator | None:
@@ -199,9 +187,6 @@ def create_app(
                 "llm_server": (getattr(model, "endpoint", None) or settings.llm_server_url) if model is not None else None,
                 "topic_check": topic_gate is not None,
                 "semantic_router": intent_router is not None,
-                # app/auth: off = every question unrestricted; file = asked as the user in auth_user_context_file
-                "auth_mode": settings.auth_mode,
-                "auth_user_context_file": settings.auth_user_context_file if settings.auth_mode == "file" else None,
             },
         )
         yield
@@ -231,7 +216,7 @@ def create_app(
             CORSMiddleware,
             allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
             allow_methods=["GET", "POST"],
-            allow_headers=["Content-Type", "Authorization"],
+            allow_headers=["Content-Type", "Authorization", "x-facility-id", "x-api-key"],
         )
 
     @app.middleware("http")
@@ -257,6 +242,11 @@ def create_app(
         first = exc.errors()[0] if exc.errors() else {}
         field_name = ".".join(str(p) for p in first.get("loc", [])[1:]) or "request"
         return JSONResponse({"error": f"{field_name}: {first.get('msg', 'invalid')}"}, status_code=400)
+
+    @app.exception_handler(DataUnavailable)
+    async def data_unavailable(_: Request, exc: DataUnavailable):  # any route: snf_mcp unreachable, refused or no tool
+        log.warning("data not available through MCP: %s", exc)
+        return JSONResponse({"error": NOT_SUPPORTED_MESSAGE}, status_code=503)
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(_: Request, exc: StarletteHTTPException):

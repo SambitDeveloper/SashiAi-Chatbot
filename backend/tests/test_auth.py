@@ -5,17 +5,14 @@ RES-1001 (Eleanor Vance) and RES-1004 (Harold Finch) only. Model plans come from
 must be refused before the model has NO fake plan, so any model call fails the test.
 """
 
-import json
-import os
 
 import pytest
 
 from app.auth.gate import check_question
 from app.auth.guard import AccessDenied, check_plan, required_capabilities, use_principal
-from app.auth.identity import AuthError, IdentityResolver, principal_from_context
+from app.auth.identity import AuthError, principal_from_caller
 from app.auth.policy import access_policy, norm_module, resolve_ref
 from app.auth.principal import SYSTEM, Principal, readable_modules
-from app.config import Settings
 from app.data import scope
 from app.data.memory_repository import MemoryResidentRepository
 from app.engine.service import QueryService
@@ -181,7 +178,8 @@ async def test_a_plan_the_gate_could_not_place_is_refused_before_execution(setti
     ("plan", "needed"),
     [
         ({"action": "count"}, ["residents"]),
-        ({"action": "list", "filters": {"age": {"min": 80}}}, ["residents", "resident_details"]),
+        # decision 2026-11-26: age and the dates are list fields (residents-list), not resident details
+        ({"action": "list", "filters": {"age": {"min": 80}}}, ["residents"]),
         ({"action": "count", "filters": {"family_relation": {"include": ["daughter"]}}}, ["residents", "family"]),
         ({"action": "count", "filters": {"staff_role": {"include": ["physician"]}}}, ["residents", "care_team"]),
         ({"action": "count", "entity": "staff"}, ["staff_directory"]),
@@ -236,73 +234,59 @@ def test_readable_modules_need_read_and_the_parent():
     assert readable_modules(perms, ("allowed", "isRead")) == {"transport", "transport calendar"}  # write grants nothing
 
 
-# ======================================================================== identity (the app's user data)
+# ======================================================================== identity (the SNF_MCP_TOKEN user)
 
-DUMMY = "app/auth/dummy_user_context.json"  # edited by hand while testing: only checked to load
-PROFILE = "tests/data/user_context_staff.json"  # the app's user data as first shared (Jone, Transport Driver)
-
-
-def test_the_shipped_dummy_user_loads():
-    assert principal_from_context(json.loads(open(DUMMY, encoding="utf-8").read())).kind in ("admin", "staff")
-
-
-def _context(**changes) -> dict:
-    data = json.loads(open(PROFILE, encoding="utf-8").read())
-    data.update(changes)
-    return data
+PERMS = [  # the app's accessPermissions shape (GET /api/staff/profile)
+    {"name": "Residents", "allowed": True, "isRead": True, "children": [
+        {"name": "residents-list", "allowed": True, "isRead": True},
+        {"name": "resident-details", "allowed": True, "isRead": True}]},
+    {"name": "Staff", "allowed": False, "isRead": False, "children": []},
+]  # fmt: skip
 
 
-def test_the_dummy_user_is_read_like_the_apps_user_data():
-    staff = principal_from_context(_context(scope="staff"))
-    assert (staff.kind, staff.facility_id, staff.scope_key) == ("staff", "S101", "83fd1390-6d21-4484-bf23-b1aebdf07205")
-    # Residents with its 3 children, Transport with 2 (transport-calendar is off), Settings; never Staff etc.
+def _caller(groups=("STAFF",), **profile) -> dict:
+    """snf_mcp get_facility_snapshot `caller` + the configured facility, as SnfMcpRepository.caller() returns it."""
+    return {"c_name": "c-jone", "groups": list(groups), "facility_id": "S101",
+            "profile": {"name": "Jone", "active": True, "access_permissions": PERMS, **profile}}  # fmt: skip
+
+
+def test_a_staff_token_user_gets_their_permissions_and_assigned_residents():
+    staff = principal_from_caller(_caller())
+    assert (staff.kind, staff.id, staff.facility_id, staff.scope_key, staff.name) == ("staff", "c-jone", "S101", "c-jone", "Jone")
     assert staff.can("residents") and staff.can("resident_details") and staff.can("family")
     assert not staff.can("staff_directory") and not staff.can("family_contacts") and not staff.can("staff_permissions")
-    assert "transport calendar" not in staff.modules and "transport requests" in staff.modules
-    admin = principal_from_context(_context(scope="admin"))
+    assert staff.assignment().staff_key == "c-jone" and staff.facilities() == {"S101"}
+
+
+@pytest.mark.parametrize("groups", [("ADMIN",), ("SUPER_ADMIN",), ("STAFF", "SUPER_ADMIN"), ("STAFF", "ADMIN")])
+def test_an_admin_group_wins_and_is_unrestricted(groups):
+    admin = principal_from_caller(_caller(groups, access_permissions=[]))
     assert admin.kind == "admin" and admin.unrestricted and admin.facilities() is None  # R1 (admin_facility_scope all)
 
 
+def test_an_admin_without_a_staff_record_is_still_an_admin():
+    assert principal_from_caller({"c_name": "a-1", "groups": ["ADMIN"], "facility_id": "S101", "profile": None}).kind == "admin"
+
+
+def test_a_staff_member_without_a_staff_record_reads_nothing():
+    staff = principal_from_caller({"c_name": "c-x", "groups": ["STAFF"], "facility_id": "S101", "profile": None})
+    assert staff.kind == "staff" and staff.modules == frozenset() and not staff.can("residents")
+
+
 @pytest.mark.parametrize(
-    ("changes", "status"),
+    ("caller", "status"),
     [
-        ({"scope": "visitor"}, 401),  # not a role the policy knows
-        ({"scope": None}, 401),
-        ({"cName": ""}, 401),
-        ({"scope": "staff", "facilityId": None}, 401),  # a staff member needs an active facility
-        ({"scope": "staff", "active": False}, 403),
+        (_caller(("RESIDENT",)), 401),  # not a role the policy knows
+        (_caller(()), 401),
+        ({**_caller(), "c_name": ""}, 401),
+        ({**_caller(), "facility_id": None}, 401),  # a staff member needs an active facility
+        (_caller(active=False), 403),
     ],
 )
-def test_incomplete_or_inactive_users_are_refused(changes, status):
+def test_unknown_incomplete_or_inactive_token_users_are_refused(caller, status):
     with pytest.raises(AuthError) as exc:
-        principal_from_context(_context(**changes))
+        principal_from_caller(caller)
     assert exc.value.status == status
-
-
-def _settings(**kw) -> Settings:
-    return Settings(_env_file=None, llm_enabled=False, plan_cache_enabled=False, **kw)
-
-
-async def test_file_mode_rereads_the_file_when_it_changes(tmp_path):
-    f = tmp_path / "user.json"
-    f.write_text(json.dumps(_context(scope="admin")))
-    resolver = IdentityResolver(_settings(auth_mode="file", auth_user_context_file=str(f)))
-    assert (await resolver.resolve()).kind == "admin"
-    f.write_text(json.dumps(_context(scope="staff")))
-    os.utime(f, (f.stat().st_atime, f.stat().st_mtime + 5))
-    assert (await resolver.resolve()).kind == "staff"  # no restart needed to switch user or role
-    f.unlink()
-    with pytest.raises(AuthError):
-        await resolver.resolve()
-
-
-def test_the_dummy_user_never_reaches_production():
-    with pytest.raises(ValueError, match="not allowed in production"):
-        _settings(environment="production", auth_mode="file")
-
-
-async def test_identity_off_is_todays_unrestricted_behaviour():
-    assert await IdentityResolver(_settings()).resolve() is SYSTEM
 
 
 async def test_every_answer_says_who_asked_and_staff_answers_are_marked_as_scoped(settings):
@@ -345,3 +329,84 @@ async def test_a_callers_index_narrows_names_only(settings):
 def test_care_types_and_statuses_are_not_staff_words(question):
     """Staging: "skilled nursing" was refused as the staff role "nurse" (care teams) for a residents-list user."""
     assert check_question(question, LIST_ONLY).denied is None
+
+
+def test_the_api_asks_as_the_token_user_and_never_falls_back_to_unrestricted(settings):
+    from fastapi.testclient import TestClient
+
+    from app.data.repository import DataUnavailable
+    from app.main import create_app
+
+    class TokenRepo(MemoryResidentRepository):  # SnfMcpRepository's caller() over the fixture
+        who: dict | Exception = {**_caller(), "c_name": "s-nurse", "facility_id": "FAC-A"}
+
+        async def caller(self) -> dict:
+            if isinstance(self.who, Exception):
+                raise self.who
+            return self.who
+
+    repo = _repo()
+    repo.__class__ = TokenRepo
+    fake = FakeTranslator({"How many residents are there?": {"action": "count"}})
+    with TestClient(create_app(settings=settings, repo=repo, translator=fake, use_default_translator=False)) as c:
+        r = c.post("/api/query", json={"query": "How many residents are there?"}).json()
+        assert r["caller"]["role"] == "staff" and r["response"]["count"] == 2  # only s-nurse's two residents
+        TokenRepo.who = DataUnavailable("the MCP server has no 'get_facility_snapshot' tool")
+        r = c.post("/api/query", json={"query": "How many residents are there?"})
+        assert r.status_code == 503 and "isn't supported" in r.json()["error"]
+
+
+# ======================================================================== an unknown person: 0 tokens, nothing leaked
+
+
+@pytest.mark.parametrize("question", ["Who is Sagar Dodia?", "In which room is Sagar staying?",
+                                      "What is Sagar Dodia's room number?"])  # fmt: skip
+@pytest.mark.parametrize("principal", [NURSE, ADMIN])
+async def test_a_question_about_a_person_nobody_has_is_answered_without_the_model(settings, question, principal):
+    service, fake = await _service(settings)  # no fake plans: any model call fails the test
+    r = await service.handle(question, principal=principal)
+    assert r["tier"] == "direct" and r["response"]["headline"] == "Not found"
+    assert "in the records you can see" in r["response"]["summaryText"] and fake.calls == []
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["Who is admitted today?", "Who is in Memory Care?", "Who is Away?", "who is sagar dodia",
+     "Who is admitted in March?", "Residents in Oak Court", "Show residents of Maple House", "Who lives in North Wing?"],
+)  # fmt: skip
+async def test_questions_that_only_look_like_a_name_keep_their_normal_path(settings, question):
+    service, fake = await _service(settings, {question: {"action": "count"}})
+    r = await service.handle(question, principal=NURSE)
+    assert r["response"]["headline"] != "Not found"
+
+
+async def test_a_typo_of_a_known_name_is_not_unknown():
+    from app.nlu.vocabulary import EntityIndex
+
+    index = EntityIndex(await _repo().vocabulary())
+    assert not index.name_is_unknown("Eleanor Vanse")  # Eleanor Vance, misspelt: the usual matching decides
+    assert not index.name_is_unknown("Vance")
+    assert index.name_is_unknown("Sagar Dodia")
+
+
+# ======================================================================== age and dates are list fields (2026-11-26)
+
+
+@pytest.mark.parametrize("plan", [
+    {"action": "list", "filters": {"age": {"min": 50}}},
+    {"action": "list", "filters": {"admission_date": {"start": "2025-11-01"}}},
+    {"action": "count", "filters": {"created_date": {"start": "2025-11-01"}, "discharge_date": {"missing": True}}},
+    {"action": "aggregate", "aggregate": {"op": "avg", "field": "age"}},
+])  # fmt: skip
+def test_lists_by_age_and_dates_need_only_the_residents_list(plan):
+    with use_principal(LIST_ONLY):
+        check_plan(QueryPlan.model_validate(plan))  # no AccessDenied
+
+
+@pytest.mark.parametrize("plan", [
+    {"action": "lookup", "lookup": {"residents": ["RES-1001"], "attributes": ["age"]}},  # ONE resident's details
+    {"action": "list", "filters": {"gender": {"include": ["Female"]}}},  # gender stays a detail
+])  # fmt: skip
+def test_one_residents_details_and_gender_still_need_resident_details(plan):
+    with use_principal(LIST_ONLY), pytest.raises(AccessDenied):
+        check_plan(QueryPlan.model_validate(plan))

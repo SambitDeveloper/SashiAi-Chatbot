@@ -61,6 +61,8 @@ async def execute(plan: QueryPlan, repo: ResidentRepository) -> ExecutionData:
     # C (app/auth/guard.py): every plan — fast path, template, follow-up, model — needs only what the caller may read;
     # raises AccessDenied. The rows themselves are limited by the request's row scope (app/data/scope.py).
     authorize_plan(plan)
+    if hasattr(repo, "for_plan"):  # snf_mcp: admins → run_query; staff → the API tool for this plan (or not supported)
+        repo = await repo.for_plan(plan)
     if plan.entity == "staff":
         return await _execute_staff(plan, repo)
     total = await repo.total()

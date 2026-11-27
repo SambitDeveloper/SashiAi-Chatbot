@@ -52,6 +52,7 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
 
   // Assistant response
   const isPolicyViolation = exec?.response.isPolicyViolation;
+  const isNotSupported = exec?.response.isNotSupported;
   const needsClarification = exec?.response.needsClarification;
   const residents = exec?.response.residentsSample || [];
   const columns = exec?.response.columns;
@@ -70,6 +71,11 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
                 <span className="flex items-center gap-1 text-rose-600 font-semibold">
                   <ShieldAlert className="w-3.5 h-3.5" />
                   Not Available
+                </span>
+              ) : isNotSupported ? (
+                <span className="flex items-center gap-1 text-amber-600 font-semibold">
+                  <HelpCircle className="w-3.5 h-3.5" />
+                  Not Supported Yet
                 </span>
               ) : needsClarification ? (
                 <span className="flex items-center gap-1 text-amber-600 font-semibold">
@@ -112,7 +118,7 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
         )}
 
         {/* How the question was understood */}
-        {exec?.interpretation && exec.interpretation.length > 0 && !isPolicyViolation && !needsClarification && (
+        {exec?.interpretation && exec.interpretation.length > 0 && !isPolicyViolation && !isNotSupported && !needsClarification && (
           <div className="flex flex-wrap items-center gap-1.5 mb-3 text-[11px]">
             <span className="text-slate-500 font-medium">Interpreted as:</span>
             {exec.interpretation.map((chip, i) => (

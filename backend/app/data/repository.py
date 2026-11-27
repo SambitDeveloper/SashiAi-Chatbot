@@ -45,6 +45,19 @@ SET_FILTER_FIELDS = ("status", "care_type", "facility", "gender", "primary_careg
 Resident = dict[str, Any]
 
 
+class DataUnavailable(RuntimeError):
+    """The data source has no tool for this data, or refused the call: the user is told it is not supported."""
+
+
+class NotSupported(DataUnavailable):
+    """The caller MAY ask this, but the tools their role uses cannot provide it (a missing tool, field or value): a
+    data limitation, never an authorization denial. `fields`: the plan fields that are not provided."""
+
+    def __init__(self, message: str, fields: tuple[str, ...] = ()):
+        super().__init__(message)
+        self.fields = fields
+
+
 @dataclass
 class Vocabulary:
     """Real values from the database, used to mask names and resolve what the model wrote."""

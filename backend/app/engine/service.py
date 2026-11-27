@@ -8,6 +8,7 @@ the read-only executor runs. No external language model is ever called.
 """
 
 import asyncio
+import calendar
 import copy
 import dataclasses
 import hashlib
@@ -29,12 +30,12 @@ from app.auth.policy import access_policy
 from app.auth.principal import SYSTEM, Principal
 from app.config import Settings
 from app.data.relations import family_relation, plan_uses_family
-from app.data.repository import ResidentRepository
+from app.data.repository import DataUnavailable, NotSupported, ResidentRepository
 from app.data.scope import assignment_scope, facility_scope
 from app.data.staff import staff_config
-from app.engine import people
+from app.engine import beds, people
 from app.engine.caller import CallerContext, use_caller
-from app.engine.describe import describe_plan
+from app.engine.describe import GROUP_LABELS, describe_plan
 from app.engine.executor import execute
 from app.engine.grounding import DateScan, check_plan, out_of_scope_terms, scan_question
 from app.engine.phraser import ResponsePhraser
@@ -43,7 +44,7 @@ from app.engine.responder import HELP_OPTIONS, build_response
 from app.engine.semantic_cache import Compatibility, QuestionView, SemanticPlanCache
 from app.engine.steps import StepTrace, reason_code
 from app.engine.stores import TTLCache
-from app.models.plan import STAFF_RELATION_FIELDS, QueryPlan, canonical_field
+from app.models.plan import CARE_TYPES, STAFF_RELATION_FIELDS, STATUSES, QueryPlan, canonical_field
 from app.nlu import placeholders as ph
 from app.nlu.direct_query import DirectQueryBuilder
 from app.nlu.grammar import skeleton as grammar_skeleton
@@ -61,6 +62,11 @@ from app.nlu.vocabulary import EntityIndex, MaskResult
 log = logging.getLogger(__name__)
 
 _RESIDENT_ID = re.compile(r"\bRES[-_ ]?\d{3,6}\b", re.IGNORECASE)
+# words that are never a person's name in "Who is …?": statuses, care types, months and weekdays
+_NOT_A_NAME = re.compile(r"\b(?:" + "|".join(sorted(
+    {v.replace("_", " ") for v in (*CARE_TYPES, *STATUSES)} | {m.lower() for m in (*calendar.month_name[1:], *calendar.day_name)},
+    key=len, reverse=True)) + r")\b")  # fmt: skip
+NOT_SUPPORTED_MESSAGE = "That isn't supported yet: the Care App does not provide this data to the assistant."
 GATE_MESSAGE = (
     "That doesn't look like a question about residents. I can help with resident counts, status, care type, "
     "facility, room, caregiver, age and admission or discharge dates."
@@ -427,7 +433,7 @@ class QueryService:
     def cache_context(self) -> str:
         """Everything besides the question and the conversation that decides how a question is interpreted."""
         s = self.settings
-        scope = f"{s.data_source}:{s.mongodb_db}.{s.mongodb_collection}"  # the data scope (tenant scope: not built yet)
+        scope = s.data_source  # the caller's facility and identity are part of `caller` below
         model = s.model_version_tag
         # the caller's effective rules (app/auth): a remembered failure or a conversation never crosses callers
         caller = current_principal().policy_version()
@@ -475,7 +481,8 @@ class QueryService:
     async def _index_for(self, principal: Principal, caller: CallerContext) -> EntityIndex | None:
         """Restricted callers resolve names only among what they may see (their residents and those residents' family);
         built from the repository's vocabulary inside the request's scope, cached per caller."""
-        if principal.unrestricted and caller.facilities is None:
+        per_caller = getattr(self.repo, "per_caller", False)  # snf_mcp: every user's data is their own
+        if not per_caller and principal.unrestricted and caller.facilities is None:
             return None  # the shared index
         key = f"{principal.policy_version()}|{sorted(caller.facilities) if caller.facilities is not None else '*'}"
         index = self._caller_indexes.get(key)
@@ -484,7 +491,8 @@ class QueryService:
             # facilities, rooms and staff stay the shared values, so a condition such as "memory care" is always
             # understood (in the caller's scope it may simply match nobody)
             mine = await self.repo.vocabulary()  # inside the request's row scope
-            index = EntityIndex(dataclasses.replace(self._vocab, residents=mine.residents, family_members=mine.family_members))
+            index = EntityIndex(mine if per_caller else  # snf_mcp: names AND values come from this caller's data
+                                dataclasses.replace(self._vocab, residents=mine.residents, family_members=mine.family_members))
             self._caller_indexes.set(key, index)
         return index
 
@@ -495,6 +503,14 @@ class QueryService:
         trace.record("receive_question", "received", chars=len(question), in_conversation=bool(session_id))
         try:
             result = await self._handle(question, session_id, query_id, trace)
+        except NotSupported as exc:  # allowed, but the caller's tools cannot provide it: a data limitation
+            log.info("not supported for this caller's tools", extra={"query_id": query_id, "reason": str(exc)[:200]})
+            trace.finish("not_supported", tier="gate")
+            return self._not_supported(query_id, question, received, exc.fields)
+        except DataUnavailable as exc:  # the MCP server has no tool for this data (or refused it)
+            log.warning("data not available through MCP", extra={"query_id": query_id, "reason": str(exc)[:200]})
+            trace.finish("refused", tier="gate")
+            return self._not_available(query_id, question, received, NOT_SUPPORTED_MESSAGE)
         except Exception as exc:
             trace.finish("failed", error=type(exc).__name__, failure_stage=trace.current_step)
             log.info("query completed", extra={"query_id": query_id, "outcome": "failed", "error": type(exc).__name__,
@@ -520,6 +536,10 @@ class QueryService:
     async def _handle(self, question: str, session_id: str | None, query_id: str, trace: StepTrace) -> dict[str, Any]:
         """The pipeline as named stages (the step numbers are app/engine/steps.py)."""
         t = self._prepare(question, session_id, query_id, trace)  # 02 mask · 03 structure · 04 memory
+        named = bool(t.mask.placeholders or t.mask.family or t.mask.persons or t.mask.model_persons)
+        person = self.person_questions.parse(question)
+        if beds.is_bed_question(question, named, person.name if person else None):  # the beds (app/engine/beds.py)
+            return await self._answer_beds(t)
         stopped = await self._screen(t)  # 05 topic · 06 policy
         if stopped is not None:
             return stopped
@@ -1302,6 +1322,11 @@ class QueryService:
         plan_json = plan.model_dump(mode="json", exclude_none=True)
         is_data = plan.is_data_query
         principal = current_principal()
+        staff_options = getattr(self.repo, "staff_suggestions", None)
+        options = response.get("clarificationOptions") or []
+        if principal.kind == "staff" and staff_options and options and all(o in HELP_OPTIONS for o in options):
+            # the general suggestions ("… by care type") may need data a staff member's tools do not provide
+            response = {**response, "clarificationOptions": staff_options[: len(options)]}
         if principal.kind == "staff" and is_data and plan.entity != "staff" and response.get("summaryText"):
             # R4: a staff member's resident answers cover their assigned residents only — said so, never "the census"
             response = {**response, "summaryText": response["summaryText"].replace(" in the census", "").rstrip()
@@ -1391,7 +1416,7 @@ class QueryService:
         found = people.candidates(asked, self.index)
         kinds = [k for k, v in found.items() if v]
         if not kinds:
-            return None
+            return self._person_not_found(t, asked.name) if self._unknown_person(t, asked) else None
         if (kinds == ["residents"] and t.mask.placeholders and asked.kind is None and not asked.detail
                 and len(found["residents"]) == 1):
             return None  # ONE resident: the resident fast path answers it (and remembers the resident for follow-ups)
@@ -1451,6 +1476,68 @@ class QueryService:
         trace.finish("clarified" if plan.action == "clarify" else "answered", tier="direct", model_calls=0)
         return self._result(t.query_id, t.question, plan, matched, total, response, "direct", ModelUsage(), latency,
                             validation_result="ok" if plan.is_data_query else "not_run", subject=subject)  # fmt: skip
+
+    async def _answer_beds(self, t: _Turn) -> dict[str, Any]:
+        """A bed question: admins read the `beds` collection through snf_mcp (one query, no model); staff and data
+        sources without beds raise NotSupported. A bed question with a word it does not understand asks to rephrase."""
+        rooms_of = getattr(self.repo, "bed_rooms", None)
+        if rooms_of is None:
+            raise NotSupported("this data source has no beds", ("beds",))
+        rooms = await rooms_of()
+        asked = beds.parse(t.question)
+        t.trace.skip_until("fast_path", "bed question")
+        if asked is None:
+            plan = QueryPlan(action="clarify", message=beds.HELP)
+            response = {"headline": "Need a bit more detail", "summaryText": beds.HELP, "count": 0,
+                        "needsClarification": True}  # fmt: skip
+        else:
+            plan = QueryPlan(action="count")
+            response = beds.answer(asked, rooms, self.settings.app_timezone)
+        t.trace.record("fast_path", "answered" if asked else "clarified", method="beds")
+        t.trace.finish("answered" if asked else "clarified", tier="direct", model_calls=0)
+        self.stats.queries += 1
+        self.stats.by_tier["direct"] += 1
+        latency = round((time.perf_counter() - t.started) * 1000)
+        result = self._result(t.query_id, t.question, plan, response.get("count", 0), len(beds.flatten(rooms)),
+                              response, "direct", ModelUsage(), latency)  # fmt: skip
+        result["interpretation"] = ["Beds", *([beds.describe(asked).capitalize()] if asked and beds.describe(asked) else []),
+                                    *([f"Room {', '.join(map(str, asked.rooms))}"] if asked and asked.rooms else [])]  # fmt: skip
+        result["intent"] = {**result["intent"], "category": "BED_QUERY"}
+        result["policy"] = {**result["policy"], "policyCategory": "BED_INTENT"}
+        return result
+
+    def _unknown_person(self, t: _Turn, asked) -> bool:
+        """A question about ONE named person that nobody can answer: nothing in it was recognised as a person, and the
+        name is clearly a name (every word capitalised; not a status, care type, month or weekday) that no person the
+        caller may see has, nor anything close (EntityIndex.name_is_unknown). The model only ever sees known names as
+        placeholders, so it could not answer either: reply "not found" with 0 tokens, the same for every reason
+        (another facility, not assigned to the caller, a typo), so it never tells whether the person exists.
+        A place is not a person: questions about a facility or wing, about someone's residents ("Residents in Oak
+        Court"), or with the name right after "in" / "at" / "from" keep their normal path."""
+        name = asked.name
+        words = name.split()
+        if not words or t.mask.placeholders or t.mask.family or t.mask.persons or t.mask.model_persons:
+            return False
+        before = asked.text[: asked.name_span[0]].split()[-1:]
+        if {a for a, _ in asked.attributes} & {"facility", "staff_residents"} or [w.lower() for w in before] in (
+                ["in"], ["at"], ["from"]):  # fmt: skip
+            return False
+        if not all(w[:1].isupper() for w in words) or _NOT_A_NAME.search(name.lower()):
+            return False
+        return self.index.name_is_unknown(name)
+
+    def _person_not_found(self, t: _Turn, name: str) -> dict[str, Any]:
+        message = f"I couldn't find \"{name}\" in the records you can see. Please check the spelling."
+        plan = QueryPlan(action="clarify", message=message)
+        response = {"headline": "Not found", "summaryText": message, "count": 0, "needsClarification": True}
+        t.trace.skip_until("fast_path", "question about one named person")
+        t.trace.record("fast_path", "not_found", method="person name")
+        t.trace.finish("clarified", tier="direct", model_calls=0)
+        self.stats.queries += 1
+        self.stats.by_tier["direct"] += 1
+        latency = round((time.perf_counter() - t.started) * 1000)
+        return self._result(t.query_id, t.question, plan, 0, 0, response, "direct", ModelUsage(), latency,
+                            validation_result="not_run", subject="person")  # fmt: skip
 
     def _subject(self, t: _Turn) -> str:
         """Who a question is about, for the backend's own messages: staff (a staff word or a recognised staff name),
@@ -1526,12 +1613,28 @@ class QueryService:
         return self._result(query_id, question, plan, 0, 0, response, "gate", ModelUsage(), latency)
 
     def _out_of_scope(self, query_id: str, question: str, started: float, terms: list[str]) -> dict[str, Any]:
-        self.stats.queries += 1
-        self.stats.by_tier["gate"] += 1
         message = (
             f"Resident records here don't include {terms[0]} information. I can help with resident counts, status, "
             "care type, facility, room, caregiver, age and admission or discharge dates."
         )
+        return self._not_available(query_id, question, started, message)
+
+    def _not_supported(self, query_id: str, question: str, started: float, fields: tuple[str, ...]) -> dict[str, Any]:
+        """The caller is allowed to ask this, but the tools their role uses cannot provide it (NotSupported): a data
+        limitation, labelled NOT_SUPPORTED and never as a policy violation or an authorization denial."""
+        labels = [GROUP_LABELS.get(f, f.replace("_", " ").title()) for f in fields]
+        what = (" and ".join(labels) + " data isn't") if labels else "That isn't"
+        message = f"{what} available to the assistant for your role yet: the Care App doesn't provide it."
+        result = self._not_available(query_id, question, started, message)
+        result["response"] = {**result["response"], "headline": "Not supported yet", "isPolicyViolation": False,
+                              "isNotSupported": True}  # fmt: skip
+        result["policy"] = {"passed": True, "policyCategory": "NOT_SUPPORTED", "violationReason": None}
+        result["intent"] = {**result["intent"], "category": "NOT_SUPPORTED"}
+        return result
+
+    def _not_available(self, query_id: str, question: str, started: float, message: str) -> dict[str, Any]:
+        self.stats.queries += 1
+        self.stats.by_tier["gate"] += 1
         plan = QueryPlan(action="unsupported", message=message)
         response = {
             "headline": "Not available",

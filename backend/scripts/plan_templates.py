@@ -1,7 +1,7 @@
 """Administer the semantic query-plan template cache (app/engine/semantic_cache.py).
 
 Runs with the cache's OWN credential (PLAN_CACHE_MONGODB_URI, readWrite on PLAN_CACHE_DATABASE only) — never with
-MONGODB_URI. Templates hold only slot-replaced question text and plan structure: no names, ids or results.
+the resident data. Templates hold only slot-replaced question text and plan structure: no names, ids or results.
 
     uv run python -m scripts.plan_templates verify                      # connection, collection, vector index status
     uv run python -m scripts.plan_templates create-index --admin-uri-env ATLAS_ADMIN_URI
@@ -47,8 +47,6 @@ def _collection(uri: str | None = None):
     uri = uri or s.plan_cache_mongodb_uri
     if not uri:
         sys.exit("PLAN_CACHE_MONGODB_URI is not set")
-    if s.mongodb_uri and uri.strip() == s.mongodb_uri.strip():
-        sys.exit("refusing to use MONGODB_URI (the resident credential) for the template cache")
     client = MongoClient(uri, serverSelectionTimeoutMS=15000, appname="shashicare-plan-templates-admin")
     return client, client[s.plan_cache_database][s.plan_cache_collection], s
 
@@ -59,10 +57,6 @@ def _check_privileges(client, s) -> None:
     auth = client.admin.command("connectionStatus")["authInfo"]
     roles = [(r["role"], r["db"]) for r in auth["authenticatedUserRoles"]]
     problems = []
-    if s.mongodb_uri:
-        other = MongoClient(s.mongodb_uri, serverSelectionTimeoutMS=15000).admin.command("connectionStatus")["authInfo"]
-        if [u["user"] for u in other["authenticatedUsers"]] == [u["user"] for u in auth["authenticatedUsers"]]:
-            problems.append("logs in as the SAME database user as MONGODB_URI")
     broad = [r for r, db in roles if r.endswith("AnyDatabase") or r in ("root", "atlasAdmin", "dbAdminAnyDatabase")]
     if broad:
         problems.append(f"has cluster-wide roles {broad}")

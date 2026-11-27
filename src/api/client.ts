@@ -8,10 +8,29 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The signed-in user's Cognito ACCESS token and facility. Sent with EVERY request; the backend passes them on to
+ * snf_mcp, which verifies the token and checks the facility. Inside the Care App web the host app calls
+ * setCredentials with its current (auto-refreshed) token and selected facility; the standalone page has dev fields.
+ */
+let credentials: { token: string; facilityId: string } | null = null;
+
+export function setCredentials(token: string, facilityId: string): void {
+  const t = token.trim().replace(/^Bearer\s+/i, '');
+  credentials = t && facilityId.trim() ? { token: t, facilityId: facilityId.trim() } : null;
+}
+
+export function hasCredentials(): boolean {
+  return credentials !== null;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
+  const signedIn: Record<string, string> = credentials
+    ? { Authorization: `Bearer ${credentials.token}`, 'x-facility-id': credentials.facilityId }
+    : {};
   try {
-    res = await fetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) } });
+    res = await fetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...signedIn, ...(init?.headers || {}) } });
   } catch {
     throw new ApiError('Cannot reach the server. Check that the backend is running.', 0);
   }
